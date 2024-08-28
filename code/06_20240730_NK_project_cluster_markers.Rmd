@@ -1,0 +1,520 @@
+---
+title: "NK project: Cluster markers"
+author: "Dr. Sara Wernig-Zorc"
+date: "`r format(Sys.time(), '%B %Y')`"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  input_BM1: "/home/rstudio/mnt_data/BM/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"
+  input_BM2: "/home/rstudio/mnt_data/BM/yang2019/Rds/Human_BM_NK_seurat_v4.Rds"
+  input_BM3: "/home/rstudio/mnt_data/BM/Lee/disco_bone_marrow_v2.0.rds"
+  input_scRNA: "/home/rstudio/mnt_out/scRNA-seq_stage_M/results/published/data/rna_decontaminated.rds"
+  out: "/home/rstudio/mnt_out/NK_project/"
+  GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
+  markers: "/home/rstudio/mnt_resources/MES_ADRN/"
+---
+
+PROJECT DESCRIPTION
+
+Identify NK sub-populations in tumor-infiltrated bone marrow samples from
+Neuroblastoma patients.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 20)
+options(future.globals.maxSize = 8 * 10^9)
+
+print(params)
+```
+
+```{r load project specific R packages and color code}
+suppressPackageStartupMessages(library(knitr))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(Seurat))
+suppressPackageStartupMessages(library(SingleR))
+suppressPackageStartupMessages(library(RColorBrewer))
+suppressPackageStartupMessages(library(ggpubr))
+suppressPackageStartupMessages(library(stats))
+suppressPackageStartupMessages(library(viridis))
+suppressPackageStartupMessages(library(SCpubr))
+suppressPackageStartupMessages(library(scCustomize))
+suppressPackageStartupMessages(library(DElegate))
+suppressPackageStartupMessages(library(clusterProfiler))
+suppressPackageStartupMessages(library(org.Hs.eg.db))
+suppressPackageStartupMessages(library(enrichplot))
+suppressPackageStartupMessages(library(AnnotationDbi))
+suppressPackageStartupMessages(library(pathview))
+suppressPackageStartupMessages(library(aggregateBioVar))
+suppressPackageStartupMessages(library(SummarizedExperiment))
+suppressPackageStartupMessages(library(SingleCellExperiment))
+suppressPackageStartupMessages(library(DESeq2))
+suppressPackageStartupMessages(library(magrittr))
+suppressPackageStartupMessages(library(pheatmap))
+suppressPackageStartupMessages(library(ggtext))
+
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_setup.R")
+```
+
+# ___Load data___
+
+
+```{r}
+crinier2021 <- readRDS(file = paste0(params$input_BM1))
+lee2023 <- readRDS(file = paste0(params$input_BM3))
+```
+
+
+
+```{r}
+fetahu2023 <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_withMetadata.Rds"))
+predicted_labels <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_predicted_NKclusters_from_Crinier2021.Rds"))
+fetahu2023_NK <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_NK_cluster.Rds"))
+
+ATRX_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_ATRXmut_BM_NK.Rds"))
+fetal_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_fetal_BM_NK.Rds"))
+```
+
+
+#  ___Exploring prediction scores for cluster 2___
+
+```{r}
+# exploring prediction scores for cluster 2
+Idents(fetahu2023_NK) <- fetahu2023_NK$predicted_NK_type
+NKclust2 <- subset(fetahu2023_NK, idents = "hNK_Bm2")
+hist(NKclust2$scores.hNK_Bm2,plot = TRUE,breaks = 50)
+
+# Extract the cell IDs where scores.hNK_Bm3 > scores.hNK_Bm2
+cell_ids_might_be_clust3 <- WhichCells(NKclust2, expression = scores.hNK_Bm3 > scores.hNK_Bm2)
+
+# Extract the cell IDs where scores.hNK_Bm1 > scores.hNK_Bm2
+cell_ids_might_be_clust1 <- WhichCells(NKclust2, expression = scores.hNK_Bm1 > scores.hNK_Bm2)
+
+# Extract the cell IDs where scores.hNK_Bm4 > scores.hNK_Bm2
+cell_ids_might_be_clust4 <- WhichCells(NKclust2, expression = scores.hNK_Bm4 > scores.hNK_Bm2)
+
+# Extract the cell IDs where scores.hNK_Bm2 > scores.hNK_Bm3
+cell_ids_true_clust2 <- WhichCells(NKclust2, 
+                                   expression =
+                                     scores.hNK_Bm3 < scores.hNK_Bm2 &
+                                     scores.hNK_Bm1 < scores.hNK_Bm2 &
+                                     scores.hNK_Bm4  < scores.hNK_Bm2)
+
+
+# Print or return the cell IDs
+highlight <- c(cell_ids_might_be_clust3,cell_ids_might_be_clust1,cell_ids_might_be_clust4)
+
+DimPlot(NKclust2, 
+        cells.highlight = cell_ids_might_be_clust1,
+                pt.size = 2,
+        sizes.highlight = 2)
+DimPlot(NKclust2, 
+        cells.highlight = cell_ids_might_be_clust3,
+                pt.size = 2,
+        sizes.highlight = 2)
+DimPlot(NKclust2, 
+        cells.highlight = cell_ids_might_be_clust4,
+        pt.size = 2,
+        sizes.highlight = 2)
+# all wrongly predicted cells 
+DimPlot(NKclust2, 
+        cells.highlight = highlight,
+                pt.size = 2,
+        sizes.highlight = 2)
+DimPlot(NKclust2, 
+        cells.highlight = cell_ids_true_clust2,
+                pt.size = 2,
+        sizes.highlight = 2)
+
+
+
+
+# ATRX only
+ATRX_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_ATRXmut_BM_NK.Rds"))
+
+ATRX_clust2 <- subset(ATRX_NK, idents = "hNK_Bm2")
+hist(ATRX_clust2$scores.hNK_Bm4, plot = TRUE,breaks = 50)
+
+hist(predicted_labels$scores,plot = TRUE,breaks = 50)
+
+```
+
+
+# ___Cluster markers in NB dataset on predicted NK sub-clusters___
+
+```{r cluster markers}
+# "healthy" fetal/toddler BM-NK cells
+fetal_NK <- fetal_NK %>% ScaleData()
+
+
+library(DElegate)
+
+de_results <- DElegate::findDE(object = fetal_NK,
+                               group_column = "predicted_NK_type")
+marker_results <- DElegate::FindAllMarkers2(object = fetal_NK,
+                                            group_column = "predicted_NK_type")
+
+marker_results_top5 <- dplyr::filter(marker_results, feature_rank < 6)
+marker_results_top5
+
+marker_results %>%
+    group_by(group1) %>%
+    slice_max(n = 10, order_by = log_fc)
+
+marker_results %>%
+    group_by(group1) %>%
+    top_n(n = 10, wt = log_fc) -> top10
+
+DEG_tumor <- DoHeatmap(fetal_NK, 
+                       features = top10$feature) + NoLegend()
+DEG_tumor
+```
+
+# ___Exploration of age and sex dependence in the data___
+
+```{r}
+fetahu2023.metadata <- read.csv("/home/rstudio/mnt_nb_tumors/fetahu2023.scRNA/metadata/fetahu2023_scRNA_seq_metadata.csv", 
+                                sep = "\t", header = TRUE)
+
+metadata <- fetahu2023@meta.data
+metadata$cell_ID <- row.names(metadata)
+
+
+# filter by unique sample ID
+library(dplyr) 
+unique.metadata <- fetahu2023.metadata %>% 
+  distinct(sample_ID,.keep_all = TRUE)
+
+# plot age distribution per comparison group
+ggplot(unique.metadata, aes(x = group, 
+               y = age_at_Dx_years, 
+               fill = group)) +
+  geom_boxplot()
+
+# input table
+input <- table(unique.metadata$group, unique.metadata$sex)
+input <- as.data.frame(input)
+colnames(input) <- c("group","sex","value")
+
+
+# plot sex distribution in the whole dataset
+ggplot(input, aes(x=sex,y=value,fill=sex)) +
+  geom_bar(stat = "identity") + 
+  theme_minimal() + 
+  scale_fill_manual(values=c("hotpink",
+                             "darkblue")) +
+  theme(text = element_text(size = 20, colour = "black"))
+
+# plot sex distribution per comparison group
+ggplot(input, aes(x=group,y=value,fill=sex)) +
+  geom_bar(stat = "identity", position = "dodge") + 
+  labs(title="Number of male/female donors per group") + 
+  theme_minimal() + 
+  scale_fill_manual(values=c("hotpink",
+                             "darkblue")) +
+  theme(text = element_text(size = 20, colour = "black"))
+
+```
+
+
+```{r fig.height=7, fig.width=7}
+do_FeaturePlot(fetahu2023_NK, 
+               plot.title = "EOMES",
+               plot.subtitle = "gene expression in NK cells",
+               features = "EOMES",
+               reduction = "UMAP",
+               plot.axes = TRUE, 
+               pt.size = 0.5,
+               slot = "data",
+               assay = "RNA",
+               font.size = 18
+               )
+
+do_FeaturePlot(fetahu2023_NK, 
+               plot.title = "ID2",
+               plot.subtitle = "gene expression in NK cells",
+               features = "ID2",
+               reduction = "UMAP",
+               plot.axes = TRUE, 
+               pt.size = 0.5,
+               slot = "data",
+               assay = "RNA",
+               font.size = 18
+               )
+
+do_FeaturePlot(fetahu2023_NK, 
+               plot.title = "TBX21",
+               plot.subtitle = "gene expression in NK cells",
+               features = "TBX21",
+               reduction = "UMAP",
+               plot.axes = TRUE, 
+               pt.size = 0.5,
+               slot = "data",
+               assay = "RNA",
+               font.size = 18
+               )
+
+do_FeaturePlot(fetahu2023_NK, 
+               plot.title = "NFIL3",
+               plot.subtitle = "gene expression in NK cells",
+               features = "NFIL3",
+               reduction = "UMAP",
+               plot.axes = TRUE, 
+               pt.size = 0.5,
+               slot = "data",
+               assay = "RNA",
+               font.size = 18
+               )
+
+do_FeaturePlot(fetahu2023_NK, 
+               plot.title = "PLZF (ZBTB16)",
+               plot.subtitle = "gene expression in NK cells",
+               features = "ZBTB16",
+               reduction = "UMAP",
+               plot.axes = TRUE, 
+               pt.size = 0.5,
+               slot = "data",
+               assay = "RNA",
+               font.size = 18
+               )
+
+```
+```{r fig.height=5, fig.width=10}
+NK_cytotoxic_markers <- list("canonical NK markers" =  c("EOMES","ID2","TBX21"),
+                             "indirect killing" =  c("PRF1","GZMB"),
+                             "direct killing" = c("TNFSF10","FASLG"),
+                             "recruitment of immune cells" = c("IFNG","TNF"),
+                              "NK activating cytokines" = c("IL2", "IL15", "IL12A", "IL12B","IL18"))
+
+do_DotPlot(fetahu2023_NK, 
+           features = NK_cytotoxic_markers, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 18,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1
+           )
+
+do_DotPlot(fetahu2023_NK, 
+           features = NK_cytotoxic_markers, 
+           group.by = "group.y", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 18,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1
+           )
+
+# NK cell killing occurs either via secretion of 
+# perforin-1 (PRF1 Gene) and granzyme B (GZMB gene) or 
+# direct cell-to-cell contact via death receptors TRAIL (TNFRSF10B gene) and  
+# FAS receptor (TNFSF6 gene). FAS ligand (FASLG gene); TRAIL ligand (TNFSF10 gene) 
+# or mediate cell killing by recruiting other immune cells via cytokine and
+# chemokine secretion, and induce cell death via Interferon-γ (IFNG gene) or  
+# TNF secretion
+```
+
+
+# ___Desensitized/exhausted NK cells___
+
+```{r}
+# list of genes from NK Cell Exhaustion review paper from 2017
+# DOI: 10.3389/fimmu.2017.00760
+# 2B4 = CD244 gene
+# NKG2A  = KLRC1 gene
+# NKG2D = KLRK1 gene
+# NRC proteins = NCOA1, NCOA2, NCOA3
+# CD16 = FCGR3A Gene gene
+# TIM3 = HAVCR2 gene
+
+exhausted_NK_genes <- list(up = c("PDCD1", "HAVCR2", "KLRC1"),
+                           down = c("KLRK1","FCGR3A","NCOA1", "NCOA2", 
+                                    "NCOA3","CD226","CD244","IFNG")) 
+
+do_DotPlot(fetahu2023_NK, 
+           features = exhausted_NK_genes, 
+           group.by = "group.y", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 18,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1
+           )
+
+do_DotPlot(fetahu2023_NK, 
+           features = exhausted_NK_genes, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 18,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1
+           )
+
+```
+
+
+# ___CCC analysis___
+
+
+The degree to which NK cells are active against tumour cells is highly dependent 
+on the activation state of the NK cells, which is regulated in large part by 
+cytokines derived from dendritic cells (DCs) and monocytes
+
+## ___NK cells: L-R expression per cluster per group___
+
+```{r fig.height=5, fig.width=15}
+# based on The cancer–natural killer cell immunity cycle review paper
+# high or low expression of  these genes is associated with a good prognosis 
+# in a pan-cancer analysis
+
+NK_receptors <- c("ADORA2A","CD2","CD226", "CD244", "TIGIT","TMIGD2", 
+                  "NCR1","NCR2","NCR3","NT5E", "ITGAL", "ITGB2","PDCD1",
+                  "KLRC1","KLRC2", "KLRC3", "KLRC4", "KLRD1", "KLRF1",
+                  "KLRG1", "KLRG2","KLRK1", "KIR2DL1", "KIR2DL3", "KIR2DL4", 
+                  "KIR2DS4","KIR3DL1", "KIR3DL2", "KIR3DL3")
+
+NK_secreted_cytokines <- c("CCL5","FLT3LG", "XCL1", "XCL2")
+
+NK_prognosis_markers <- list(NK_receptors = c("ADORA2A","CD2","CD226", "CD244", 
+                                              "TIGIT","TMIGD2", "NCR1","NCR2",
+                                              "NCR3","NT5E", "ITGAL", "ITGB2",
+                                              "PDCD1","KLRC1","KLRC2", "KLRC3", 
+                                              "KLRC4", "KLRD1","KLRF1","KLRG1", 
+                                              "KLRG2","KLRK1","KIR2DL1","KIR2DL3", 
+                                              "KIR2DL4", "KIR3DL1", "KIR3DL2", 
+                                              "KIR3DL3","KIR2DS4"),
+                             NK_secreted_cytokines = c("CCL5","FLT3LG", "XCL1", "XCL2"))
+
+do_DotPlot(fetahu2023_NK, 
+           features = NK_prognosis_markers, 
+           group.by = "group.y", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 18,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1
+           )
+
+do_DotPlot(fetahu2023_NK, 
+           features = NK_prognosis_markers, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 18,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1
+           )
+
+```
+
+
+## ___NK - M - DC axis___
+
+```{r}
+cell_types_of_interest_v2 <- c("NK (4)",
+                               "pDC (12)",
+                               "M (1)","M (2)", "M (10)","M (15)")
+
+fetahu2023.NK.DC.M <- subset(fetahu2023,
+                             idents = cell_types_of_interest_v2)
+
+cell_types_of_interest_v3 <- c("M (10)")
+fetahu2023.M10 <- subset(fetahu2023,
+                         idents = cell_types_of_interest_v3)
+
+do_DotPlot(fetahu2023.NK.DC.M, 
+           features = NK_cytotoxic_markers, 
+           group.by = "orig.ident", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 18,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1
+           )
+
+do_DotPlot(fetahu2023.M10, 
+           features = NK_cytotoxic_markers, 
+           group.by = "group.y", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 18,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1
+           )
+
+do_ViolinPlot(fetahu2023.NK.DC.M, 
+           features = c("IL2", "IL15", "IL12A", "IL12B","IL18"), 
+           group.by = "orig.ident", 
+           split.by = "group.y",
+           plot_boxplot = FALSE,
+           slot = "data")
+
+# Chemokines secreated by NK cells and associated with 
+# recruiting type 1 conventional dendritic cells
+
+do_DotPlot(fetahu2023_NK, 
+           features = c("CCL5","XCL1","FLT3LG"), 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 18,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1
+           )
+
+do_DotPlot(fetahu2023_NK, 
+           features = c("CCL5","XCL1","FLT3LG"), 
+           group.by = "group.y", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 18,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1
+           )
+
+```
+
+-------------------------------------------------------------------------------
+
+# ___Session Info___
+
+```{r}
+sessionInfo()
+```

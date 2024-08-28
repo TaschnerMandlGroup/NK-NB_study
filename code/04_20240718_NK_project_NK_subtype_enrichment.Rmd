@@ -1,0 +1,775 @@
+---
+title: "NK project with Magdalena Rados"
+author: "Sara Wernig-Zorc"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  input: "/home/rstudio/mnt_data/"
+  out: "/home/rstudio/mnt_out/"
+  data: "/home/rstudio/mnt_data/"
+  nb_tumors: "/home/rstudio/mnt_nb_tumors/"
+  GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
+  markers: "/home/rstudio/mnt_resources/MES_ADRN/"
+---
+
+```{r setup, include=FALSE, echo = FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 20)
+options(future.globals.maxSize = 8 * 10^9)
+
+print(params)
+```
+
+```{r R packages: load, include=FALSE, echo=FALSE}
+suppressPackageStartupMessages(library("Seurat"))
+suppressPackageStartupMessages(library("SingleCellExperiment"))
+suppressPackageStartupMessages(library("readxl"))
+suppressPackageStartupMessages(library("SCpubr"))
+suppressPackageStartupMessages(library("scCustomize"))
+suppressPackageStartupMessages(library("ggVennDiagram"))
+suppressPackageStartupMessages(library("statmod"))
+suppressPackageStartupMessages(library("miloR"))
+suppressPackageStartupMessages(library("scran"))
+suppressPackageStartupMessages(library("scater"))
+suppressPackageStartupMessages(library("dplyr"))
+suppressPackageStartupMessages(library("patchwork"))
+suppressPackageStartupMessages(library("RColorBrewer"))
+
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_setup.R")
+```
+
+# __load integrated data__
+
+```{r}
+# input data - integrated data from Fetahu et al., 2023
+scrna_data <- readRDS(paste0(params$out,
+                             "/scRNA-seq_stage_M/results/published/data/rna_decontaminated.rds"))
+metadata <- readRDS(paste0(params$out,
+                           "/scRNA-seq_stage_M/results/published/data/metadata.rds"))
+
+rna <- as.Seurat(scrna_data, data=NULL)
+rna <- RenameAssays(object = rna, originalexp = 'RNA')
+
+# set cell type annotation to the original annotation
+rna@active.ident <- setNames(pull(metadata[match(metadata$cell,colnames(rna)), "cellont_cluster"], "cellont_cluster"),
+                             pull(metadata[match(metadata$cell,colnames(rna)),  "cell"], "cell"))
+
+rna@meta.data$orig.ident <- rna@active.ident
+
+# set assay to RNA 
+DefaultAssay(rna) <- "RNA"
+```
+
+# __subset object to NK cells only__
+
+```{r}
+levels(Idents(rna))
+
+# subset metadata
+filter <- metadata$cellont_abbr == "NK"
+
+# subset scRNA-seq data 
+# to NK cells only
+
+NK_cells <- "NK (4)" # change cluster number
+fetahu.NK <- subset(rna, idents = NK_cells, invert = FALSE)
+fetahu.NK
+
+Idents(fetahu.NK) <- fetahu.NK@meta.data$sample
+fetahu.NK <- RenameIdents(fetahu.NK, 
+                    "2005_1702" = "ATRXmut_01", 
+                    "2006_2684" = "sporadic_01",
+                    "2014_0102" = "ctrl_01",
+                    "2016_1853" = "ctrl_02",
+                    "2016_2950" = "ctrl_03",
+                    "2016_3924" = "ATRXmut_02",
+                    "2016_4503" = "MYCNA_01",
+                    "2018_1404" = "MYCNA_02",
+                    "2018_1625" = "sporadic_02",
+                    "2018_4252" = "ctrl_04",
+                    "2018_6056" = "sporadic_03",
+                    "2019_2495" = "sporadic_04",
+                    "2019_5022" = "MYCNA_03",
+                    "2019_5754" = "MYCNA_04",
+                    "2020_1288" = "ctrl_05",
+                    "2020_1667" = "sporadic_05")
+
+fetahu.NK@meta.data$patients <- Idents(fetahu.NK)
+```
+
+# __Yang et al., 2019__
+
+```{r}
+yang2019_clust_mark_full <- read_excel("/home/rstudio/mnt_resources/NK_cells_gene_sets/Yang2019_supp_Table_1.xlsx")
+yang2019_clust_mark <- yang2019_clust_mark_full$gene
+length(yang2019_clust_mark)
+
+yang2019_clust_filt <- filter(yang2019_clust_mark_full, 
+                              avg_logFC > 0.2) 
+
+yang2019_clust1 <- filter(yang2019_clust_filt, 
+                          cluster == "1") # 149
+yang2019_clust2 <- filter(yang2019_clust_filt, 
+                          cluster == "2") # 21
+yang2019_clust3 <- filter(yang2019_clust_filt, 
+                          cluster == "3") # 65
+yang2019_clust4 <- filter(yang2019_clust_filt, 
+                          cluster == "4") # 6
+yang2019_clust5 <- filter(yang2019_clust_filt, 
+                          cluster == "5") # 143
+yang2019_clust6 <- filter(yang2019_clust_filt, 
+                          cluster == "6") # 79
+yang2019_clust7 <- filter(yang2019_clust_filt, 
+                          cluster == "7") # 65
+
+```
+
+```{r eval=FALSE, include=FALSE}
+# loop through clusters 1-7
+for (x in 1:7) {
+  print(paste0("Processing cluster ", x))
+  filter <- yang2019_clust_filt$cluster == x
+  y <- yang2019_clust_filt[filter,]
+  # write the gene list per cluster
+  write.table(y$gene, sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE,
+              file = paste0("/home/rstudio/mnt_resources/NK_cells_gene_sets/yang2019_cluster",x,".csv"))
+}
+```
+
+
+```{r}
+# normalize and scale count data
+fetahu.NK <- fetahu.NK %>%
+  NormalizeData() %>%
+  ScaleData() %>%
+  FindVariableFeatures(nfeatures = 8000)
+
+# principal component analysis using 1088 genes from yang2019
+fetahu.NK <- RunPCA(fetahu.NK, 
+                    assay = "RNA", 
+                    npcs = 20,
+                    features = yang2019_clust_mark,
+                    seed.use = 2805,
+                    reduction.name = "pca_new")
+
+# PCA plot
+DimPlot(object = fetahu.NK,reduction = "pca_new")
+
+# find closest cells based on gene expression of the yang2019_clust_mark genes
+fetahu.NK <- FindNeighbors(fetahu.NK, 
+                           features = yang2019_clust_mark,
+                           reduction = "pca_new", 
+                           dims = 1:10,
+                           k.param = 100)
+
+# find clusters based on nearest neighbours
+fetahu.NK <- FindClusters(fetahu.NK, 
+                          resolution = 0.2,
+                          random.seed = 28,
+                          group.singletons = TRUE,
+                          cluster.name = "yang2019_clusters")
+
+# Dimension reductions with Uniform Manifold Approximation and Projection (UMAP)
+fetahu.NK <- RunUMAP(fetahu.NK, 
+                     reduction = "pca_new", 
+                     dims = 1:10,
+                     n.epochs = 500,
+                     min.dist = 0.5,
+                     seed.use = 28,
+                     reduction.name = "umap_new")
+
+# plot UMAP
+DimPlot(fetahu.NK,
+        group.by = "yang2019_clusters",
+        reduction = "umap_new")
+
+# Get number of cells per cluster and per group
+table(fetahu.NK$yang2019_clusters, 
+      fetahu.NK$group)
+# Group I: non-tumor-infiltrated BM
+# Group II: MYCNA 
+# Group III: ATRXmutated
+# Group IV: Sporadic
+
+# set Seurat clusters as ident
+Idents(fetahu.NK) <- fetahu.NK@meta.data$yang2019_clusters
+
+# Heatmap of gene expression of yang2019_clust_mark genes
+DoHeatmap(fetahu.NK, 
+          features = yang2019_clust_filt$gene)
+
+saveRDS(fetahu.NK, file = paste0(params$out,
+                                 "NK_project/Rds/fetahu2023_NK_reClust_yang2019.Rds"))
+
+```
+
+```{r Clusters per sample}
+fetahu.NK <- readRDS(file = paste0(params$out,
+                                   "NK_project/Rds/fetahu2023_NK_reClust_yang2019.Rds"))
+
+Idents(fetahu.NK) <- fetahu.NK@meta.data$patients
+
+percent_NK_group <- table(fetahu.NK$yang2019_clusters,fetahu.NK$group)
+percent_NK_group
+
+percent_NK_sample <- table(fetahu.NK$yang2019_clusters, fetahu.NK$patients)
+percent_NK_sample
+
+
+# define colors
+colors <- brewer.pal(4,"Pastel2") 
+
+barplot(percent_NK_group,
+        col = colors, 
+        border = "white", 
+        xlab = "NB genetic group",
+        legend.text = c("C1","C2","C3","C4"))
+
+
+# Transform this data in %
+data_percentage_group <- apply(percent_NK_group, 2, 
+                         function(x){x*100/sum(x,na.rm=T)})
+
+data_percentage_sample <- apply(percent_NK_sample, 2, 
+                         function(x){x*100/sum(x,na.rm=T)})
+ 
+
+# Make a stacked barplot in %
+barplot(data_percentage_group, 
+        col = colors, 
+        border = "white", 
+        xlab = "NB genetic group",
+        legend.text = c("C1","C2","C3","C4"))
+
+barplot(data_percentage_sample, 
+        col = colors, 
+        border = "white", 
+        xlab = "NB genetic group",
+        legend.text = c("C1","C2","C3","C4"))
+```
+
+# ___NK sub-type enrichment___
+
+```{r load gene lists}
+yang2019_clust1 <- read.table("/home/rstudio/mnt_resources/NK_cells_gene_sets/yang2019_cluster1.csv")
+nrow(yang2019_clust1)
+yang2019_clust2 <- read.table("/home/rstudio/mnt_resources/NK_cells_gene_sets/yang2019_cluster2.csv")
+nrow(yang2019_clust2)
+yang2019_clust3 <- read.table("/home/rstudio/mnt_resources/NK_cells_gene_sets/yang2019_cluster3.csv")
+nrow(yang2019_clust3)
+yang2019_clust4 <- read.table("/home/rstudio/mnt_resources/NK_cells_gene_sets/yang2019_cluster4.csv")
+nrow(yang2019_clust4)
+yang2019_clust5 <- read.table("/home/rstudio/mnt_resources/NK_cells_gene_sets/yang2019_cluster5.csv")
+nrow(yang2019_clust5)
+yang2019_clust6 <- read.table("/home/rstudio/mnt_resources/NK_cells_gene_sets/yang2019_cluster6.csv")
+nrow(yang2019_clust6)
+yang2019_clust7 <- read.table("/home/rstudio/mnt_resources/NK_cells_gene_sets/yang2019_cluster7.csv")
+nrow(yang2019_clust7)
+```
+
+```{r}
+# extract counts
+counts <- LayerData(fetahu.NK, assay="RNA", layer='data')
+var_genes <- dimnames(counts)[[1]]
+
+# remove genes not present in dataset
+yang2019_clust1 <- intersect(yang2019_clust1$V1, var_genes)
+length(yang2019_clust1)
+yang2019_clust2 <- intersect(yang2019_clust2$V1, var_genes)
+length(yang2019_clust2)
+yang2019_clust3 <- intersect(yang2019_clust3$V1, var_genes)
+length(yang2019_clust3)
+yang2019_clust4 <- intersect(yang2019_clust4$V1, var_genes)
+length(yang2019_clust4)
+yang2019_clust5 <- intersect(yang2019_clust5$V1, var_genes)
+length(yang2019_clust5)
+yang2019_clust6 <- intersect(yang2019_clust6$V1, var_genes)
+length(yang2019_clust6)
+yang2019_clust7 <- intersect(yang2019_clust7$V1, var_genes)
+length(yang2019_clust7)
+
+yang2019_genes <- list(cluster1 = yang2019_clust1, 
+                       cluster2 = yang2019_clust2,
+                       cluster3 = yang2019_clust3,
+                       cluster4 = yang2019_clust4,
+                       cluster5 = yang2019_clust5,
+                       cluster6 = yang2019_clust6,
+                       cluster7 = yang2019_clust7)
+
+#pdf(file = paste0(params$out,"NK_project/figures/yang2019_gene_list_overlap.pdf"),
+#   height = 5, width = 10)
+ggVennDiagram(yang2019_genes, set_size = 6, label_alpha = 0,label_size = 2,
+  category.names = c("Cluster 1","Cluster 2","Cluster 3","Cluster 4",
+                     "Cluster 5","Cluster 6","Cluster 7"),
+  edge_size = 1, label_percent_digit = 2,label_color = "white") +
+  ggplot2::scale_fill_gradient(low="#B59410",high = "darkblue") +
+  labs(title = "\t \t \t Overlap of marker genes") + 
+  theme(title = element_text(size = 20),legend.text = element_text(size = 10)) +
+  scale_x_continuous(expand = expansion(mult = .2))
+#dev.off()
+```
+
+```{r generate cluster module scores}
+fetahu.NK <- AddModuleScore(fetahu.NK,
+                         features = yang2019_clust1,
+                         name = "Yang2019_cluster1_",
+                         seed = 2805,
+                         slot = "data")
+
+fetahu.NK <- AddModuleScore(fetahu.NK,
+                         features = yang2019_clust2,
+                         name = "Yang2019_cluster2_",
+                         seed = 2805)
+
+fetahu.NK <- AddModuleScore(fetahu.NK,
+                         features = yang2019_clust3,
+                         name = "Yang2019_cluster3_",
+                         seed = 2805)
+
+fetahu.NK <- AddModuleScore(fetahu.NK,
+                         features = yang2019_clust4,
+                         name = "Yang2019_cluster4_",
+                         seed = 2805)
+
+fetahu.NK <- AddModuleScore(fetahu.NK,
+                         features = yang2019_clust5,
+                         name = "Yang2019_cluster5_",
+                         seed = 2805)
+
+fetahu.NK <- AddModuleScore(fetahu.NK,
+                         features = yang2019_clust6,
+                         name = "Yang2019_cluster6_",
+                         seed = 2805)
+
+fetahu.NK <- AddModuleScore(fetahu.NK,
+                         features = yang2019_clust7,
+                         name = "Yang2019_cluster7_",
+                         seed = 2805)
+```
+
+```{r plot module scores, fig.height=6, fig.width=6}
+#pdf(file = paste0(params$out,"NK_project/figures/fetahu2023_reClust_UMAP.pdf"), 
+#    height = 6, width = 6)
+do_DimPlot(sample = fetahu.NK,
+           plot.title = "Fetahu et al., 2023",
+           plot.subtitle = "Re-clustering using Yang et al., 2019 gene lists",
+           reduction = "umap_new",
+           colors.use = COLOR_CODE_CLUST_v3,
+           group.by = "yang2019_clusters",
+           shuffle = TRUE,
+           repel = TRUE,
+           font.size = 16,
+           plot.axes = TRUE,
+           pt.size = 1,
+           legend.title = "Clusters",
+           legend.position = "right")
+#dev.off()
+
+#pdf(file = paste0(params$out,"NK_project/figures/yang2019_moduleScore_cluster1.pdf"), 
+#    height = 6, width = 6)
+do_FeaturePlot(sample = fetahu.NK, 
+               features = "Yang2019_cluster1_1",
+               plot.subtitle = "Yang et al., 2019: Cluster 1 gene module score",
+               plot.title = "Fetahu et al., 2023",
+               order = TRUE,
+               pt.size = 1,
+               use_viridis = TRUE,
+               viridis.direction = -1,
+               viridis.palette = "A",
+               font.size = 16,
+               label.size = 16,
+               legend.title.face = "bold",
+               axis.text.face = "bold",
+               plot.title.face = "bold",
+               plot.axes = TRUE,
+               legend.title = "Score",
+               legend.length = 10,
+               legend.position = "right")
+#dev.off()
+
+#pdf(file = paste0(params$out,"NK_project/figures/yang2019_moduleScore_cluster2.pdf"), 
+#    height = 6, width = 6)
+do_FeaturePlot(sample = fetahu.NK, 
+               features = "Yang2019_cluster2_1",
+               plot.subtitle = "Yang et al., 2019: Cluster 2 gene module score",
+               plot.title = "Fetahu et al., 2023",
+               order = TRUE,
+               pt.size = 1,
+               use_viridis = TRUE,
+               viridis.direction = -1,
+               viridis.palette = "A",
+               font.size = 16,
+               label.size = 16,
+               legend.title.face = "bold",
+               axis.text.face = "bold",
+               plot.title.face = "bold",
+               plot.axes = TRUE,
+               legend.title = "Score",
+               legend.length = 10,
+               legend.position = "right")
+#dev.off()
+
+#pdf(file = paste0(params$out,"NK_project/figures/yang2019_moduleScore_cluster3.pdf"), 
+#    height = 6, width = 6)
+do_FeaturePlot(sample = fetahu.NK, 
+               features = "Yang2019_cluster3_1",
+               plot.subtitle = "Yang et al., 2019: Cluster 3 gene module score",
+               plot.title = "Fetahu et al., 2023",
+               order = TRUE,
+               pt.size = 1,
+               use_viridis = TRUE,
+               viridis.direction = -1,
+               viridis.palette = "A",
+               font.size = 16,
+               label.size = 16,
+               legend.title.face = "bold",
+               axis.text.face = "bold",
+               plot.title.face = "bold",
+               plot.axes = TRUE,
+               legend.title = "Score",
+               legend.length = 10,
+               legend.position = "right")
+#dev.off()
+
+#pdf(file = paste0(params$out,"NK_project/figures/yang2019_moduleScore_cluster4.pdf"), 
+#    height = 6, width = 6)
+do_FeaturePlot(sample = fetahu.NK, 
+               features = "Yang2019_cluster4_1",
+               plot.subtitle = "Yang et al., 2019: Cluster 4 gene module score",
+               plot.title = "Fetahu et al., 2023",
+               order = TRUE,
+               pt.size = 1,
+               use_viridis = TRUE,
+               viridis.direction = -1,
+               viridis.palette = "A",
+               font.size = 16,
+               label.size = 16,
+               legend.title.face = "bold",
+               axis.text.face = "bold",
+               plot.title.face = "bold",
+               plot.axes = TRUE,
+               legend.title = "Score",
+               legend.length = 10,
+               legend.position = "right")
+#dev.off()
+
+#pdf(file = paste0(params$out,"NK_project/figures/yang2019_moduleScore_cluster5.pdf"), 
+#    height = 6, width = 6)
+do_FeaturePlot(sample = fetahu.NK, 
+               features = "Yang2019_cluster5_1",
+               plot.subtitle = "Yang et al., 2019: Cluster 5 gene module score",
+               plot.title = "Fetahu et al., 2023",
+               order = TRUE,
+               pt.size = 1,
+               use_viridis = TRUE,
+               viridis.direction = -1,
+               viridis.palette = "A",
+               font.size = 16,
+               label.size = 16,
+               legend.title.face = "bold",
+               axis.text.face = "bold",
+               plot.title.face = "bold",
+               plot.axes = TRUE,
+               legend.title = "Score",
+               legend.length = 10,
+               legend.position = "right")
+#dev.off()
+
+#pdf(file = paste0(params$out,"NK_project/figures/yang2019_moduleScore_cluster6.pdf"), 
+#    height = 6, width = 6)
+do_FeaturePlot(sample = fetahu.NK, 
+               features = "Yang2019_cluster6_1",
+               plot.subtitle = "Yang et al., 2019: Cluster 6 gene module score",
+               plot.title = "Fetahu et al., 2023",
+               order = TRUE,
+               pt.size = 1,
+               use_viridis = TRUE,
+               viridis.direction = -1,
+               viridis.palette = "A",
+               font.size = 16,
+               label.size = 16,
+               legend.title.face = "bold",
+               axis.text.face = "bold",
+               plot.title.face = "bold",
+               plot.axes = TRUE,
+               legend.title = "Score",
+               legend.length = 10,
+               legend.position = "right")
+#dev.off()
+
+
+#pdf(file = paste0(params$out,"NK_project/figures/yang2019_moduleScore_cluster7.pdf"), 
+#    height = 6, width = 6)
+do_FeaturePlot(sample = fetahu.NK, 
+               features = "Yang2019_cluster7_1",
+               plot.subtitle = "Yang et al., 2019: Cluster 7 gene module score",
+               plot.title = "Fetahu et al., 2023",
+               order = TRUE,
+               pt.size = 1,
+               use_viridis = TRUE,
+               viridis.direction = -1,
+               viridis.palette = "A",
+               font.size = 16,
+               label.size = 16,
+               legend.title.face = "bold",
+               axis.text.face = "bold",
+               plot.title.face = "bold",
+               plot.axes = TRUE,
+               legend.title = "Score",
+               legend.length = 10,
+               legend.position = "right")
+#dev.off()
+```
+
+```{r fig.height=6, fig.width=6}
+FeaturePlot(object = fetahu.NK, 
+            features = "Yang2019_cluster1_1",
+            reduction = "umap_new",
+            cols = c("darkgray","blue","red"),
+            pt.size = 1,
+            order = FALSE)
+FeaturePlot(object = fetahu.NK, 
+            features = "Yang2019_cluster2_1",
+            reduction = "umap_new",
+            cols = c("darkgray","blue","red"),
+            pt.size = 1,
+            order = FALSE)
+FeaturePlot(object = fetahu.NK, 
+            features = "Yang2019_cluster3_1",
+            reduction = "umap_new",
+            cols = c("darkgray","blue","red"),
+            pt.size = 1,
+            order = FALSE)
+FeaturePlot(object = fetahu.NK, 
+            features = "Yang2019_cluster4_1",
+            reduction = "umap_new",
+            cols = c("darkgray","blue","red"),
+            pt.size = 1,
+            order = FALSE)
+FeaturePlot(object = fetahu.NK, 
+            features = "Yang2019_cluster5_1",
+            reduction = "umap_new",
+            cols = c("darkgray","blue","red"),
+            pt.size = 1,
+            order = FALSE)
+FeaturePlot(object = fetahu.NK, 
+            features = "Yang2019_cluster6_1",
+            reduction = "umap_new",
+            cols = c("darkgray","blue","red"),
+            pt.size = 1,
+            order = FALSE)
+FeaturePlot(object = fetahu.NK, 
+            features = "Yang2019_cluster7_1",
+            reduction = "umap_new",
+            cols = c("darkgray","blue","red"),
+            pt.size = 1,
+            order = FALSE)
+```
+
+
+```{r}
+VlnPlot(fetahu.NK,features = "Yang2019_cluster1_1")
+RidgePlot(fetahu.NK,features = "Yang2019_cluster1_1")
+VlnPlot(fetahu.NK,features = "Yang2019_cluster2_1")
+RidgePlot(fetahu.NK,features = "Yang2019_cluster2_1")
+VlnPlot(fetahu.NK,features = "Yang2019_cluster3_1")
+RidgePlot(fetahu.NK,features = "Yang2019_cluster3_1")
+VlnPlot(fetahu.NK,features = "Yang2019_cluster4_1")
+RidgePlot(fetahu.NK,features = "Yang2019_cluster4_1")
+VlnPlot(fetahu.NK,features = "Yang2019_cluster5_1")
+RidgePlot(fetahu.NK,features = "Yang2019_cluster5_1")
+VlnPlot(fetahu.NK,features = "Yang2019_cluster6_1")
+RidgePlot(fetahu.NK,features = "Yang2019_cluster6_1")
+VlnPlot(fetahu.NK,features = "Yang2019_cluster7_1")
+RidgePlot(fetahu.NK,features = "Yang2019_cluster7_1")
+```
+
+
+# ___DA testing___
+
+```{r}
+fetahu.NK@meta.data$patients<- factor(fetahu.NK@meta.data$patients)
+fetahu.NK@meta.data$yang2019_clusters<- factor(fetahu.NK@meta.data$yang2019_clusters)
+```
+
+```{r miloR - many groups}
+# MiloR doesn't use the "original" clusters but rather creates neighborhoods
+# based on similar logFC (note the fold change here is the number of cells
+# per cell type)
+
+#2. If comparing more than two sample / groups, use DA testing with contrasts
+
+# For differential abundance analysis on graph neighborhoods we first construct a Milo object. 
+# This extends the SingleCellExperiment class to store information about neighborhoods on the KNN graph.
+
+rna_milo <- Milo(as.SingleCellExperiment(fetahu.NK))
+rna_milo
+
+reducedDim(rna_milo, "UMAP") <- reducedDim(as.SingleCellExperiment(fetahu.NK), 
+                                           "UMAP_NEW")
+plotUMAP(rna_milo, 
+         colour_by="group") 
+plotUMAP(rna_milo, 
+        colour_by="patients")
+
+# Define cell neighbourhoods
+rna_milo <- buildGraph(rna_milo, 
+                       k = 10, 
+                       d = 30)
+
+## Constructing kNN graph with k = 10
+rna_milo <- makeNhoods(rna_milo, 
+                       prop = 0.1, 
+                       k = 10, 
+                       d = 30, 
+                       refined = TRUE, 
+                       refinement_scheme = "graph") # make nhoods using graph-only as this is faster
+
+# metadata
+colData(rna_milo)$patients <- paste(colData(rna_milo)$group, colData(rna_milo)$patients, sep="_")
+
+# Counting cells in neighbourhoods
+rna_milo <- countCells(rna_milo, meta.data = data.frame(colData(rna_milo)), 
+                       samples="patients") # make the nhood X sample counts matrix
+
+
+# Defining experimental design
+rna_design <- data.frame(colData(rna_milo))[,c("patients", "group")]
+rna_design <- distinct(rna_design)
+rownames(rna_design) <- rna_design$patients
+rna_design
+
+# Computing neighborhood connectivity
+rna_milo <- calcNhoodDistance(rna_milo, 
+                              d = 30, 
+                              reduced.dim = "PCA")
+
+# DA testing
+da_results <- testNhoods(rna_milo, 
+                         design = ~ 0 + group,
+                         design.df = rna_design, 
+                         reduced.dim="PCA")
+head(da_results)
+
+da_results %>%
+  arrange(SpatialFDR) %>%
+  head() 
+
+rna_milo <- buildNhoodGraph(rna_milo)
+
+
+# QUALITY CHECK OF THE DIFFERENTIAL ABUNDANCE TESTING
+
+# Plot single-cell UMAP
+umap_pl <- plotReducedDim(rna_milo, 
+                          dimred = "UMAP", 
+                          colour_by = "group", 
+                          text_by = "yang2019_clusters", 
+                          text_size = 3, point_size = 0.5,) +
+  guides(fill = "none")
+
+rna_milo <- buildNhoodGraph(rna_milo)
+
+# Plot neighbourhood graph
+nh_graph_pl <- plotNhoodGraphDA(rna_milo, 
+                                da_results, 
+                                layout="UMAP", 
+                                alpha=0.05) 
+
+umap_pl + nh_graph_pl +
+  plot_layout(guides = "collect")
+
+# Differential abundance testing with contrasts
+rna_design <- data.frame(colData(rna_milo))[,c("patients", "group")]
+rna_design <- distinct(rna_design)
+rownames(rna_design) <- rna_design$patients
+
+# Reorder rownames to match columns of nhoodCounts(milo)
+rna_design <- rna_design[colnames(nhoodCounts(rna_milo)), , drop=FALSE]
+table(rna_design$group)
+
+# Comparisons
+#A. ATRXmut vs.(MYCNA and sporadic)
+model <- model.matrix(~ 0 + group, data = rna_design)
+ave.contrast <- c("groupIII - (groupII + groupIV) / 2")
+mod.constrast <- makeContrasts(contrasts = ave.contrast, levels = model)
+mod.constrast
+
+da_results_ATRXmutvsAll <- testNhoods(rna_milo, design = ~ 0 + group, 
+                         design.df = rna_design, 
+                         model.contrasts = ave.contrast, 
+                         fdr.weighting = "graph-overlap")
+
+table(da_results_ATRXmutvsAll$SpatialFDR < 0.1)
+
+# annotate hood with original cell type annotation
+da_results_ATRXmutvsAll <- annotateNhoods(rna_milo, da_results_ATRXmutvsAll, 
+                             coldata_col = "yang2019_clusters")
+
+# remove hoods that contained mixed cell type populations
+da_results_ATRXmutvsAll$yang2019_clusters <- 
+  ifelse(da_results_ATRXmutvsAll$yang2019_clusters_fraction < 0.7, 
+         "Mixed", da_results_ATRXmutvsAll$yang2019_clusters)
+
+# filter only significant populations (less than 10% false discovery rate and 
+# fold change bigger than 0.5)
+results <- da_results_ATRXmutvsAll %>% 
+  arrange(FDR) %>% filter(FDR < 0.1 & abs(logFC) >= 0.5)
+results
+
+plotDAbeeswarm(da_results_ATRXmutvsAll, group.by = "yang2019_clusters")
+
+#B. ATRXmut vs.(MYCNA and sporadic and control)
+
+model <- model.matrix(~ 0 + group, data = rna_design)
+ave.contrast <- c("groupIII - (groupII + groupIV + groupI) / 3")
+mod.constrast <- makeContrasts(contrasts = ave.contrast, levels = model)
+mod.constrast
+
+da_results_ATRXmutvsAll <- testNhoods(rna_milo, design = ~ 0 + group, 
+                         design.df = rna_design, 
+                         model.contrasts = ave.contrast, 
+                         fdr.weighting = "graph-overlap")
+
+table(da_results_ATRXmutvsAll$SpatialFDR < 0.1)
+
+# annotate hood with original cell type annotation
+da_results_ATRXmutvsAll <- annotateNhoods(rna_milo, da_results_ATRXmutvsAll, 
+                             coldata_col = "yang2019_clusters")
+
+# remove hoods that contained mixed cell type populations
+da_results_ATRXmutvsAll$yang2019_clusters <- 
+  ifelse(da_results_ATRXmutvsAll$yang2019_clusters_fraction < 0.7, 
+         "Mixed", da_results_ATRXmutvsAll$yang2019_clusters)
+
+# filter only significant populations (less than 10% false discovery rate and 
+# fold change bigger than 0.5)
+results <- da_results_ATRXmutvsAll %>% 
+  arrange(FDR) %>% filter(FDR < 0.1 & abs(logFC) >= 0.5)
+results
+
+plotDAbeeswarm(da_results_ATRXmutvsAll, group.by = "yang2019_clusters")
+```
+
+
+# ___SessionInfo___
+
+```{r}
+sessionInfo()
+```
+
