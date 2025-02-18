@@ -1,0 +1,3277 @@
+---
+title: "NK project: New clinical annotation"
+author: "Dr. Sara Wernig-Zorc"
+date: "04.10.2024"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged                 
+params:
+  input_BM1: "/home/rstudio/mnt_data/BM/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"
+  input_BM2: "/home/rstudio/mnt_data/BM/yang2019/Rds/Human_BM_NK_seurat_v4.Rds"
+  input_BM3: "/home/rstudio/mnt_data/BM/Lee/disco_bone_marrow_v2.0.rds"
+  input_scRNA: "/home/rstudio/mnt_out/scRNA-seq_stage_M/results/published/data/rna_decontaminated.rds"
+  out: "/home/rstudio/mnt_out/NK_project/"
+  GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
+  markers: "/home/rstudio/mnt_resources/MES_ADRN/"
+  metadata: "/home/rstudio/mnt_out/scRNA-seq_stage_M/results/metadata/"
+---
+
+DESCRIPTION
+
+Evi re-analysed the SNP data for these patients and discovered that one of the
+sporadic patients actually carries an ATRX deletion.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 80)
+options(future.globals.maxSize = 80 * 10^9)
+
+print(params)
+```
+
+```{r load project specific R packages and color code}
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_setup.R")
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_utils.R")
+
+library(EnhancedVolcano)
+```
+
+# ___Add new clinical information to the single cell object___
+
+```{r eval=FALSE, include=FALSE}
+fetahu2023 <- readRDS(file = paste0(params$input_scRNA))
+metadata <- readRDS("/home/rstudio/mnt_out/scRNA-seq_stage_M/results/published/data/metadata.rds")
+
+fetahu2023 <- SeuratObject::as.Seurat(fetahu2023, data=NULL)
+fetahu2023 <- RenameAssays(object = fetahu2023, originalexp = 'RNA')
+
+# set cell type annotation to the original annotation
+fetahu2023@active.ident <- setNames(pull(metadata[match(metadata$cell,colnames(fetahu2023)),"cellont_cluster"], "cellont_cluster"),pull(metadata[match(metadata$cell,colnames(fetahu2023)), "cell"], "cell"))
+
+fetahu2023@meta.data$orig.ident <- fetahu2023@active.ident
+
+# set assay to RNA 
+DefaultAssay(fetahu2023) <- "RNA"
+
+# add sex and age information
+# Merge the metadata with the Seurat object's metadata based on the sample_ID and sample columns
+# Ensure column names match those in your data
+full_metadata <- read.csv(file = paste0(params$metadata, 
+  "2024-10-04_Fetahu_complete_single_cell_cohort_EB_FINAL_Rimport.csv"), 
+  sep =";",colClasses = c("character","character","character","character","character",
+                          "character","character","numeric","character",
+                          "character","character","character","character",
+                          "numeric","character","character","character",
+                          "character","character","character","character",
+                          "character","character","character","character",
+                          "character","character","character","character",
+                          "character","character","character","character"))
+
+full_metadata[, 1] <- as.Date(full_metadata[, 1], format = "%d/%m/%Y")
+full_metadata[, 2] <- as.Date(full_metadata[, 2], format = "%d/%m/%Y")
+
+metadata <- fetahu2023@meta.data
+metadata$cell_ID <- row.names(metadata)
+
+names(full_metadata)[names(full_metadata) == 'BM_ID'] <- 'sample'
+
+full_metadata$sample <- gsub("-", "_", full_metadata$sample)
+
+# Perform the merge using left_join from dplyr, keeping the row order of df1
+merged_metadata <- metadata %>%
+  left_join(full_metadata, by = "sample") %>% 
+  distinct(cell_ID, .keep_all = TRUE)
+
+row.names(merged_metadata) <- merged_metadata$cell_ID 
+
+# Update the Seurat object's metadata slot
+fetahu2023@meta.data <- merged_metadata
+fetahu2023@meta.data
+
+saveRDS(fetahu2023, file = paste0(params$out,"/Rds/fetahu2023_withNewMetadata.Rds"))
+```
+
+```{r eval=FALSE, include=FALSE}
+predicted_labels <- readRDS(file = paste0(params$out,                                 "/Rds/fetahu2023_predicted_NKclusters_from_Crinier2021_de.n=350.Rds"))
+
+levels(Idents(fetahu2023))
+
+# subset scRNA-seq data 
+# NK cells only
+
+NK_cells <- "NK (4)" # change cluster number
+ALL_NK <- subset(fetahu2023, idents = NK_cells, invert = FALSE)
+
+# subset metadata
+filter <- metadata$cellont_abbr == "NK"
+NK.metadata <- metadata[filter,]
+NK.metadata <- ALL_NK@meta.data
+NK.metadata$cell_ID <- row.names(NK.metadata)
+predicted_labels$cell_ID <- row.names(predicted_labels)
+
+merged_metadata <- NK.metadata %>%
+  left_join(predicted_labels, by = "cell_ID", copy = TRUE) %>% 
+  distinct(cell_ID, .keep_all = TRUE)
+
+merged_metadata <- merged_metadata %>%
+  rename(predicted_NK_type_de.n350 = labels)
+  
+row.names(merged_metadata) <- merged_metadata$cell_ID 
+  
+ALL_NK@meta.data <- merged_metadata
+
+# log scale counts
+ALL_NK <- ALL_NK %>% 
+  NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000)
+```
+
+```{r eval=FALSE, include=FALSE}
+ALL_NK@meta.data$genetic_subtype  <- factor(ALL_NK@meta.data$genetic_subtype)
+Idents(ALL_NK) <- ALL_NK@meta.data$genetic_subtype 
+
+Idents(ALL_NK) <- plyr::mapvalues(Idents(ALL_NK), 
+                                      from = c("ATRXm",
+                                              "localized",
+                                              "MNA",
+                                              "other"),
+                                      to = c("ATRXm", 
+                                             "control",
+                                             "MYCNamp", 
+                                             "ATRXwtMYCNwt"))
+
+
+ALL_NK@meta.data$genetic_subtype  <- Idents(ALL_NK) 
+
+# identify cell IDs associated with each cluster 
+M <- WhichCells(ALL_NK, ident = "MYCNamp")        # MYCN amplified
+S <- WhichCells(ALL_NK, ident = "ATRXwtMYCNwt") # sporadic
+C <- WhichCells(ALL_NK, ident = "control")   # control / control (GNB or GNM)
+A <- WhichCells(ALL_NK, ident = "ATRXm")       # ATRX deletion or mutations
+
+ALL_NK@active.ident <- ALL_NK$orig.ident
+
+# Add ATRX wt vs. mutated annotation
+Idents(object = ALL_NK, cells = M) <- "ATRXwt"
+Idents(object = ALL_NK, cells = S) <- "ATRXwt"
+Idents(object = ALL_NK, cells = A) <- "ATRXmut"
+Idents(object = ALL_NK, cells = C) <- "CTRL"
+
+# Add active identities to metadata column comparison_group
+ALL_NK$comparison_group <- ALL_NK@active.ident
+
+saveRDS(ALL_NK, file = paste0(params$out,"/Rds/ALL_NK_cluster_withNewMetadata.Rds"))
+```
+
+
+# ___Load data___
+
+```{r}
+ALL_NK <- readRDS(file = paste0(params$out,"/Rds/ALL_NK_cluster_withNewMetadata.Rds"))
+```
+
+```{r}
+# sanity check
+table(ALL_NK$sample, ALL_NK$genetic_subtype)
+```
+
+
+# ___RNA expression___
+
+## ___CD6 expression [on NK sub-clusters]___
+
+### ___Dot plot___
+
+```{r}
+do_DotPlot(sample = ALL_NK, 
+           axis.text.x.angle = 0,
+           features = "CD6",
+           plot.title = "RNA expression",
+           plot.subtitle = "CD6",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "genetic_subtype",
+           use_viridis = TRUE,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 25,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "scaled RNA expression")
+
+do_DotPlot(sample = ALL_NK, 
+           axis.text.x.angle = 0,
+           features = "CD6",
+           plot.title = "RNA expression",
+           plot.subtitle = "CD6",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "predicted_NK_type_de.n350",
+           use_viridis = TRUE,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 25,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "scaled RNA expression")
+```
+
+### ___Feature plot___
+
+```{r fig.height=5, fig.width=10}
+do_FeaturePlot(sample = ALL_NK, 
+               features = "CD6",
+               plot.subtitle = "CD6 gene expression",
+               plot.title = "Predicted NK sub-types in NB-BM samples",
+               order = TRUE,
+               reduction = "UMAP",
+               pt.size = 1,
+               use_viridis = TRUE,
+               viridis.direction = -1,
+               viridis.palette = "A",
+               font.size = 16,
+               label.size = 16,
+               min.cutoff = 0,
+               max.cutoff = 3,
+               legend.title.face = "bold",
+               axis.text.face = "bold",
+               plot.title.face = "bold",
+               plot.axes = TRUE,
+               legend.title = "Score",
+               legend.length = 10,
+               legend.position = "right")
+```
+
+### ___Violin plot with stats___
+
+```{r add stats to violin plots: CD6 expression}
+gene_of_interest <- "CD6"
+
+# Change identities in the Seurat object to genetic groups
+Idents(ALL_NK) <- ALL_NK$genetic_subtype
+
+# Specify groups comparisons
+ATRXm_ctrl <- list("ATRXm", "control")
+ATRXm_ATRXwt <- list("ATRXm", c("MYCNamp","ATRXwtMYCNwt"))
+ATRXm_other <- list("ATRXm", c("control","MYCNamp","ATRXwtMYCNwt"))
+
+my_comparisons <- list(ATRXm_ctrl,
+                       ATRXm_ATRXwt,
+                       ATRXm_other)
+
+# I'M NOT USING THESE COMPARISONS BELOW!
+# These were only used for testing purposes
+
+# Create violin plot with adjusted p-values for all comparisons [to ATRXm as ref]
+
+# 1. PER GROUP
+
+group_signif <- VlnPlot(ALL_NK, 
+             features = gene_of_interest, 
+             group.by = "genetic_subtype",
+             log = TRUE,
+             cols = COLOR_CODE_GROUP,
+             layer = "data",
+             pt.size = 0) +
+  theme_classic() +
+  stat_compare_means(method = "wilcox.test", 
+                     label = "p.signif",
+                     ref.group = "ATRXm") + 
+      ggtitle(paste(gene_of_interest, " RNA expression")) + 
+  labs(y = paste(gene_of_interest, " log scaled RNA expression"),
+       x = "")  + 
+    theme(legend.position = "none",  # Remove the legend
+          axis.text.x = element_text(angle = 45, hjust = 1, colour = "black"))
+
+# Show the plot
+group_signif
+
+# Save the plot as a PNG file
+group_save <- paste0(params$out,"figures/","fetahu2023_violinPlot_", 
+                      gene_of_interest, "_genetic_groups", "_NEWCLINICALGROUPS" ,".png")
+ggsave(group_save, plot = group_signif, width = 5, height = 4,dpi = 600)
+
+# 2. PER SAMPLE/PATIENT
+
+rename <- as.data.frame(PATIENT_GROUPS_v2)
+
+# Rename the sample names in the Seurat object's metadata
+ALL_NK@meta.data$sample <- plyr::mapvalues(ALL_NK@meta.data$sample, 
+                                                   from = rownames(rename), 
+                                                   to = rename$PATIENT_GROUPS_v2)
+
+ALL_NK@meta.data$sample <- factor(ALL_NK@meta.data$sample)
+
+patient_signif <- VlnPlot(ALL_NK, 
+             features = gene_of_interest, 
+             group.by = "sample",
+             log = TRUE,
+             cols = COLOR_CODE_PATIENTS_GROUP,
+             layer = "data",
+             pt.size = 0) +
+  theme_classic() +
+  stat_compare_means(method = "wilcox.test", 
+                     label = "p.signif",
+                     ref.group = "ATRXm") + 
+      ggtitle(paste(gene_of_interest, " RNA expression")) + 
+  labs(y = paste(gene_of_interest, " log scaled RNA expression"),
+       x = "")  + 
+    theme(legend.position = "none",  # Remove the legend
+          axis.text.x = element_text(angle = 45, hjust = 1, colour = "black"))
+
+# Show the plot
+patient_signif
+
+# Save the plot as a PNG file
+patient_save <- paste0(params$out,"figures/","fetahu2023_violinPlot_", 
+                      gene_of_interest, "_sample", "_NEWCLINICALGROUPS" ,".png")
+ggsave(patient_save, plot = patient_signif, width = 8, height = 4,dpi = 600)
+
+
+
+# COMPARISON BETWEEN NK SUB-TYPES, BETWEEN NB GENETIC GROUPS [ON NK CELLS!]
+
+# Change identities in the Seurat object to genetic groups
+Idents(ALL_NK) <- ALL_NK$predicted_NK_type_de.n350
+
+# Check the range of the gene expression for y label positioning
+gene_range <- range(FetchData(ALL_NK, vars = gene_of_interest)$CD6)
+gene_max <- gene_range[2]
+y_positions <- c(gene_max + 1)
+
+# Extract the cluster identities from the Seurat object
+NK_cluster_list <- unique(Idents(ALL_NK))
+
+# plot violin plots with significance levels for each NK cluster
+for (NK_cluster in NK_cluster_list){
+  # Generate violin plot for each cluster
+  signif_plot <- VlnPlot(ALL_NK,
+        group.by = "genetic_subtype",
+        idents = NK_cluster,
+        features = gene_of_interest,
+        fill.by = "genetic_subtype",
+        log = TRUE,
+        layer = "data",
+        pt.size = 0,
+        cols = COLOR_CODE_GROUP) +
+  theme_classic() +
+  stat_compare_means(method = "wilcox.test", 
+                     label = "p.signif",
+                     ref.group = "ATRXm") +
+      ggtitle(paste("RNA expression for ", gene_of_interest, 
+                    "in cluster: ", NK_cluster)) + 
+  labs(y = paste(gene_of_interest, " log scaled RNA expression"),
+       x = "") + 
+    theme(legend.position = "none",  # Remove the legend
+          axis.text.x = element_text(angle = 45, hjust = 1, colour = "black")) 
+  
+  # print the violin plot on the screen
+  print(signif_plot)
+  
+  # Save the plot as a PNG file
+  file_name <- paste0(params$out,"figures/","fetahu2023_violinPlot_", 
+                      gene_of_interest, "_cluster_", NK_cluster, 
+                      "_NEWCLINICALGROUPS" ,".png")
+  ggsave(file_name, plot = signif_plot, width = 5, height = 4,dpi = 600)
+}
+```
+
+
+## ___CD8A expression [on NK sub-clusters]___
+
+### ___Dot plot___
+
+```{r}
+do_DotPlot(sample = ALL_NK, 
+           axis.text.x.angle = 0,
+           features = "CD8A",
+           plot.title = "RNA expression",
+           plot.subtitle = "CD8A",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "genetic_subtype",
+           use_viridis = TRUE,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 25,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "scaled RNA expression")
+
+do_DotPlot(sample = ALL_NK, 
+           axis.text.x.angle = 0,
+           features = "CD8A",
+           plot.title = "RNA expression",
+           plot.subtitle = "CD8A",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "predicted_NK_type_de.n350",
+           use_viridis = TRUE,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 25,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "scaled RNA expression")
+```
+
+### ___Feature plot___
+
+```{r fig.height=5, fig.width=10}
+do_FeaturePlot(sample = ALL_NK, 
+               features = "CD8A",
+               plot.subtitle = "CD8A gene expression",
+               plot.title = "Predicted NK sub-types in NB-BM samples",
+               order = TRUE,
+               reduction = "UMAP",
+               pt.size = 1,
+               use_viridis = TRUE,
+               viridis.direction = -1,
+               viridis.palette = "A",
+               font.size = 16,
+               label.size = 16,
+               min.cutoff = 0,
+               max.cutoff = 3,
+               legend.title.face = "bold",
+               axis.text.face = "bold",
+               plot.title.face = "bold",
+               plot.axes = TRUE,
+               legend.title = "Score",
+               legend.length = 10,
+               legend.position = "right")
+```
+
+### ___Violin plot with stats___
+
+```{r add stats to violin plots: CD8A expression}
+gene_of_interest <- "CD8A"
+
+# Change identities in the Seurat object to genetic groups
+Idents(ALL_NK) <- ALL_NK$genetic_subtype
+
+# Specify groups comparisons
+ATRXm_ctrl <- list("ATRXm", "control")
+ATRXm_ATRXwt <- list("ATRXm", c("MYCNamp","ATRXwtMYCNwt"))
+ATRXm_other <- list("ATRXm", c("control","MYCNamp","ATRXwtMYCNwt"))
+
+my_comparisons <- list(ATRXm_ctrl,
+                       ATRXm_ATRXwt,
+                       ATRXm_other)
+
+# I'M NOT USING THESE COMPARISONS BELOW!
+# These were only used for testing purposes
+
+# Create violin plot with adjusted p-values for all comparisons [to ATRXm as ref]
+
+# 1. PER GROUP
+
+group_signif <- VlnPlot(ALL_NK, 
+             features = gene_of_interest, 
+             group.by = "genetic_subtype",
+             log = TRUE,
+             cols = COLOR_CODE_GROUP,
+             layer = "data",
+             pt.size = 0) +
+  theme_classic() +
+  stat_compare_means(method = "wilcox.test", 
+                     label = "p.signif",
+                     ref.group = "ATRXm") + 
+      ggtitle(paste(gene_of_interest, " RNA expression")) + 
+  labs(y = paste(gene_of_interest, " log scaled RNA expression"),
+       x = "")  + 
+    theme(legend.position = "none",  # Remove the legend
+          axis.text.x = element_text(angle = 45, hjust = 1, colour = "black"))
+
+# Show the plot
+group_signif
+
+# Save the plot as a PNG file
+group_save <- paste0(params$out,"figures/","fetahu2023_violinPlot_", 
+                      gene_of_interest, "_genetic_groups", "_NEWCLINICALGROUPS" ,".png")
+ggsave(group_save, plot = group_signif, width = 5, height = 4,dpi = 600)
+
+# 2. PER SAMPLE/PATIENT
+
+rename <- as.data.frame(PATIENT_GROUPS_v2)
+
+# Rename the sample names in the Seurat object's metadata
+ALL_NK@meta.data$sample <- plyr::mapvalues(ALL_NK@meta.data$sample, 
+                                                   from = rownames(rename), 
+                                                   to = rename$PATIENT_GROUPS_v2)
+
+ALL_NK@meta.data$sample <- factor(ALL_NK@meta.data$sample)
+
+patient_signif <- VlnPlot(ALL_NK, 
+             features = gene_of_interest, 
+             group.by = "sample",
+             log = TRUE,
+             cols = COLOR_CODE_PATIENTS_GROUP,
+             layer = "data",
+             pt.size = 0) +
+  theme_classic() +
+  stat_compare_means(method = "wilcox.test", 
+                     label = "p.signif",
+                     ref.group = "ATRXm") + 
+      ggtitle(paste(gene_of_interest, " RNA expression")) + 
+  labs(y = paste(gene_of_interest, " log scaled RNA expression"),
+       x = "")  + 
+    theme(legend.position = "none",  # Remove the legend
+          axis.text.x = element_text(angle = 45, hjust = 1, colour = "black"))
+
+# Show the plot
+patient_signif
+
+# Save the plot as a PNG file
+patient_save <- paste0(params$out,"figures/","fetahu2023_violinPlot_", 
+                      gene_of_interest, "_sample", "_NEWCLINICALGROUPS" ,".png")
+ggsave(patient_save, plot = patient_signif, width = 8, height = 4,dpi = 600)
+
+
+
+# COMPARISON BETWEEN NK SUB-TYPES, BETWEEN NB GENETIC GROUPS [ON NK CELLS!]
+
+# Change identities in the Seurat object to genetic groups
+Idents(ALL_NK) <- ALL_NK$predicted_NK_type_de.n350
+
+# Check the range of the gene expression for y label positioning
+gene_range <- range(FetchData(ALL_NK, vars = gene_of_interest)$CD8A)
+gene_max <- gene_range[2]
+y_positions <- c(gene_max + 1)
+
+# Extract the cluster identities from the Seurat object
+NK_cluster_list <- unique(Idents(ALL_NK))
+
+# plot violin plots with significance levels for each NK cluster
+for (NK_cluster in NK_cluster_list){
+  # Generate violin plot for each cluster
+  signif_plot <- VlnPlot(ALL_NK,
+        group.by = "genetic_subtype",
+        idents = NK_cluster,
+        features = gene_of_interest,
+        fill.by = "genetic_subtype",
+        log = TRUE,
+        layer = "data",
+        pt.size = 0,
+        cols = COLOR_CODE_GROUP) +
+  theme_classic() +
+  stat_compare_means(method = "wilcox.test", 
+                     label = "p.signif",
+                     ref.group = "ATRXm") +
+      ggtitle(paste("RNA expression for ", gene_of_interest, 
+                    "in cluster: ", NK_cluster)) + 
+  labs(y = paste(gene_of_interest, " log scaled RNA expression"),
+       x = "") + 
+    theme(legend.position = "none",  # Remove the legend
+          axis.text.x = element_text(angle = 45, hjust = 1, colour = "black")) 
+  
+  # print the violin plot on the screen
+  print(signif_plot)
+  
+  # Save the plot as a PNG file
+  file_name <- paste0(params$out,"figures/","fetahu2023_violinPlot_", 
+                      gene_of_interest, "_cluster_", NK_cluster, 
+                      "_NEWCLINICALGROUPS" ,".png")
+  ggsave(file_name, plot = signif_plot, width = 5, height = 4,dpi = 600)
+}
+```
+
+
+## ___ALCAM expression [on NB tumor cells]___
+
+```{r}
+fetahu2023 <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_withNewMetadata.Rds"))
+fetahu2023 <- fetahu2023 %>% ScaleData()
+```
+
+```{r}
+gene_of_interest <- "ALCAM"
+
+# 1. PER GROUP
+
+group_signif <- VlnPlot(fetahu2023, 
+                        idents = "NB (8)",
+                        features = gene_of_interest, 
+                        group.by = "genetic_subtype",
+                        log = TRUE,
+                        cols = COLOR_CODE_GROUP_v3,
+                        layer = "data",
+                        pt.size = 0) +
+  theme_classic() +
+  stat_compare_means(method = "wilcox.test", 
+                     label = "p.signif",
+                     ref.group = "ATRXm") + 
+      ggtitle(paste(gene_of_interest, " RNA expression")) + 
+  labs(y = paste(gene_of_interest, " log scaled RNA expression"),
+       x = "")  + 
+    theme(legend.position = "none",  # Remove the legend
+          axis.text.x = element_text(angle = 45, hjust = 1, colour = "black"))
+
+# Show the plot
+group_signif
+
+# Save the plot as a PNG file
+group_save <- paste0(params$out,"figures/","fetahu2023_violinPlot_", 
+                      gene_of_interest, "_genetic_groups", "_NEWCLINICALGROUPS" ,".png")
+ggsave(group_save, plot = group_signif, width = 5, height = 4,dpi = 600)
+
+
+# 2. PER SAMPLE
+
+sample_signif <- VlnPlot(fetahu2023, 
+                        idents = "NB (8)",
+                        features = gene_of_interest, 
+                        group.by = "sample",
+                        log = TRUE,
+                        cols = COLOR_CODE_PATIENTS_GROUP_v2,
+                        layer = "data",
+                        pt.size = 0) +
+  theme_classic() +
+      ggtitle(paste(gene_of_interest, " RNA expression")) + 
+  labs(y = paste(gene_of_interest, " log scaled RNA expression"),
+       x = "")  + 
+    theme(legend.position = "none",  # Remove the legend
+          axis.text.x = element_text(angle = 45, hjust = 1, colour = "black"))
+
+# Show the plot
+sample_signif
+
+# Save the plot as a PNG file
+sample_save <- paste0(params$out,"figures/","fetahu2023_violinPlot_", 
+                      gene_of_interest, "_sample", "_NEWCLINICALGROUPS" ,".png")
+ggsave(sample_save, plot = sample_signif, width = 5, height = 4,dpi = 600)
+```
+
+## ___ATRX expression [on NB tumor cells]___
+
+```{r}
+gene_of_interest <- "ATRX"
+
+# 1. PER GROUP
+
+group_signif <- VlnPlot(fetahu2023, 
+                        idents = "NB (8)",
+                        features = "rna_ATRX", 
+                        group.by = "genetic_subtype",
+                        log = TRUE,
+                        cols = COLOR_CODE_GROUP_v3,
+                        layer = "data",
+                        pt.size = 0) +
+  theme_classic() +
+  stat_compare_means(method = "wilcox.test", 
+                     label = "p.signif",
+                     ref.group = "ATRXm") + 
+      ggtitle(paste(gene_of_interest, " RNA expression")) + 
+  labs(y = paste(gene_of_interest, " log scaled RNA expression"),
+       x = "")  + 
+    theme(legend.position = "none",  # Remove the legend
+          axis.text.x = element_text(angle = 45, hjust = 1, colour = "black"))
+
+# Show the plot
+group_signif
+
+# Save the plot as a PNG file
+group_save <- paste0(params$out,"figures/","fetahu2023_violinPlot_", 
+                      gene_of_interest, "_genetic_groups", "_NEWCLINICALGROUPS" ,".png")
+ggsave(group_save, plot = group_signif, width = 5, height = 4,dpi = 600)
+
+# 2. PER SAMPLE
+
+sample_signif <- VlnPlot(fetahu2023, 
+                        idents = "NB (8)",
+                        features = "rna_ATRX", 
+                        group.by = "sample",
+                        log = TRUE,
+                        cols = COLOR_CODE_PATIENTS_GROUP_v2,
+                        layer = "data",
+                        pt.size = 0) +
+  theme_classic() +
+      ggtitle(paste(gene_of_interest, " RNA expression")) + 
+  labs(y = paste(gene_of_interest, " log scaled RNA expression"),
+       x = "")  + 
+    theme(legend.position = "none",  # Remove the legend
+          axis.text.x = element_text(angle = 45, hjust = 1, colour = "black"))
+
+# Show the plot
+sample_signif
+
+# Save the plot as a PNG file
+sample_save <- paste0(params$out,"figures/","fetahu2023_violinPlot_", 
+                      gene_of_interest, "_sample", "_NEWCLINICALGROUPS" ,".png")
+ggsave(sample_save, plot = sample_signif, width = 5, height = 4,dpi = 600)
+```
+
+
+
+## ___IL15 expression [on Monocytes]___
+
+```{r}
+gene_of_interest <- "IL15"
+clusters_of_interest <- c("M (1)","M (2)","M (10)","M (15)")
+
+for (cluster in clusters_of_interest){
+  plot <- VlnPlot(fetahu2023, 
+        idents =  cluster, 
+        features = "IL15",   
+        group.by = "genetic_subtype", 
+        log = TRUE,
+        cols = COLOR_CODE_GROUP_v4,
+        layer = "data",
+        pt.size = 0)  +
+  theme_classic() +
+  stat_compare_means(method = "wilcox.test", 
+                     label = "p.signif",
+                     ref.group = "ATRXm") + 
+      ggtitle(paste(gene_of_interest, " RNA expression", "in cluster: ", cluster)) + 
+  labs(y = paste(gene_of_interest, " log scaled RNA expression"),
+       x = "")  + 
+    theme(legend.position = "none",  # Remove the legend
+          axis.text.x = element_text(angle = 45, hjust = 1, colour = "black"))
+  print(plot)
+}
+```
+
+
+# ___DEG analysis: ATRX mutated vs. ATRX wild-type___
+
+___single cell RNA-seq DEG analysis___
+
+<br>
+Replicates set to biological replicates with the sample slot in the metadata
+<br>
+<br>
+ATRXm, n = 3
+<br>
+MYCNamp, n = 4
+<br>
+ATRXwtMYCNwt (MYCNwt, ATRXwt), n = 4
+<br>
+<br>
+4-way comparison, always using ATRXm samples as the reference group [group2]
+<br>
+ctrl vs. ATRXm
+<br>
+MYCNamp vs. ATRXmut
+<br>
+Sporadic vs. ATRXmut
+<br>
+ATRX wild-type [MYCNamp + sporadic] vs. ATRX mutated
+<br>
+
+```{r}
+# Access the counts matrix
+counts_matrix <- GetAssayData(ALL_NK, slot = "counts")
+
+# Filter genes with at least 11 reads in the dataset
+geneUniverse <- rownames(counts_matrix)[Matrix::rowSums(counts_matrix) > 10]
+length(geneUniverse)
+```
+
+## ___Cluster 2___
+
+```{r}
+# Change idents to cluster annotations
+Idents(ALL_NK) <- ALL_NK@meta.data$predicted_NK_type_de.n350
+
+# subset to cluster 2
+cluster_of_interest <- "hNK_Bm2"
+
+# subset scRNA-seq data to NK and NB cells 
+hNK_Bm2 <- subset(ALL_NK, 
+                  idents = cluster_of_interest, 
+                  invert = FALSE)
+hNK_Bm2 #2586 cells
+```
+
+```{r}
+# DE analysis for the hNK_Bm2 NK cluster
+DEG_hNK_Bm2_DEG <- DElegate::findDE(hNK_Bm2,
+                           group_column = "genetic_subtype",
+                           order_results = TRUE,
+                           compare_is_ref = TRUE,
+                           replicate_column = "sample",
+                           compare = "ATRXm")
+
+ctrl_vs_ATRXm <- subset(DEG_hNK_Bm2_DEG, 
+                        DEG_hNK_Bm2_DEG$group1 == "control")
+MYCNA_vs_ATRXm <- subset(DEG_hNK_Bm2_DEG, 
+                         DEG_hNK_Bm2_DEG$group1 == "MYCNamp")
+sporadic_vs_ATRXm <- subset(DEG_hNK_Bm2_DEG, 
+                            DEG_hNK_Bm2_DEG$group1 == "ATRXwtMYCNwt")
+
+MYCNA_vs_ATRXm_signif <- subset(MYCNA_vs_ATRXm, 
+                                MYCNA_vs_ATRXm$padj < 0.10)
+sporadic_vs_ATRXm_signif <- subset(sporadic_vs_ATRXm, 
+                                   sporadic_vs_ATRXm$padj < 0.10)
+
+common_genes <- merge(MYCNA_vs_ATRXm_signif, 
+                      sporadic_vs_ATRXm_signif, 
+                      by = "feature")
+common_genes_all <- merge(ctrl_vs_ATRXm, 
+                          common_genes,  
+                          by = "feature")
+
+head(common_genes,10)
+head(common_genes_all,10)
+
+write.table(MYCNA_vs_ATRXm_signif, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNK-Bm2_ATRXm-vs-MYCNamp_2024-10-04.csv"))
+write.table(sporadic_vs_ATRXm_signif, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNK-Bm2_ATRXm-vs-Sporadic_2024-10-04.csv"))
+```
+
+
+```{r}
+# DE analysis for the hNK_Bm2 NK cluster
+DEG_hNK_Bm2_ref <- DElegate::findDE(hNK_Bm2,
+                           group_column = "comparison_group",
+                           order_results = TRUE,
+                           compare_is_ref = TRUE,
+                           replicate_column = "sample",
+                           compare = "ATRXmut")
+
+ctrl_vs_ATRXm <- subset(DEG_hNK_Bm2_ref, 
+                        DEG_hNK_Bm2_ref$group1 == "CTRL")
+ATRXwt_vs_ATRXm <- subset(DEG_hNK_Bm2_ref, 
+                          DEG_hNK_Bm2_ref$group1 == "ATRXwt")
+
+common_genes <- merge(ctrl_vs_ATRXm, ATRXwt_vs_ATRXm,  by = "feature")
+head(common_genes,10)
+
+ctrl_vs_ATRXm_signif <- subset(ctrl_vs_ATRXm, ctrl_vs_ATRXm$padj < 0.10)
+ATRXwt_vs_ATRXm_signif <- subset(ATRXwt_vs_ATRXm, ATRXwt_vs_ATRXm$padj < 0.10)
+
+ctrl_vs_ATRXm_signif
+ATRXwt_vs_ATRXm_signif
+
+write.table(ATRXwt_vs_ATRXm, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNK-Bm2_ATRX_mut-vs-wt_2024-10-04.csv"))
+
+```
+
+### ___Vulcano plot___
+
+#### ___1. ctrl vs. ATRXm___
+
+```{r fig.height=7, fig.width=7}
+ctrl_vs_ATRXm
+rownames(ctrl_vs_ATRXm) <- ctrl_vs_ATRXm$feature
+
+library(EnhancedVolcano)
+
+EnhancedVolcano(ctrl_vs_ATRXm, 
+                lab = rownames(ctrl_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2",
+                selectLab = c('CD6','TGFB1','IL32','KLRF1','FCER1G',
+                              'PFN1'),
+                subtitle = "CTRL vs. ATRXm",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6
+                )
+
+EnhancedVolcano(ctrl_vs_ATRXm, 
+                lab = rownames(ctrl_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2",
+                subtitle = "CTRL vs. ATRXm",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6,
+                drawConnectors = TRUE,
+                widthConnectors = 0.75
+                )
+```
+
+#### ___2. MYCNamp vs. ATRXmut___
+
+```{r fig.height=7, fig.width=7}
+MYCNA_vs_ATRXm
+rownames(MYCNA_vs_ATRXm) <- MYCNA_vs_ATRXm$feature
+
+EnhancedVolcano(MYCNA_vs_ATRXm, 
+                lab = rownames(MYCNA_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2",
+                selectLab = c('CD6','TGFB1','IL32','KLRF1','FCER1G','PFN1'),
+                subtitle = "MYCNamp vs. ATRXm",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6
+                )
+
+EnhancedVolcano(MYCNA_vs_ATRXm, 
+                lab = rownames(MYCNA_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2",
+                subtitle = "MYCNamp vs. ATRXm",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6,
+                drawConnectors = TRUE,
+                widthConnectors = 0.75
+                )
+```
+
+#### ___3. Sporadic vs. ATRXmut___
+
+```{r fig.height=7, fig.width=7}
+sporadic_vs_ATRXm
+rownames(sporadic_vs_ATRXm) <- sporadic_vs_ATRXm$feature
+
+EnhancedVolcano(sporadic_vs_ATRXm, 
+                lab = rownames(sporadic_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2",
+                selectLab = c('CD6','TGFB1','IL32','KLRF1','FCER1G',
+                              'PFN1'),
+                subtitle = "Sporadic vs. ATRXmut",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6
+                )
+
+EnhancedVolcano(sporadic_vs_ATRXm, 
+                lab = rownames(sporadic_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2",
+                subtitle = "Sporadic vs. ATRXmut",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6,
+                drawConnectors = TRUE,
+                widthConnectors = 0.75
+                )
+```
+
+#### ___4. ATRXwt vs. ATRXmut___
+
+```{r fig.height=7, fig.width=7}
+ATRXwt_vs_ATRXm
+rownames(ATRXwt_vs_ATRXm) <- ATRXwt_vs_ATRXm$feature
+
+EnhancedVolcano(ATRXwt_vs_ATRXm, 
+                lab = rownames(ATRXwt_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2",
+                selectLab = c('CD6','TGFB1','IL32','KLRF1','FCER1G',
+                              'PFN1'),
+                subtitle = "ATRXwt vs. ATRXmut",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6
+                )
+
+EnhancedVolcano(ATRXwt_vs_ATRXm, 
+                lab = rownames(ATRXwt_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2",
+                subtitle = "ATRXwt vs. ATRXmut",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6,
+                drawConnectors = TRUE,
+                widthConnectors = 0.75
+                )
+```
+
+##### ___DEG Heatmap___
+
+```{r}
+hNK_Bm2 <- hNK_Bm2 %>% ScaleData()
+DoHeatmap(object = hNK_Bm2, 
+           group.by = "genetic_subtype",
+           features = ATRXwt_vs_ATRXm_signif$feature)
+```
+
+
+### ___Pathways enrichment analysis___
+
+```{r}
+ATRXwt_vs_ATRXm_signif <- ATRXwt_vs_ATRXm_signif %>%
+  arrange(log_fc)
+
+sporadic_vs_ATRXm_signif <- sporadic_vs_ATRXm_signif %>%
+  arrange(log_fc)
+
+MYCNA_vs_ATRXm_signif  <- MYCNA_vs_ATRXm_signif %>%
+  arrange(log_fc)
+
+ATRXwt_vs_ATRXm_up <- ATRXwt_vs_ATRXm_signif %>% subset(log_fc < 0) # up-regulated in ATRXmutated samples !!
+ATRXwt_vs_ATRXm_down <- ATRXwt_vs_ATRXm_signif %>% subset(log_fc > 0) # down-regulated in ATRXmutated samples !!
+
+MYCNA_vs_ATRXm_up <- MYCNA_vs_ATRXm_signif %>% subset(log_fc < 0)
+MYCNA_vs_ATRXm_down <- MYCNA_vs_ATRXm_signif %>% subset(log_fc > 0)
+
+sporadic_vs_ATRXm_up <- sporadic_vs_ATRXm_signif %>% subset(log_fc < 0)
+sporadic_vs_ATRXm_down <- sporadic_vs_ATRXm_signif %>% subset(log_fc > 0)
+```
+
+#### ___MYCNamp vs. ATRXmut ___
+
+```{r pathway enrichment MYCNamp vs. ATRXm - cluster 2, fig.height=10,fig.width=10}
+# the background genes here should be all expressed (and detected) in all NK cells
+genes <- MYCNA_vs_ATRXm_up$feature
+
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+               pAdjustMethod = "fdr",
+               qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+go_BP
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXm: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+                  ont = "MF",
+                  OrgDb ="org.Hs.eg.db",
+                  universe = geneUniverse,
+                  readable = TRUE,
+                  pAdjustMethod = "fdr",
+                  qvalueCutoff = 0.10)
+
+go_MF
+
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXm: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXm: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              qvalueCutoff = 0.10, 
+                              minGSSize = 2,
+                              maxGSSize = 5000)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(as.data.frame(kegg_enrichment)$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXm: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+```
+
+#### ___Sporadic vs. ATRXmut ___
+
+```{r pathway enrichment Sporadic vs. ATRXm - cluster 2, fig.height=10,fig.width=10}
+# the background genes here should be all expressed (and detected) in all NK cells
+genes <- sporadic_vs_ATRXm_up$feature
+
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_BP
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXm: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+               ont = "MF",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_MF
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXm: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXm: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              pvalueCutoff = 0.05,
+                              qvalueCutoff = 0.10)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(as.data.frame(kegg_enrichment)$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXm: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+```
+
+#### ___ATRXwt vs. ATRXmut___
+
+```{r pathway enrichment analysis - Cluster 2, fig.height=10,fig.width=10}
+# the background genes here should be all expressed (and detected) in all NK cells
+genes <- ATRXwt_vs_ATRXm_up$feature
+
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              pvalueCutoff = 0.05)
+
+go_BP
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXm: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+               ont = "MF",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_MF
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXm: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXm: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              pvalueCutoff = 0.05,
+                              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(as.data.frame(kegg_enrichment)$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXm: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+```
+
+## ___Cluster 3___
+
+```{r}
+# Change idents to cluster annotations
+Idents(ALL_NK) <- ALL_NK@meta.data$predicted_NK_type_de.n350
+
+# subset to cluster 3
+cluster_of_interest <- "hNK_Bm3"
+
+# subset scRNA-seq data to NK and NB cells 
+hNK_Bm3 <- subset(ALL_NK, 
+                  idents = cluster_of_interest, 
+                  invert = FALSE)
+hNK_Bm3 # 3732 cells
+```
+
+```{r}
+# DE analysis for the hNK_Bm3 NK cluster
+DEG_hNK_Bm3_DEG <- DElegate::findDE(hNK_Bm3,
+                           group_column = "genetic_subtype",
+                           order_results = TRUE,
+                           compare_is_ref = TRUE,
+                           replicate_column = "sample",
+                           compare = "ATRXm")
+
+ctrl_vs_ATRXm <- subset(DEG_hNK_Bm3_DEG, 
+                        DEG_hNK_Bm3_DEG$group1 == "control")
+MYCNA_vs_ATRXm <- subset(DEG_hNK_Bm3_DEG, 
+                         DEG_hNK_Bm3_DEG$group1 == "MYCNamp")
+sporadic_vs_ATRXm <- subset(DEG_hNK_Bm3_DEG, 
+                            DEG_hNK_Bm3_DEG$group1 == "ATRXwtMYCNwt")
+
+MYCNA_vs_ATRXm_signif <- subset(MYCNA_vs_ATRXm, 
+                                MYCNA_vs_ATRXm$padj < 0.1)
+sporadic_vs_ATRXm_signif <- subset(sporadic_vs_ATRXm, 
+                                   sporadic_vs_ATRXm$padj < 0.1)
+
+common_genes <- merge(MYCNA_vs_ATRXm_signif, 
+                      sporadic_vs_ATRXm_signif, 
+                      by = "feature")
+common_genes_all <- merge(ctrl_vs_ATRXm, 
+                          common_genes,  
+                          by = "feature")
+
+head(common_genes,10)
+head(common_genes_all,10)
+
+write.table(MYCNA_vs_ATRXm_signif, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNK-Bm3_ATRXm-vs-MYCNamp_2024-10-04.csv"))
+write.table(sporadic_vs_ATRXm_signif, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNK-Bm3_ATRXm-vs-Sporadic_2024-10-04.csv"))
+```
+
+```{r}
+# DE analysis for the hNK_Bm3 NK cluster
+DEG_hNK_Bm3_ref <- DElegate::findDE(hNK_Bm3,
+                           group_column = "comparison_group",
+                           order_results = TRUE,
+                           compare_is_ref = TRUE,
+                           replicate_column = "sample",
+                           compare = "ATRXmut")
+
+ctrl_vs_ATRXm <- subset(DEG_hNK_Bm3_ref, 
+                        DEG_hNK_Bm3_ref$group1 == "CTRL")
+ATRXwt_vs_ATRXm <- subset(DEG_hNK_Bm3_ref, 
+                          DEG_hNK_Bm3_ref$group1 == "ATRXwt")
+
+common_genes <- merge(ctrl_vs_ATRXm, ATRXwt_vs_ATRXm,  by = "feature")
+head(common_genes,10)
+
+ctrl_vs_ATRXm_signif <- subset(ctrl_vs_ATRXm, ctrl_vs_ATRXm$padj < 0.10)
+ATRXwt_vs_ATRXm_signif <- subset(ATRXwt_vs_ATRXm, ATRXwt_vs_ATRXm$padj < 0.10)
+
+ctrl_vs_ATRXm_signif
+ATRXwt_vs_ATRXm_signif
+
+write.table(ATRXwt_vs_ATRXm, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNK-Bm3_ATRX_mut-vs-wt_2024-10-04.csv"))
+
+```
+
+### ___Vulcano plot___
+
+#### ___1. ctrl vs. ATRXm___
+
+```{r vulcano plot - ctrl vs. ATRXm: cluster 3,fig.height=7, fig.width=7}
+ctrl_vs_ATRXm
+rownames(ctrl_vs_ATRXm) <- ctrl_vs_ATRXm$feature
+
+library(EnhancedVolcano)
+
+EnhancedVolcano(ctrl_vs_ATRXm, 
+                lab = rownames(ctrl_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 3",
+                selectLab = c('CD6','TGFB1','IL32','KLRF1','FCER1G',
+                              'PFN1'),
+                subtitle = "CTRL vs. ATRXm",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6
+                )
+
+EnhancedVolcano(ctrl_vs_ATRXm, 
+                lab = rownames(ctrl_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 3",
+                subtitle = "CTRL vs. ATRXm",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6,
+                drawConnectors = TRUE,
+                widthConnectors = 0.75
+                )
+```
+
+#### ___2. MYCNamp vs. ATRXmut___
+
+```{r vulcano plot - MYCNamp vs. ATRXmut: cluster 3,fig.height=7, fig.width=7}
+MYCNA_vs_ATRXm
+rownames(MYCNA_vs_ATRXm) <- MYCNA_vs_ATRXm$feature
+
+library(EnhancedVolcano)
+
+EnhancedVolcano(MYCNA_vs_ATRXm, 
+                lab = rownames(MYCNA_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 3",
+                selectLab = c('CD6','TGFB1','IL32','KLRF1','FCER1G',
+                              'PFN1'),
+                subtitle = "MYCNamp vs. ATRXm",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6
+                )
+
+EnhancedVolcano(MYCNA_vs_ATRXm, 
+                lab = rownames(MYCNA_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 3",
+                subtitle = "MYCNamp vs. ATRXm",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6,
+                drawConnectors = TRUE,
+                widthConnectors = 0.75
+                )
+```
+
+#### ___3. Sporadic vs. ATRXmut___
+
+```{r vulcano plot - Sporadic vs. ATRXmut: cluster 3, fig.height=7, fig.width=7}
+sporadic_vs_ATRXm
+rownames(sporadic_vs_ATRXm) <- sporadic_vs_ATRXm$feature
+
+EnhancedVolcano(sporadic_vs_ATRXm, 
+                lab = rownames(sporadic_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 3",
+                selectLab = c('CD6','TGFB1','IL32','KLRF1','FCER1G',
+                              'PFN1'),
+                subtitle = "Sporadic vs. ATRXmut",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6
+                )
+
+EnhancedVolcano(sporadic_vs_ATRXm, 
+                lab = rownames(sporadic_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 3",
+                subtitle = "Sporadic vs. ATRXmut",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6,
+                drawConnectors = TRUE,
+                widthConnectors = 0.75
+                )
+```
+
+#### ___4. ATRXwt vs. ATRXmut___
+
+```{r vulcano plot - ATRXwt vs. ATRXmut: Cluster 3, fig.height=7, fig.width=7}
+ATRXwt_vs_ATRXm
+rownames(ATRXwt_vs_ATRXm) <- ATRXwt_vs_ATRXm$feature
+
+EnhancedVolcano(ATRXwt_vs_ATRXm, 
+                lab = rownames(ATRXwt_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 3",
+                selectLab = c('CD6','TGFB1','IL32','KLRF1','FCER1G',
+                              'PFN1'),
+                subtitle = "ATRXwt vs. ATRXmut",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6
+                )
+
+EnhancedVolcano(ATRXwt_vs_ATRXm, 
+                lab = rownames(ATRXwt_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 3",
+                subtitle = "ATRXwt vs. ATRXmut",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6,
+                drawConnectors = TRUE,
+                widthConnectors = 0.75
+                )
+```
+
+### ___Pathways enrichment analysis___
+
+```{r}
+ATRXwt_vs_ATRXm_signif <- ATRXwt_vs_ATRXm_signif %>%
+  arrange(log_fc)
+
+sporadic_vs_ATRXm_signif <- sporadic_vs_ATRXm_signif %>%
+  arrange(log_fc)
+
+MYCNA_vs_ATRXm_signif  <- MYCNA_vs_ATRXm_signif %>%
+  arrange(log_fc)
+
+ATRXwt_vs_ATRXm_up <- ATRXwt_vs_ATRXm_signif %>% subset(log_fc < 0) # up-regulated in ATRXmutated samples 
+ATRXwt_vs_ATRXm_down <- ATRXwt_vs_ATRXm_signif %>% subset(log_fc > 0) #down-regulated in ATRXmutated samples
+
+MYCNA_vs_ATRXm_up <- MYCNA_vs_ATRXm_signif %>% subset(log_fc < 0)
+MYCNA_vs_ATRXm_down <- MYCNA_vs_ATRXm_signif %>% subset(log_fc > 0)
+
+sporadic_vs_ATRXm_up <- sporadic_vs_ATRXm_signif %>% subset(log_fc < 0)
+sporadic_vs_ATRXm_down <- sporadic_vs_ATRXm_signif %>% subset(log_fc > 0)
+```
+
+#### ___MYCNamp vs. ATRXmut ___
+
+```{r pathway enrichment MYCNamp vs. ATRXm - cluster 3, fig.height=10,fig.width=10}
+# the background genes here should be all expressed (and detected) in all NK cells
+genes <- MYCNA_vs_ATRXm_up$feature
+
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+go_BP
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXm: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+               ont = "MF",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+go_MF
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXm: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXm: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              pvalueCutoff = 0.05,
+                              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(as.data.frame(kegg_enrichment)$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXm: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+```
+
+#### ___Sporadic vs. ATRXmut ___
+
+```{r pathway enrichment Sporadic vs. ATRXm - cluster 3, fig.height=10,fig.width=10}
+# the background genes here should be all expressed (and detected) in all NK cells
+genes <- sporadic_vs_ATRXm_up$feature
+
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+go_BP
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXm: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+               ont = "MF",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+go_MF
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXm: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXm: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              pvalueCutoff = 0.05,
+                              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(as.data.frame(kegg_enrichment)$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXm: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+```
+
+## ___Cluster 2 + 3___
+
+```{r}
+# Change idents to cluster annotations
+Idents(ALL_NK) <- ALL_NK@meta.data$predicted_NK_type_de.n350
+
+# subset to cluster 3
+cluster_of_interest <- c("hNK_Bm2","hNK_Bm3")
+
+# subset scRNA-seq data to NK and NB cells 
+hNK_Bm2_and_Bm3 <- subset(ALL_NK, 
+                  idents = cluster_of_interest, 
+                  invert = FALSE)
+hNK_Bm2_and_Bm3 # 6318 cells
+
+Idents(hNK_Bm2_and_Bm3) <- hNK_Bm2_and_Bm3@meta.data$orig.ident 
+```
+
+```{r}
+# DE analysis for the hNK_Bm3 NK cluster
+DEG_hNK_Bm2_and_Bm3_DEG <- DElegate::findDE(hNK_Bm2_and_Bm3,
+                           group_column = "genetic_subtype",
+                           order_results = TRUE,
+                           compare_is_ref = TRUE,
+                           replicate_column = "sample",
+                           compare = "ATRXm")
+
+ctrl_vs_ATRXm <- subset(DEG_hNK_Bm2_and_Bm3_DEG, 
+                        DEG_hNK_Bm2_and_Bm3_DEG$group1 == "control")
+MYCNA_vs_ATRXm <- subset(DEG_hNK_Bm2_and_Bm3_DEG, 
+                         DEG_hNK_Bm2_and_Bm3_DEG$group1 == "MYCNamp")
+sporadic_vs_ATRXm <- subset(DEG_hNK_Bm2_and_Bm3_DEG, 
+                            DEG_hNK_Bm2_and_Bm3_DEG$group1 == "ATRXwtMYCNwt")
+
+MYCNA_vs_ATRXm_signif <- subset(MYCNA_vs_ATRXm, 
+                                MYCNA_vs_ATRXm$padj < 0.1)
+sporadic_vs_ATRXm_signif <- subset(sporadic_vs_ATRXm, 
+                                   sporadic_vs_ATRXm$padj < 0.1)
+
+common_genes <- merge(MYCNA_vs_ATRXm_signif, 
+                      sporadic_vs_ATRXm_signif, 
+                      by = "feature")
+common_genes_all <- merge(ctrl_vs_ATRXm, 
+                          common_genes,  
+                          by = "feature")
+
+head(common_genes,10)
+head(common_genes_all,10)
+
+write.table(MYCNA_vs_ATRXm_signif, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, "tables/DEG_NK_clust2+3_ATRXm-vs-MYCNamp_2024-10-04.csv"))
+
+write.table(sporadic_vs_ATRXm_signif, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, "tables/DEG_NK_clust2+3_ATRXm-vs-Sporadic_2024-10-04.csv"))
+```
+
+```{r}
+Idents(hNK_Bm2_and_Bm3) <- hNK_Bm2_and_Bm3@meta.data$genetic_subtype
+
+# DE analysis for the ALL_NK NK cluster
+DEG_hNK_Bm2_and_Bm3_ref <- DElegate::findDE(hNK_Bm2_and_Bm3,
+                           group_column = "comparison_group",
+                           order_results = TRUE,
+                           compare_is_ref = TRUE,
+                           replicate_column = "sample",
+                           compare = "ATRXmut")
+
+ctrl_vs_ATRXm <- subset(DEG_hNK_Bm2_and_Bm3_ref, 
+                        DEG_hNK_Bm2_and_Bm3_ref$group1 == "CTRL")
+ATRXwt_vs_ATRXm <- subset(DEG_hNK_Bm2_and_Bm3_ref, 
+                          DEG_hNK_Bm2_and_Bm3_ref$group1 == "ATRXwt")
+
+common_genes <- merge(ctrl_vs_ATRXm, ATRXwt_vs_ATRXm,  by = "feature")
+head(common_genes,10)
+
+ctrl_vs_ATRXm_signif <- subset(ctrl_vs_ATRXm, ctrl_vs_ATRXm$padj < 0.10)
+ATRXwt_vs_ATRXm_signif <- subset(ATRXwt_vs_ATRXm, ATRXwt_vs_ATRXm$padj < 0.10)
+
+ctrl_vs_ATRXm_signif
+ATRXwt_vs_ATRXm_signif
+
+write.table(ATRXwt_vs_ATRXm, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, 
+                          "tables/DEG_NK_clust2+3_ATRX_mut-vs-wt_2024-10-04.csv"))
+
+```
+
+### ___Vulcano plot___
+
+#### ___1. ctrl vs. ATRXm___
+
+```{r vulcano plot - ctrl vs. ATRXm: cluster 2+3,fig.height=7, fig.width=7}
+ctrl_vs_ATRXm
+rownames(ctrl_vs_ATRXm) <- ctrl_vs_ATRXm$feature
+
+library(EnhancedVolcano)
+
+EnhancedVolcano(ctrl_vs_ATRXm, 
+                lab = rownames(ctrl_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2+3",
+                selectLab = c('CD6','TGFB1','IL32','KLRF1','FCER1G',
+                              'PFN1'),
+                subtitle = "CTRL vs. ATRXm",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6
+                )
+
+EnhancedVolcano(ctrl_vs_ATRXm, 
+                lab = rownames(ctrl_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2+3",
+                subtitle = "CTRL vs. ATRXm",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6,
+                drawConnectors = TRUE,
+                widthConnectors = 0.75
+                )
+```
+
+#### ___2. MYCNamp vs. ATRXmut___
+
+```{r vulcano plot - MYCNamp vs. ATRXmut: cluster 2+3, fig.height=7, fig.width=7}
+MYCNA_vs_ATRXm
+rownames(MYCNA_vs_ATRXm) <- MYCNA_vs_ATRXm$feature
+
+library(EnhancedVolcano)
+
+EnhancedVolcano(MYCNA_vs_ATRXm, 
+                lab = rownames(MYCNA_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2+3",
+                selectLab = c('CD6','TGFB1','IL32','KLRF1','FCER1G',
+                              'PFN1'),
+                subtitle = "MYCNamp vs. ATRXm",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6
+                )
+
+EnhancedVolcano(MYCNA_vs_ATRXm, 
+                lab = rownames(MYCNA_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2+3",
+                subtitle = "MYCNamp vs. ATRXm",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6,
+                drawConnectors = TRUE,
+                widthConnectors = 0.75
+                )
+```
+
+#### ___3. Sporadic vs. ATRXmut___
+
+```{r vulcano plot - Sporadic vs. ATRXmut: cluster 2+3, fig.height=7, fig.width=7}
+sporadic_vs_ATRXm
+rownames(sporadic_vs_ATRXm) <- sporadic_vs_ATRXm$feature
+
+EnhancedVolcano(sporadic_vs_ATRXm, 
+                lab = rownames(sporadic_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2+3",
+                selectLab = c('CD6','TGFB1','IL32','KLRF1','FCER1G',
+                              'PFN1'),
+                subtitle = "Sporadic vs. ATRXmut",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6
+                )
+
+EnhancedVolcano(sporadic_vs_ATRXm, 
+                lab = rownames(sporadic_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2+3",
+                subtitle = "Sporadic vs. ATRXmut",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6,
+                drawConnectors = TRUE,
+                widthConnectors = 0.75
+                )
+```
+
+#### ___4. ATRXwt vs. ATRXmut___
+
+```{r vulcano plot - ATRXwt vs. ATRXmut: cluster 2+3, fig.height=7, fig.width=7}
+ATRXwt_vs_ATRXm
+rownames(ATRXwt_vs_ATRXm) <- ATRXwt_vs_ATRXm$feature
+
+EnhancedVolcano(ATRXwt_vs_ATRXm, 
+                lab = rownames(ATRXwt_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2+3",
+                selectLab = c('CD6','TGFB1','IL32','KLRF1','FCER1G',
+                              'PFN1'),
+                subtitle = "ATRXwt vs. ATRXmut",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6
+                )
+
+EnhancedVolcano(ATRXwt_vs_ATRXm, 
+                lab = rownames(ATRXwt_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2+3",
+                subtitle = "ATRXwt vs. ATRXmut",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6,
+                drawConnectors = TRUE,
+                widthConnectors = 0.75
+                )
+```
+
+### ___Pathways enrichment analysis___
+
+```{r}
+ATRXwt_vs_ATRXm_signif <- ATRXwt_vs_ATRXm_signif %>%
+  arrange(log_fc)
+
+sporadic_vs_ATRXm_signif <- sporadic_vs_ATRXm_signif %>%
+  arrange(log_fc)
+
+MYCNA_vs_ATRXm_signif  <- MYCNA_vs_ATRXm_signif %>%
+  arrange(log_fc)
+
+ATRXwt_vs_ATRXm_up <- ATRXwt_vs_ATRXm_signif %>% subset(log_fc < 0) # up-regulated in ATRXmutated samples 
+ATRXwt_vs_ATRXm_down <- ATRXwt_vs_ATRXm_signif %>% subset(log_fc > 0) #down-regulated in ATRXmutated samples
+
+MYCNA_vs_ATRXm_up <- MYCNA_vs_ATRXm_signif %>% subset(log_fc < 0)
+MYCNA_vs_ATRXm_down <- MYCNA_vs_ATRXm_signif %>% subset(log_fc > 0)
+
+sporadic_vs_ATRXm_up <- sporadic_vs_ATRXm_signif %>% subset(log_fc < 0)
+sporadic_vs_ATRXm_down <- sporadic_vs_ATRXm_signif %>% subset(log_fc > 0)
+```
+
+#### ___ATRX wild-type vs. mutated___
+
+```{r pathway enrichment ATRXwt vs. ATRXm - cluster 2+3, fig.height=10,fig.width=10}
+# the background genes here should be all expressed (and detected) in all NK cells
+genes <- ATRXwt_vs_ATRXm_up$feature
+
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+go_BP
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+Bm_hNK3 in ATRXm: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+               ont = "MF",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+go_MF
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+Bm_hNK3 in ATRXm: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+Bm_hNK3 in ATRXm: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              pvalueCutoff = 0.05,
+                              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(as.data.frame(kegg_enrichment)$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+Bm_hNK3 in ATRXm: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+```
+
+#### ___MYCNamp vs. ATRXmut ___
+
+```{r pathway enrichment MYCNamp vs. ATRXm - clusters 2+3, fig.height=10,fig.width=10}
+# the background genes here should be all expressed (and detected) in all NK cells
+genes <- MYCNA_vs_ATRXm_up$feature
+
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+head(go_BP, 10)
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+Bm_hNK3 in ATRXm: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+               ont = "MF",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+go_MF
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+Bm_hNK3 in ATRXm: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+Bm_hNK3 in ATRXm: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              pvalueCutoff = 0.05,
+                              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(as.data.frame(kegg_enrichment)$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+Bm_hNK3 in ATRXm: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+```
+
+#### ___Sporadic vs. ATRXmut ___
+
+```{r pathway enrichment Sporadic vs. ATRXm - clusters 2+3, fig.height=10,fig.width=10}
+# the background genes here should be all expressed (and detected) in all NK cells
+genes <- sporadic_vs_ATRXm_up$feature
+
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+go_BP
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+Bm_hNK3 in ATRXm: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+               ont = "MF",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+go_MF
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+Bm_hNK3 in ATRXm: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+Bm_hNK3 in ATRXm: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              pvalueCutoff = 0.05,
+                              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(as.data.frame(kegg_enrichment)$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+Bm_hNK3 in ATRXm: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+```
+
+## ___All clusters___
+
+```{r}
+# DE analysis for the ALL_NK NK cluster
+DEG_ALL_NK_DEG <- DElegate::findDE(ALL_NK,
+                           group_column = "genetic_subtype",
+                           order_results = TRUE,
+                           compare_is_ref = TRUE,
+                           replicate_column = "sample",
+                           compare = "ATRXm")
+
+ctrl_vs_ATRXm <- subset(DEG_ALL_NK_DEG, 
+                        DEG_ALL_NK_DEG$group1 == "control")
+MYCNA_vs_ATRXm <- subset(DEG_ALL_NK_DEG, 
+                         DEG_ALL_NK_DEG$group1 == "MYCNamp")
+sporadic_vs_ATRXm <- subset(DEG_ALL_NK_DEG, 
+                            DEG_ALL_NK_DEG$group1 == "ATRXwtMYCNwt")
+
+MYCNA_vs_ATRXm_signif <- subset(MYCNA_vs_ATRXm, 
+                                MYCNA_vs_ATRXm$padj < 0.1)
+sporadic_vs_ATRXm_signif <- subset(sporadic_vs_ATRXm, 
+                                   sporadic_vs_ATRXm$padj < 0.1)
+
+common_genes <- merge(MYCNA_vs_ATRXm_signif, 
+                      sporadic_vs_ATRXm_signif, 
+                      by = "feature")
+common_genes_all <- merge(ctrl_vs_ATRXm, 
+                          common_genes,  
+                          by = "feature")
+
+head(common_genes,10)
+head(common_genes_all,10)
+
+write.table(MYCNA_vs_ATRXm_signif, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, "tables/DEG_ALL-NK_ATRXm-vs-MYCNamp_2024-10-04.csv"))
+write.table(sporadic_vs_ATRXm_signif, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, "tables/DEG_ALL-NK_ATRXm-vs-Sporadic_2024-10-04.csv"))
+```
+
+```{r}
+# DE analysis for the ALL_NK NK cluster
+DEG_ALL_NK_ref <- DElegate::findDE(ALL_NK,
+                           group_column = "comparison_group",
+                           order_results = TRUE,
+                           compare_is_ref = TRUE,
+                           replicate_column = "sample",
+                           compare = "ATRXmut")
+
+ctrl_vs_ATRXm <- subset(DEG_ALL_NK_ref, 
+                        DEG_ALL_NK_ref$group1 == "CTRL")
+ATRXwt_vs_ATRXm <- subset(DEG_ALL_NK_ref, 
+                          DEG_ALL_NK_ref$group1 == "ATRXwt")
+
+common_genes <- merge(ctrl_vs_ATRXm, ATRXwt_vs_ATRXm,  by = "feature")
+head(common_genes,10)
+
+ctrl_vs_ATRXm_signif <- subset(ctrl_vs_ATRXm, ctrl_vs_ATRXm$padj < 0.10)
+ATRXwt_vs_ATRXm_signif <- subset(ATRXwt_vs_ATRXm, ATRXwt_vs_ATRXm$padj < 0.10)
+
+ctrl_vs_ATRXm_signif
+ATRXwt_vs_ATRXm_signif
+
+write.table(ATRXwt_vs_ATRXm, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, "tables/DEG_ALL-NK_ATRX_mut-vs-wt_2024-10-04.csv"))
+
+```
+
+### ___Vulcano plot___
+
+#### ___1. ctrl vs ATRXm___
+
+```{r fig.height=7, fig.width=7}
+ctrl_vs_ATRXm
+rownames(ctrl_vs_ATRXm) <- ctrl_vs_ATRXm$feature
+
+library(EnhancedVolcano)
+
+EnhancedVolcano(ctrl_vs_ATRXm, 
+                lab = rownames(ctrl_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in ALL NK cells",
+                selectLab = c('CD6','TGFB1','IL32','KLRF1','FCER1G',
+                              'PFN1'),
+                subtitle = "CTRL vs. ATRXm",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6
+                )
+
+EnhancedVolcano(ctrl_vs_ATRXm, 
+                lab = rownames(ctrl_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in ALL NK cells",
+                subtitle = "CTRL vs. ATRXm",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6,
+                drawConnectors = TRUE,
+                widthConnectors = 0.75
+                )
+```
+
+#### ___2. MYCNamp vs. ATRXmut___
+
+```{r fig.height=7, fig.width=7}
+MYCNA_vs_ATRXm
+rownames(MYCNA_vs_ATRXm) <- MYCNA_vs_ATRXm$feature
+
+library(EnhancedVolcano)
+
+EnhancedVolcano(MYCNA_vs_ATRXm, 
+                lab = rownames(MYCNA_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in ALL NK cells",
+                selectLab = c('CD6','TGFB1','IL32','KLRF1','FCER1G',
+                              'PFN1'),
+                subtitle = "MYCNamp vs. ATRXm",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6
+                )
+
+EnhancedVolcano(MYCNA_vs_ATRXm, 
+                lab = rownames(MYCNA_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in ALL NK cells",
+                subtitle = "MYCNamp vs. ATRXm",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6,
+                drawConnectors = TRUE,
+                widthConnectors = 0.75
+                )
+```
+
+#### ___3. Sporadic vs. ATRXmut___
+
+```{r fig.height=7, fig.width=7}
+sporadic_vs_ATRXm
+rownames(sporadic_vs_ATRXm) <- sporadic_vs_ATRXm$feature
+
+EnhancedVolcano(sporadic_vs_ATRXm, 
+                lab = rownames(sporadic_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in ALL NK cells",
+                selectLab = c('CD6','TGFB1','IL32','KLRF1','FCER1G',
+                              'PFN1'),
+                subtitle = "Sporadic vs. ATRXmut",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6
+                )
+
+EnhancedVolcano(sporadic_vs_ATRXm, 
+                lab = rownames(sporadic_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in ALL NK cells",
+                subtitle = "Sporadic vs. ATRXmut",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6,
+                drawConnectors = TRUE,
+                widthConnectors = 0.75
+                )
+```
+
+#### ___4. ATRXwt vs. ATRXmut___
+
+```{r fig.height=7, fig.width=7}
+ATRXwt_vs_ATRXm
+rownames(ATRXwt_vs_ATRXm) <- ATRXwt_vs_ATRXm$feature
+
+EnhancedVolcano(ATRXwt_vs_ATRXm, 
+                lab = rownames(ATRXwt_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in ALL NK cells",
+                selectLab = c('CD6','TGFB1','IL32','KLRF1','FCER1G',
+                              'PFN1'),
+                subtitle = "ATRXwt vs. ATRXmut",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6
+                )
+
+EnhancedVolcano(ATRXwt_vs_ATRXm, 
+                lab = rownames(ATRXwt_vs_ATRXm),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in ALL NK cells",
+                subtitle = "ATRXwt vs. ATRXmut",
+                pCutoff = 0.1,
+                FCcutoff = 0.5,
+                pointSize = 3,
+                labSize = 6,
+                drawConnectors = TRUE,
+                widthConnectors = 0.75
+                )
+```
+
+### ___Pathways enrichment analysis___
+
+```{r}
+ATRXwt_vs_ATRXm_signif <- ATRXwt_vs_ATRXm_signif %>%
+  arrange(log_fc)
+
+sporadic_vs_ATRXm_signif <- sporadic_vs_ATRXm_signif %>%
+  arrange(log_fc)
+
+MYCNA_vs_ATRXm_signif  <- MYCNA_vs_ATRXm_signif %>%
+  arrange(log_fc)
+
+ATRXwt_vs_ATRXm_up <- ATRXwt_vs_ATRXm_signif %>% subset(log_fc < 0) # up-regulated in ATRXmutated samples 
+ATRXwt_vs_ATRXm_down <- ATRXwt_vs_ATRXm_signif %>% subset(log_fc > 0) #down-regulated in ATRXmutated samples
+
+MYCNA_vs_ATRXm_up <- MYCNA_vs_ATRXm_signif %>% subset(log_fc < 0)
+MYCNA_vs_ATRXm_down <- MYCNA_vs_ATRXm_signif %>% subset(log_fc > 0)
+
+sporadic_vs_ATRXm_up <- sporadic_vs_ATRXm_signif %>% subset(log_fc < 0)
+sporadic_vs_ATRXm_down <- sporadic_vs_ATRXm_signif %>% subset(log_fc > 0)
+```
+
+#### ___1. MYCNamp vs. ATRXmut ___
+
+```{r pathway enrichment - MYCNamp vs. ATRXm: all clusters, fig.height=10,fig.width=10}
+# the background genes here should be all expressed (and detected) in all NK cells
+genes <- MYCNA_vs_ATRXm_up$feature
+
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+go_BP
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("up- in NK cells in ATRXm: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+               ont = "MF",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+go_MF
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("up- in NK cells in ATRXm: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("up- in NK cells in ATRXm: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              pvalueCutoff = 0.05,
+                              qvalueCutoff = 0.10, 
+                              minGSSize = 2,
+                              maxGSSize = 50000)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(as.data.frame(kegg_enrichment)$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("up- in NK cells in ATRXm: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+```
+
+#### ___2. Sporadic vs. ATRXmut ___
+
+```{r pathway enrichment - Sporadic vs. ATRXm: all clusters, fig.height=10,fig.width=10}
+# the background genes here should be all expressed (and detected) in all NK cells
+genes <- sporadic_vs_ATRXm_up$feature
+
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+go_BP
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("up- in NK cells in ATRXm: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+               ont = "MF",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.10, 
+               minGSSize = 2,
+               maxGSSize = 50000)
+
+go_MF
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("up- in NK cells in ATRXm: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              pvalueCutoff = 0.05)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("up- in NK cells in ATRXm: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              pvalueCutoff = 0.05,
+                              qvalueCutoff = 0.10, 
+                              minGSSize = 2,
+                              maxGSSize = 50000)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(as.data.frame(kegg_enrichment)$pvalue < 0.05)) {
+  # If there is at least one term with pvalue < 0.05, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("up- in NK cells in ATRXm: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+```
+
+## ___Cluster annotation___
+
+### ___Calculate module scores___
+
+Gene lists as defined in Crinier at al., 2021
+
+```{r}
+# remove previously calculated module scores
+metadata <- ALL_NK@meta.data
+cols_to_remove <- grep("module", colnames(metadata), value = TRUE)
+ALL_NK@meta.data <- metadata[, !colnames(metadata) %in% cols_to_remove]
+
+head(ALL_NK@meta.data)
+```
+
+```{r}
+# extract counts
+counts <- LayerData(ALL_NK, assay="RNA", layer='data')
+var_genes <- dimnames(counts)[[1]]
+
+# remove genes not present in dataset
+adaptive_NK_genes <- intersect(adaptive_NK_genes, var_genes)
+print("Number of genes in the adaptive_NK_genes gene list: ")
+length(adaptive_NK_genes)
+
+conventional_NK_genes <- intersect(conventional_NK_genes, var_genes)
+print("Number of genes in the conventional_NK_genes gene list: ")
+length(conventional_NK_genes)
+
+mature_NK_genes <- intersect(mature_NK_genes, var_genes)
+print("Number of genes in the mature_NK_genes gene list: ")
+length(mature_NK_genes)
+
+NKP_genes <- intersect(NKP_genes, var_genes)
+print("Number of genes in the NKP_genes gene list: ")
+length(NKP_genes)
+
+# log scale counts
+ALL_NK <- ALL_NK %>% 
+  NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000)
+```
+
+```{r}
+ALL_NK <- AddModuleScore(object = ALL_NK,
+                         ctrl = 50,
+                         features = adaptive_NK_genes,
+                         name = "adaptive_NK_module",
+                         seed = 2805)
+
+ALL_NK <- AddModuleScore(object = ALL_NK,
+                         ctrl = 50,
+                         features = conventional_NK_genes,
+                         name = "conventional_NK_module",
+                         seed = 2805)
+
+ALL_NK <- AddModuleScore(object = ALL_NK,
+                         ctrl = 50,
+                         features = NKP_genes,
+                         name = "NKP_module",
+                         seed = 2805)
+
+ALL_NK <- AddModuleScore(object = ALL_NK,
+                         ctrl = 50, 
+                         features = mature_NK_genes,
+                         name = "mature_NK_module",
+                         seed = 2805)
+```
+
+### ___Plot module scores___
+
+#### ___Feature plot___
+
+```{r fig.height=12, fig.width=12}
+do_FeaturePlot(sample = ALL_NK, 
+               features = "adaptive_NK_module1",
+               plot.title = "Adaptive NK cells",
+               plot.subtitle = "Gene module scores",
+               pt.size = 1,
+               reduction = "UMAP",
+               viridis.direction = -1,
+               viridis.palette = "D",
+               font.size = 14,
+               label.size = 14, 
+               max.cutoff = 0.5,
+               slot = "data",
+               legend.title.face = "bold",
+               axis.text.face = "bold",
+               plot.title.face = "bold",
+               plot.axes = TRUE,
+               legend.title = "Module score",
+               legend.length = 10,
+               split.by = "genetic_subtype")
+
+do_FeaturePlot(sample = ALL_NK, 
+               features = "adaptive_NK_module1",
+               plot.title = "Adaptive NK cells",
+               plot.subtitle = "Gene module scores",
+               pt.size = 1,
+               reduction = "UMAP",
+               viridis.direction = -1,
+               viridis.palette = "D",
+               font.size = 14,
+               label.size = 14,
+               max.cutoff = 0.5,
+               slot = "data",
+               legend.title.face = "bold",
+               axis.text.face = "bold",
+               plot.title.face = "bold",
+               plot.axes = TRUE,
+               legend.title = "Module score",
+               legend.length = 10,
+               split.by = "predicted_NK_type_de.n350")
+
+do_FeaturePlot(sample = ALL_NK, 
+               features = "conventional_NK_module1",
+               plot.title = "Conventional NK cells",
+               plot.subtitle = "Gene module scores",
+               pt.size = 1,
+               reduction = "UMAP",
+               viridis.direction = -1,
+               viridis.palette = "D",
+               font.size = 14,
+               label.size = 14,
+               max.cutoff = 0.5,
+               slot = "data",
+               legend.title.face = "bold",
+               axis.text.face = "bold",
+               plot.title.face = "bold",
+               plot.axes = TRUE,
+               legend.title = "Module score",
+               legend.length = 10,
+               split.by = "genetic_subtype")
+
+do_FeaturePlot(sample = ALL_NK, 
+               features = "conventional_NK_module1",
+               plot.title = "Conventional NK cells",
+               plot.subtitle = "Gene module scores",
+               pt.size = 1,
+               reduction = "UMAP",
+               viridis.direction = -1,
+               viridis.palette = "D",
+               font.size = 14,
+               label.size = 14,
+               max.cutoff = 0.5,
+               slot = "data",
+               legend.title.face = "bold",
+               axis.text.face = "bold",
+               plot.title.face = "bold",
+               plot.axes = TRUE,
+               legend.title = "Module score",
+               legend.length = 10,
+               split.by = "predicted_NK_type_de.n350")
+
+do_FeaturePlot(sample = ALL_NK, 
+               features = "NKP_module1",
+               plot.title = "progenitor NK cells",
+               plot.subtitle = "Gene module scores",
+               pt.size = 1,
+               reduction = "UMAP",
+               viridis.direction = -1,
+               viridis.palette = "D",
+               font.size = 14,
+               label.size = 14,
+               max.cutoff = 0.5,
+               slot = "data",
+               legend.title.face = "bold",
+               axis.text.face = "bold",
+               plot.title.face = "bold",
+               plot.axes = TRUE,
+               legend.title = "Module score",
+               legend.length = 10,
+               split.by = "genetic_subtype")
+
+do_FeaturePlot(sample = ALL_NK, 
+               features = "NKP_module1",
+               plot.title = "progenitor NK cells",
+               plot.subtitle = "Gene module scores",
+               pt.size = 1,
+               reduction = "UMAP",
+               viridis.direction = -1,
+               viridis.palette = "D",
+               font.size = 14,
+               label.size = 14,
+               max.cutoff = 0.5,
+               slot = "data",
+               legend.title.face = "bold",
+               axis.text.face = "bold",
+               plot.title.face = "bold",
+               plot.axes = TRUE,
+               legend.title = "Module score",
+               legend.length = 10,
+               split.by = "predicted_NK_type_de.n350")
+
+do_FeaturePlot(sample = ALL_NK, 
+               features = "mature_NK_module1",
+               plot.title = "Mature NK cells",
+               plot.subtitle = "Gene module scores",
+               pt.size = 1,
+               reduction = "UMAP",
+               viridis.direction = -1,
+               viridis.palette = "D",
+               font.size = 14,
+               label.size = 14,
+               slot = "data",
+               legend.title.face = "bold",
+               axis.text.face = "bold",
+               plot.title.face = "bold",
+               plot.axes = TRUE,
+               legend.title = "Module score",
+               legend.length = 10,
+               split.by = "genetic_subtype")
+
+do_FeaturePlot(sample = ALL_NK, 
+               features = "mature_NK_module1",
+               plot.title = "Mature NK cells",
+               plot.subtitle = "Gene module scores",
+               pt.size = 1,
+               reduction = "UMAP",
+               viridis.direction = -1,
+               viridis.palette = "D",
+               font.size = 14,
+               label.size = 14,
+               slot = "data",
+               legend.title.face = "bold",
+               axis.text.face = "bold",
+               plot.title.face = "bold",
+               plot.axes = TRUE,
+               legend.title = "Module score",
+               legend.length = 10,
+               split.by = "predicted_NK_type_de.n350")
+```
+
+#### ___Dot plot___
+
+```{r fig.height=6.1, fig.width=7}
+do_DotPlot(sample = ALL_NK, 
+           axis.text.x.angle = 0,
+           features = "mature_NK_module1",
+           plot.title = "Mature NK cells",
+           plot.subtitle = "Gene module scores",
+           scale = TRUE,legend.length = 5,
+           group.by = "predicted_NK_type_de.n350",
+           use_viridis = TRUE,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 22,
+           dot.scale = 30,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Mature NK score")
+
+do_DotPlot(sample = ALL_NK, 
+           axis.text.x.angle = 0,
+           features = "adaptive_NK_module1",
+           plot.title = "adaptive NK",
+           plot.subtitle = "Gene module scores",
+           scale = TRUE,legend.length = 5,
+           group.by = "predicted_NK_type_de.n350",
+           use_viridis = TRUE,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 22,
+           dot.scale = 30,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Adaptive NK score")
+
+do_DotPlot(sample = ALL_NK, 
+           axis.text.x.angle = 0,
+           features = "conventional_NK_module1",
+           plot.title = "Conventional NK",
+           plot.subtitle = "Gene module scores",
+           scale = TRUE,legend.length = 5,
+           group.by = "predicted_NK_type_de.n350",
+           use_viridis = TRUE,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 22,
+           dot.scale = 30,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Conventional NK score")
+
+do_DotPlot(sample = ALL_NK, 
+           axis.text.x.angle = 0,
+           features = "NKP_module1",
+           plot.title = "NK Progenitors",
+           plot.subtitle = "Gene module scores",
+           scale = TRUE,legend.length = 5,
+           group.by = "predicted_NK_type_de.n350",
+           use_viridis = TRUE,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 22,
+           dot.scale = 30,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "NK progenitor score")
+```
+
+#### ___Violin plot___
+
+##### ___Adaptive NK gene signature___
+
+```{r}
+VlnPlot(ALL_NK,
+        features = "adaptive_NK_module1", 
+        group.by = "genetic_subtype", 
+        split.by = "predicted_NK_type_de.n350",
+        cols = COLOR_CODE_v2, 
+        y.max = 0.01)
+```
+
+##### ___Conventional NK gene signature___
+
+```{r}
+VlnPlot(ALL_NK,
+        features = "conventional_NK_module1", 
+        group.by = "genetic_subtype", 
+        split.by = "predicted_NK_type_de.n350",
+        cols = COLOR_CODE_v2, 
+        y.max = 0.01)
+```
+
+##### ___NK progenitors gene signature___
+
+```{r}
+VlnPlot(ALL_NK,
+        features = "NKP_module1", 
+        group.by = "genetic_subtype", 
+        split.by = "predicted_NK_type_de.n350",
+        cols = COLOR_CODE_v2, 
+        y.max = 0.01)
+```
+
+##### ___NK maturity gene signature [with stats]___
+
+```{r add stats to violin plots: NK maturity score}
+gene_of_interest <- "mature_NK_module1"
+
+# 1. PER GROUP
+
+# Change identities in the Seurat object to genetic groups
+Idents(ALL_NK) <- ALL_NK$genetic_subtype
+
+# Create violin plot with adjusted p-values for all comparisons [to ATRXm as ref]
+group_signif <- VlnPlot(ALL_NK, 
+             features = gene_of_interest, 
+             group.by = "genetic_subtype",
+             log = FALSE,
+             cols = COLOR_CODE_GROUP,
+             layer = "data",
+             pt.size = 0) +
+  theme_classic() +
+  stat_compare_means(method = "wilcox.test", 
+                     label = "p.signif",
+                     ref.group = "ATRXm") + 
+      ggtitle(paste(gene_of_interest, " module score")) + 
+  labs(y = paste(gene_of_interest, " module score"),
+       x = "")  + 
+    theme(legend.position = "none",  # Remove the legend
+          axis.text.x = element_text(angle = 45, hjust = 1, colour = "black"))
+
+# Show the plot
+group_signif
+
+# Save the plot as a PNG file
+group_save <- paste0(params$out,"figures/","fetahu2023_violinPlot_", 
+                      gene_of_interest, "_genetic_groups", "_NEWCLINICALGROUPS" ,".png")
+ggsave(group_save, plot = group_signif, width = 6, height = 4,dpi = 600)
+
+
+# 2. PER SAMPLE/PATIENT
+
+patient_signif <- VlnPlot(ALL_NK, 
+             features = gene_of_interest, 
+             group.by = "sample",
+             log = TRUE,
+             cols = COLOR_CODE_PATIENTS_GROUP,
+             layer = "data",
+             pt.size = 0) +
+  theme_classic() +
+  stat_compare_means(method = "wilcox.test", 
+                     label = "p.signif",
+                     ref.group = "ATRXm") + 
+      ggtitle(paste(gene_of_interest, " module scores")) + 
+  labs(y = paste(gene_of_interest, " module scores"),
+       x = "")  + 
+    theme(legend.position = "none",  # Remove the legend
+          axis.text.x = element_text(angle = 45, hjust = 1, colour = "black"))
+
+# Show the plot
+patient_signif
+
+# Save the plot as a PNG file
+patient_save <- paste0(params$out,"figures/","fetahu2023_violinPlot_", 
+                      gene_of_interest, "_sample", "_NEWCLINICALGROUPS" ,".png")
+ggsave(patient_save, plot = patient_signif, width = 8, height = 4,dpi = 600)
+
+
+# COMPARISON BETWEEN NK SUB-TYPES, BETWEEN NB GENETIC GROUPS [ON NK CELLS!]
+
+# Change identities in the Seurat object to genetic groups
+Idents(ALL_NK) <- ALL_NK$predicted_NK_type_de.n350
+
+# Check the range of the gene expression for y label positioning
+gene_range <- range(FetchData(ALL_NK, vars = gene_of_interest)$CD6)
+gene_max <- gene_range[2]
+y_positions <- c(gene_max + 1)
+
+# Extract the cluster identities from the Seurat object
+NK_cluster_list <- unique(Idents(ALL_NK))
+
+# plot violin plots with significance levels for each NK cluster
+for (NK_cluster in NK_cluster_list){
+  # Generate violin plot for each cluster
+  signif_plot <- VlnPlot(ALL_NK,
+        group.by = "genetic_subtype",
+        idents = NK_cluster,
+        features = gene_of_interest,
+        fill.by = "genetic_subtype",
+        log = FALSE, # FOR MODULE SCORE SHOULD BE SET TO FALSE
+        layer = "data",
+        pt.size = 0,
+        cols = COLOR_CODE_GROUP) +
+  theme_classic() +
+  stat_compare_means(method = "wilcox.test", 
+                     label = "p.signif",
+                     ref.group = "ATRXm") +
+      ggtitle(paste("Module scores for ", gene_of_interest, 
+                    "in cluster: ", NK_cluster)) + 
+  labs(y = paste(gene_of_interest, " module score"),
+       x = "")  + 
+    theme(legend.position = "none",  # Remove the legend
+          axis.text.x = element_text(angle = 45, hjust = 1, colour = "black"))
+  
+  # print the violin plot on the screen
+  print(signif_plot)
+  
+  # Save the plot as a PNG file
+  file_name <- paste0(params$out,"figures/","fetahu2023_violinPlot_", 
+                      gene_of_interest, "_cluster_", NK_cluster, 
+                      "_NEWCLINICALGROUPS" ,".png")
+  ggsave(file_name, plot = signif_plot, width = 6, height = 4,dpi = 600)
+}
+```
+
+
+
+# ___Session Info___
+
+```{r}
+sessionInfo()
+```
+
+# ___The End___

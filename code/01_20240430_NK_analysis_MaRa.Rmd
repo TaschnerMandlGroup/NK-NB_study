@@ -1,5 +1,5 @@
 ---
-title: "NK project with Magdalena Rados"
+title: "NK project: Preliminary analysis"
 author: "Sara Wernig-Zorc"
 date: "`r Sys.Date()`"
 output: 
@@ -20,6 +20,12 @@ params:
   GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
   markers: "/home/rstudio/mnt_resources/MES_ADRN/"
 ---
+
+Fetahu et al., 2023 scRNA-seq
+Group I: non-tumor-infiltrated BM
+Group II: MYCNA 
+Group III: ATRXmutated
+Group IV: Sporadic
 
 ```{r setup, include=FALSE, echo = FALSE}
 knitr::opts_chunk$set(echo = TRUE,
@@ -50,7 +56,7 @@ suppressPackageStartupMessages(library("dplyr"))
 suppressPackageStartupMessages(library("patchwork"))
 suppressPackageStartupMessages(library("RColorBrewer"))
 
-source("/home/rstudio/scRNA.scATAC/R/NK_paper_setup.R")
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_setup.R")
 ```
 
 # __load integrated data__
@@ -136,7 +142,6 @@ yang2019_clust6 <- filter(yang2019_clust_filt,
                           cluster == "6") # 79
 yang2019_clust7 <- filter(yang2019_clust_filt, 
                           cluster == "7") # 65
-
 ```
 
 ```{r eval=FALSE, include=FALSE}
@@ -150,7 +155,6 @@ for (x in 1:7) {
               file = paste0("/home/rstudio/mnt_resources/NK_cells_gene_sets/yang2019_cluster",x,".csv"))
 }
 ```
-
 
 ```{r}
 # normalize and scale count data
@@ -168,7 +172,9 @@ fetahu.NK <- RunPCA(fetahu.NK,
                     reduction.name = "pca_new")
 
 # PCA plot
-DimPlot(object = fetahu.NK,reduction = "pca_new")
+DimPlot(object = fetahu.NK,
+        reduction = "pca_new",
+        group.by = "group")
 
 # find closest cells based on gene expression of the yang2019_clust_mark genes
 fetahu.NK <- FindNeighbors(fetahu.NK, 
@@ -201,10 +207,6 @@ DimPlot(fetahu.NK,
 # Get number of cells per cluster and per group
 table(fetahu.NK$yang2019_clusters, 
       fetahu.NK$group)
-# Group I: non-tumor-infiltrated BM
-# Group II: MYCNA 
-# Group III: ATRXmutated
-# Group IV: Sporadic
 
 # set Seurat clusters as ident
 Idents(fetahu.NK) <- fetahu.NK@meta.data$yang2019_clusters
@@ -213,12 +215,17 @@ Idents(fetahu.NK) <- fetahu.NK@meta.data$yang2019_clusters
 DoHeatmap(fetahu.NK, 
           features = yang2019_clust_filt$gene)
 
-saveRDS(fetahu.NK, file = paste0(params$out,
-                                 "NK_project/Rds/fetahu2023_NK_reClust_yang2019.Rds"))
+#saveRDS(fetahu.NK, file = paste0(params$out,"NK_project/Rds/fetahu2023_NK_reClust_yang2019.Rds"))
 
 ```
 
 ```{r Clusters per sample}
+DimPlot(fetahu.NK,
+        reduction = "umap_new",
+        split.by = "group", 
+        group.by = "yang2019_clusters",
+        pt.size = 1)
+
 fetahu.NK <- readRDS(file = paste0(params$out,
                                    "NK_project/Rds/fetahu2023_NK_reClust_yang2019.Rds"))
 
@@ -232,14 +239,19 @@ percent_NK_sample
 
 
 # define colors
-colors <- brewer.pal(4,"Pastel2") 
+colors <- brewer.pal(6,"Pastel2") 
 
 barplot(percent_NK_group,
+        main = "Fetahu et al., 2023: reclustering with Yang2019 genes",
         col = colors, 
-        border = "white", 
-        xlab = "NB genetic group",
-        legend.text = c("C1","C2","C3","C4"))
-
+        border = "white",
+        xlim=c(0, ncol(percent_NK_group) + 2),
+        ylab = "Number of cells in the cluster",
+        xlab = "Sample group",
+        legend.text = c("0","1","2","3","4","5"),
+        args.legend = list(x = ncol(percent_NK_group) + 2,
+                           y = max(colSums(percent_NK_group)),
+                           bty = "n"))
 
 # Transform this data in %
 data_percentage_group <- apply(percent_NK_group, 2, 
@@ -251,17 +263,32 @@ data_percentage_sample <- apply(percent_NK_sample, 2,
 
 # Make a stacked barplot in %
 barplot(data_percentage_group, 
+        main = "Fetahu et al., 2023: reclustering with Yang2019 genes",
         col = colors, 
-        border = "white", 
-        xlab = "NB genetic group",
-        legend.text = c("C1","C2","C3","C4"))
-
-barplot(data_percentage_sample, 
-        col = colors, 
-        border = "white", 
-        xlab = "NB genetic group",
-        legend.text = c("C1","C2","C3","C4"))
+        border = "white",
+        xlim=c(0, ncol(data_percentage_group) + 2),
+        ylab = "Percentage of cells in the cluster",
+        xlab = "Sample group",
+        legend.text = c("0","1","2","3","4","5"),
+        args.legend = list(x = ncol(data_percentage_group) + 2,
+                           y = max(colSums(data_percentage_group)),
+                           bty = "n"))
 ```
+
+```{r fig.height=5, fig.width=15}
+barplot(data_percentage_sample, 
+        main = "Fetahu et al., 2023: reclustering with Yang2019 genes",
+        col = colors, 
+        border = "white",
+        xlim = c(0, ncol(data_percentage_sample) + 4),
+        ylab = "Percentage of cells in the cluster",
+        xlab = "Sample groups",
+        legend.text = c("0","1","2","3","4","5"),
+        args.legend = list(x = ncol(data_percentage_sample) + 5,
+                           y = max(colSums(data_percentage_sample)),
+                           bty = "n"))
+```
+
 
 # ___NK sub-type enrichment___
 
@@ -599,6 +626,13 @@ VlnPlot(fetahu.NK,features = "Yang2019_cluster7_1")
 RidgePlot(fetahu.NK,features = "Yang2019_cluster7_1")
 ```
 
+Intepretation: 
+NB cluster 4 = Yang cluster 1 (CD56 bright NK)
+*NB cluster 0 = Yang cluster 2 (Transitional NK)*
+NB cluster 5 = Yang cluster 3 (Active NK)
+NB cluster 1 = Yang cluster 4 (adaptive NK)
+NB cluster 2 = Yang cluster 5 (Mature NK)
+NA = Yang clusters 6 and 7 (Terminal and Inflamed NK, respectively)
 
 # ___DA testing___
 

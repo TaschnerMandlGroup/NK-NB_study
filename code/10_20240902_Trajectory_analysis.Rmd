@@ -1,0 +1,332 @@
+---
+title: "NK project: Trajectory analysis"
+author: "Dr. Sara Wernig-Zorc"
+date: "27.9.2024"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  input_BM1: "/home/rstudio/mnt_data/BM/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"
+  input_BM2: "/home/rstudio/mnt_data/BM/yang2019/Rds/Human_BM_NK_seurat_v4.Rds"
+  input_BM3: "/home/rstudio/mnt_data/BM/Lee/disco_bone_marrow_v2.0.rds"
+  input_scRNA: "/home/rstudio/mnt_out/scRNA-seq_stage_M/results/published/data/rna_decontaminated.rds"
+  out: "/home/rstudio/mnt_out/NK_project/"
+  GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
+  markers: "/home/rstudio/mnt_resources/MES_ADRN/"
+  metadata: "/home/rstudio/scRNA.NB.integration/metadata/"
+---
+
+DESCRIPTION
+
+The idea here is to see the the differentiation trajectory of NK cells and if 
+<br>
+the trajectory differs between healthy and tumor
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 80)
+options(future.globals.maxSize = 80 * 10^9)
+
+print(params)
+```
+
+```{r load project specific R packages and color code}
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_setup.R")
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_utils.R")
+```
+
+ ___Input_data___
+
+```{r}
+adult_BM_NK <- readRDS(file = params$input_BM1)
+
+scea <- as.SingleCellExperiment(adult_BM_NK)
+colLabels(scea) <- adult_BM_NK$cluster2
+```
+
+```{r}
+ALL_NK <-  readRDS(file = paste0(params$out,"Rds/fetahu2023_NK_subclusters_from_Crinier2021_de.n=350.Rds"))
+
+sce <- as.SingleCellExperiment(ALL_NK)
+colLabels(sce) <- ALL_NK$predicted_NK_type_de.n350
+```
+
+```{r}
+Idents(ALL_NK) <- ALL_NK$group.y
+
+ATRX_NK <- subset(ALL_NK, idents = "ATRXdel") 
+ATRX <- as.SingleCellExperiment(ATRX_NK)
+colLabels(ATRX) <- ATRX_NK$predicted_NK_type_de.n350
+
+MNA_NK <- subset(ALL_NK, idents = "MNA") 
+MNA <- as.SingleCellExperiment(MNA_NK)
+colLabels(MNA) <- MNA_NK$predicted_NK_type_de.n350
+
+sporadic_NK <- subset(ALL_NK, idents = "sporadic") 
+sporadic <- as.SingleCellExperiment(sporadic_NK)
+colLabels(sporadic) <- sporadic_NK$predicted_NK_type_de.n350
+
+control_NK <- subset(ALL_NK, idents = "control") 
+control <- as.SingleCellExperiment(control_NK)
+colLabels(control) <- control_NK$predicted_NK_type_de.n350
+
+Idents(ALL_NK) <- ALL_NK$predicted_NK_type_de.n350
+```
+
+# ___ALL NK___
+
+## ___Slingshot___
+
+```{r PCA}
+# Extract PCA embeddings from Seurat object
+pca_embeddings <- Embeddings(ALL_NK, "PCA")
+
+# Extract cluster identities
+Idents(ALL_NK) <- ALL_NK$predicted_NK_type_de.n350
+cluster_labels <- Idents(ALL_NK)
+
+# Perform trajectory inference 
+sds <- slingshot(sce,
+                 clusterLabels = cluster_labels, 
+                 reducedDim = "PCA")
+
+# plot the PCA from Seurat
+DimPlot(ALL_NK,reduction = "PCA",dims = 1:2,pt.size = 1)
+ 
+# Plot Slingshot results
+plot(pca_embeddings[, 1], pca_embeddings[, 2], col = cluster_labels, pch = 10,
+     xlab = "PC1", ylab = "PC2", main = "PCA with Slingshot Trajectories")
+
+# Overlay the Slingshot trajectories
+lines(SlingshotDataSet(sds), lwd = 4, col = 'black')
+```
+
+```{r UMAP}
+# Extract PCA embeddings from Seurat object
+pca_embeddings <- Embeddings(ALL_NK, "UMAP")
+
+# Extract cluster identities
+Idents(ALL_NK) <- ALL_NK$predicted_NK_type_de.n350
+cluster_labels <- Idents(ALL_NK)
+
+# Perform trajectory inference 
+sds <- slingshot(pca_embeddings, 
+                 clusterLabels = cluster_labels, 
+                 reducedDim = "UMAP")
+
+# plot the PCA from Seurat
+DimPlot(ALL_NK,reduction = "UMAP",dims = 1:2,pt.size = 1)
+ 
+# Plot Slingshot results
+plot(pca_embeddings[, 1], pca_embeddings[, 2], col = cluster_labels, pch = 10,
+     xlab = "PC2", ylab = "PC3", main = "UMAP with Slingshot Trajectories")
+
+# Overlay the Slingshot trajectories
+lines(SlingshotDataSet(sds), lwd = 4, col = 'black')
+
+```
+
+## ___TSCAN___
+
+TSCAN uses the clustering to summarize the data into a smaller set of discrete units, 
+computes cluster centroids by averaging the coordinates of its member cells, 
+and then forms the minimum spanning tree (MST) across those centroids. 
+The MST is simply an undirected acyclic graph that passes through each centroid 
+exactly once and is thus the most parsimonious structure that captures the 
+transitions between clusters. 
+
+```{r}
+library(TSCAN)
+library(scater)
+
+# 1.Cluster-based minimum spanning tree
+by.cluster <- aggregateAcrossCells(sce, ids = sce$predicted_NK_type_de.n350)
+centroids <- reducedDim(by.cluster, "PCA")
+
+# Set clusters=NULL as we have already aggregated above.
+mst <- createClusterMST(centroids, clusters=NULL)
+mst
+
+line.data <- reportEdges(by.cluster, mst=mst, clusters=NULL, use.dimred="TSNE")
+
+plotTSNE(sce, colour_by="predicted_NK_type_de.n350") + 
+    geom_line(data=line.data, mapping=aes(x=tSNE_1, y=tSNE_2, group=edge))
+
+#We obtain a pseudotime ordering by projecting the cells onto the MST with mapCellsToEdges(). More specifically, we move each cell onto the closest edge of the MST; the pseudotime is then calculated as the distance along the MST to this new position from a “root node” with orderCells(). For our purposes, we will arbitrarily pick one of the endpoint nodes as the root, though a more careful choice based on the biological annotation of each node may yield more relevant orderings (e.g., picking a node corresponding to a more pluripotent state).
+
+map.tscan <- mapCellsToEdges(sce, mst=mst, use.dimred="PCA")
+tscan.pseudo <- orderCells(map.tscan, mst)
+head(tscan.pseudo)
+
+common.pseudo <- averagePseudotime(tscan.pseudo) 
+plotTSNE(sce, colour_by=I(common.pseudo), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=line.data, mapping=aes(x=tSNE_1, y=tSNE_2, group=edge))
+```
+
+```{r eval=FALSE, include=FALSE}
+#same as above but in one command
+pseudo.all <- quickPseudotime(sce, use.dimred="PCA")
+```
+
+Alternative approach: In this mode, the MST focuses on the connectivity between clusters, which can be different from the shortest distance between centroids
+
+```{r}
+pseudo.mnn <- quickPseudotime(sce, use.dimred="PCA", dist.method=NULL)
+mnn.pseudo <- averagePseudotime(pseudo.mnn$ordering)
+
+plotTSNE(sce, colour_by=I(mnn.pseudo), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$TSNE, mapping=aes(x=tSNE_1, y=tSNE_2, 
+                                                          group=edge))
+
+plotUMAP(sce, colour_by=I(mnn.pseudo), 
+         text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$UMAP, mapping=aes(x=UMAP_1, y=UMAP_2,
+                                                          group=edge))
+
+plotPCA(sce, colour_by=I(mnn.pseudo), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$PCA, mapping=aes(x=PC_1, y=PC_2,
+                                                          group=edge))
+```
+
+
+
+# ___Adolescent controls [healthy]___
+
+```{r}
+pseudo.mnn <- quickPseudotime(control, use.dimred="PCA", dist.method=NULL)
+mnn.pseudo <- averagePseudotime(pseudo.mnn$ordering)
+
+plotTSNE(control, colour_by=I(mnn.pseudo), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$TSNE, mapping=aes(x=tSNE_1, y=tSNE_2, 
+                                                          group=edge))
+
+plotUMAP(control, colour_by=I(mnn.pseudo), 
+         text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$UMAP, mapping=aes(x=UMAP_1, y=UMAP_2,
+                                                          group=edge))
+
+plotPCA(control, colour_by=I(mnn.pseudo), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$PCA, mapping=aes(x=PC_1, y=PC_2,
+                                                          group=edge))
+```
+
+# ___ATRXm___
+
+```{r}
+pseudo.mnn <- quickPseudotime(ATRX, use.dimred="PCA", dist.method=NULL)
+mnn.pseudo <- averagePseudotime(pseudo.mnn$ordering)
+
+plotTSNE(ATRX, colour_by=I(mnn.pseudo), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$TSNE, mapping=aes(x=tSNE_1, y=tSNE_2, 
+                                                          group=edge))
+
+plotUMAP(ATRX, colour_by=I(mnn.pseudo), 
+         text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$UMAP, mapping=aes(x=UMAP_1, y=UMAP_2,
+                                                          group=edge))
+
+plotPCA(ATRX, colour_by=I(mnn.pseudo), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$PCA, mapping=aes(x=PC_1, y=PC_2,
+                                                          group=edge))
+```
+
+# ___MNA___
+
+```{r}
+pseudo.mnn <- quickPseudotime(MNA, use.dimred="PCA", dist.method=NULL)
+mnn.pseudo <- averagePseudotime(pseudo.mnn$ordering)
+
+plotTSNE(MNA, colour_by=I(mnn.pseudo), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$TSNE, mapping=aes(x=tSNE_1, y=tSNE_2, 
+                                                          group=edge))
+
+plotUMAP(MNA, colour_by=I(mnn.pseudo), 
+         text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$UMAP, mapping=aes(x=UMAP_1, y=UMAP_2,
+                                                          group=edge))
+
+plotPCA(MNA, colour_by=I(mnn.pseudo), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$PCA, mapping=aes(x=PC_1, y=PC_2,
+                                                          group=edge))
+```
+
+# ___Sporadic___
+
+```{r}
+pseudo.mnn <- quickPseudotime(sporadic, use.dimred="PCA", dist.method=NULL)
+mnn.pseudo <- averagePseudotime(pseudo.mnn$ordering)
+
+plotTSNE(sporadic, colour_by=I(mnn.pseudo), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$TSNE, mapping=aes(x=tSNE_1, y=tSNE_2, 
+                                                          group=edge))
+
+plotUMAP(sporadic, colour_by=I(mnn.pseudo), 
+         text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$UMAP, mapping=aes(x=UMAP_1, y=UMAP_2,
+                                                          group=edge))
+
+plotPCA(sporadic, colour_by=I(mnn.pseudo), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$PCA, mapping=aes(x=PC_1, y=PC_2,
+                                                          group=edge))
+```
+
+
+
+# ___Adult controls [healthy]___
+
+Crinier at al., 2021 adult BM-derived-NK cells from 8 healthy donors
+
+```{r}
+library(TSCAN)
+library(scater)
+
+by.cluster <- aggregateAcrossCells(scea, ids = scea$cluster2)
+centroids <- reducedDim(by.cluster, "PCA")
+
+mst <- createClusterMST(centroids, clusters=NULL)
+mst
+
+line.data <- reportEdges(by.cluster, mst=mst, clusters=NULL, use.dimred="TSNE")
+
+plotTSNE(scea, colour_by="cluster2") + 
+    geom_line(data=line.data, mapping=aes(x=tSNE_1, y=tSNE_2, group=edge))
+
+map.tscan <- mapCellsToEdges(scea, mst=mst, use.dimred="PCA")
+tscan.pseudo <- orderCells(map.tscan, mst)
+head(tscan.pseudo)
+
+common.pseudo <- averagePseudotime(tscan.pseudo) 
+plotTSNE(scea, colour_by=I(common.pseudo), 
+        text_by="cluster2", text_colour="red") +
+    geom_line(data=line.data, mapping=aes(x=tSNE_1, y=tSNE_2, group=edge))
+```
+
+# ___sessionInfo___
+
+```{r}
+sessionInfo()
+```

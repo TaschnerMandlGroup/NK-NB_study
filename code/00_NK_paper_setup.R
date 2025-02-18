@@ -1,6 +1,44 @@
-# gene lists for NK project
+#!/usr/bin/env Rscript 
 
-# Yang et al., 2019
+# ___R packages___
+suppressPackageStartupMessages(library("Seurat"))
+suppressPackageStartupMessages(library("SingleCellExperiment"))
+suppressPackageStartupMessages(library("readxl"))
+suppressPackageStartupMessages(library("SCpubr"))
+suppressPackageStartupMessages(library("scCustomize"))
+suppressPackageStartupMessages(library("ggVennDiagram"))
+suppressPackageStartupMessages(library("statmod"))
+suppressPackageStartupMessages(library("miloR"))
+suppressPackageStartupMessages(library("scran"))
+suppressPackageStartupMessages(library("scater"))
+suppressPackageStartupMessages(library("dplyr"))
+suppressPackageStartupMessages(library("patchwork"))
+suppressPackageStartupMessages(library("RColorBrewer"))
+suppressPackageStartupMessages(library("dplyr"))
+suppressPackageStartupMessages(library("ggplot2"))
+suppressPackageStartupMessages(library("SingleR"))
+suppressPackageStartupMessages(library("ggpubr"))
+suppressPackageStartupMessages(library("stats"))
+suppressPackageStartupMessages(library("viridis"))
+suppressPackageStartupMessages(library("DElegate"))
+suppressPackageStartupMessages(library("clusterProfiler"))
+suppressPackageStartupMessages(library("org.Hs.eg.db"))
+suppressPackageStartupMessages(library("enrichplot"))
+suppressPackageStartupMessages(library("AnnotationDbi"))
+suppressPackageStartupMessages(library("pathview"))
+suppressPackageStartupMessages(library("knitr"))
+suppressPackageStartupMessages(library("pathview"))
+suppressPackageStartupMessages(library("aggregateBioVar"))
+suppressPackageStartupMessages(library("SummarizedExperiment"))
+suppressPackageStartupMessages(library("DESeq2"))
+suppressPackageStartupMessages(library("magrittr"))
+suppressPackageStartupMessages(library("pheatmap"))
+suppressPackageStartupMessages(library("ggtext"))
+suppressPackageStartupMessages(library("readxl"))
+
+
+# ___NK sub-set markers___
+# from: Yang et al., 2019
 library(readxl)
 yang2019_clust_mark <- 
   read_excel("/home/rstudio/mnt_resources/NK_cells_gene_sets/Yang2019_supp_Table_1.xlsx")
@@ -9,33 +47,53 @@ yang2019_clust_mark <- yang2019_clust_mark$gene
 length(yang2019_clust_mark)
 
 
-## ___NK gene lists___
+## ____NK functional markers____
 
-
-adaptive_NK_genes <- read.csv("/home/rstudio/mnt_resources/NK_cells_gene_sets/adaptive_NK_marker_genes.txt", 
-                              header = FALSE)
+adaptive_NK_genes <- read.csv("/home/rstudio/mnt_resources/NK_cells_gene_sets/adaptive_NK_marker_genes.txt", header = FALSE)
 adaptive_NK_genes <- adaptive_NK_genes$V1
-conventional_NK_genes <- read.csv("/home/rstudio/mnt_resources/NK_cells_gene_sets/conventional_NK_marker_genes.txt", 
-                                  header = FALSE)
+conventional_NK_genes <- read.csv("/home/rstudio/mnt_resources/NK_cells_gene_sets/conventional_NK_marker_genes.txt", header = FALSE)
 conventional_NK_genes <- conventional_NK_genes$V1
-mature_NK_genes <- read.csv("/home/rstudio/mnt_resources/NK_cells_gene_sets/mature_NK_marker_genes.txt", 
-                            header = FALSE)
+mature_NK_genes <- read.csv("/home/rstudio/mnt_resources/NK_cells_gene_sets/mature_NK_marker_genes.txt", header = FALSE)
 mature_NK_genes <- mature_NK_genes$V1
-NKP_genes <- read.csv("/home/rstudio/mnt_resources/NK_cells_gene_sets/NKP_marker_genes.txt", 
-                      header = FALSE)
+NKP_genes <- read.csv("/home/rstudio/mnt_resources/NK_cells_gene_sets/NKP_marker_genes.txt", header = FALSE)
 NKP_genes <- NKP_genes$V1
 
 
-COLOR_CODE <- c("I"   = "#161B33",
-                "II"  = "#419D78",
-                "III" = "#AF1B3F",
-                "IV"  = "#E88873")
+## ____NK other markers____
 
-COLOR_CODE_GROUP <- c("control"   = "#161B33",
-                "MNA"  = "#419D78",
-                "ATRXdel" = "#AF1B3F",
-                "sporadic"  = "#E88873")
+# direct_R = c("TNFRSF10B","TNFSF6")
+NK_functional_markers <- list(canonical_markers = c("EOMES","ID2","TBX21"),
+                              NK_subtype_markers = c("FCGR3A","NCAM1","CD160",
+                                                     "CD52","IL2RB", "CD27", 
+                                                     "CD69", "IL7R"),
+                              indirect = c("PRF1","GZMB"),   # Indirect killing of tumor cells
+                              direct = c("TNFSF10","FASLG"), # Direct killing of tumor cells
+                              recruitment = c("IFNG","TNF")) # Recruitment of other immune cell types such as DCs, T-cells
 
+
+NK_activating_cytokines <- c("IL2", "IL15", "IL12A", 
+                            "IL12B","IL18")
+
+NK_maturation_genes <- c("IFI44L", "IFI6", "IFIT3", "IFI44", "HLA-DPB1", 
+                         "HLA-DPA1", "HLA-DRB5", "HLA-DRB1", "ZEB2", "KLF2")
+
+cytokines <- c("IL7","KITLG","FLT3","LTA","LTB","IL15","IL17A","TGFB1")
+
+TFs <- c("EOMES", "ID2", "TBX21", "NFIL3", "HNF1A", "ETS1", "STAT5A", "STAT5B", 
+         "TBX21", "TOX", "TOX2","PRDM1","ZEB2","GATA3","SMAD4","FOXO1")
+
+
+## ___Color pallets___
+
+COLOR_CODE <- c("I"   = "#1A535C",
+                "II"  = "#8AB17D",
+                "III" = "#FF6B6B",
+                "IV"  = "#78C0E0")
+
+COLOR_CODE_GROUP <- c("control"   = "#503D42",
+                           "MNA"  = "#8AB17D",
+                        "ATRXdel" = "#F2CEE6",
+                      "sporadic"  = "#E05263")
 
 COLOR_CODE_v2 <- c("hNK_Bm1"   = "#161B33",
                 "hNK_Bm2"  = "#419D78",
@@ -52,7 +110,6 @@ COLOR_CODE_CLUST_v2 <- c("0"   = "#161B33",
                          "2" = "#AF1B3F",
                          "3"  = "#E88873")
 
-
 COLOR_CODE_CLUST_v3 <- c("0"   = "#264653",
                          "1"  = "#287271",
                          "2" = "#2a9d8f",
@@ -60,8 +117,6 @@ COLOR_CODE_CLUST_v3 <- c("0"   = "#264653",
                          "4" = "#e9c46a",
                          "5" = "#f4a261",
                          "6" = "#e76f51")
-
-
 
 COLOR_CODE_DONORS <- c("donor1"   = "#264653",
                        "donor2"  = "#287271",
@@ -80,8 +135,6 @@ COLOR_CODE_DOTPLOT <- c("#264653",
                         "#f4a261",
                         "#e76f51")
 
-
-
 COLOR_CODE_PATIENTS <-c("2005_1702" = "#b440a3",
                         "2006_2684" = "#ff91ab",
                         "2014_0102" = "#79c220",
@@ -98,7 +151,6 @@ COLOR_CODE_PATIENTS <-c("2005_1702" = "#b440a3",
                         "2019_5754" = "#ce9c85",
                         "2020_1288" = "#1c3c41",
                         "2020_1667" = "#6fb1aa")
-
 
 COLOR_CODE_PATIENTS_v2 <-c("patient 01" = "#b440a3",
                         "patient 02" = "#ff91ab",
@@ -146,13 +198,11 @@ COLOR_CODE_PATIENTS_v5 <-c("donor1" = "#b440a3",
 COLOR_CODE_PATIENTS_v6 <-c("ATRXmut_01" = "#b440a3",
                            "ATRXmut_02" = "#f76cc6")
 
-
 COLOR_CODE_PATIENTS_v7 <-c("2014_0102" = "#4a9e48",
                            "2020_1288" = "#247a4d",
                            "2018_4252" = "#30c67c",
                            "2016_1853" = "#099773",
                            "2016_2950" = "#2e703b")
-
 
 PATIENT_GROUPS <- c("2005_1702" = "III", 
                     "2006_2684" = "IV",
@@ -170,7 +220,6 @@ PATIENT_GROUPS <- c("2005_1702" = "III",
                     "2019_5754" = "II",
                     "2020_1288" = "I",
                     "2020_1667" = "IV")
-
 
 PATIENT_GROUPS_v2 <- c("2005_1702" = "ATRXmut_01", 
                     "2006_2684" = "sporadic_01",

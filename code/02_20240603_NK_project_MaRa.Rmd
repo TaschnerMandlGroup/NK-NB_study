@@ -1,5 +1,5 @@
 ---
-title: "NK project with Magdalena Rados"
+title: "NK project: (prelimnary) DEG analysis"
 author: "Sara Wernig-Zorc"
 date: "`r Sys.Date()`"
 output: 
@@ -13,10 +13,12 @@ output:
     theme: spacelab
     df_print: paged
 params:
-  input: "/home/data/MapMet/"
-  out: "/home/out/MapMet/"
-  GO_db: "/home/sara_wz/annotation/GSEA_GeneSetEnrichments"
-  markers: "/home/sara_wz/annotation/MES_ADRN/"
+  input: "/home/rstudio/mnt_data/BM/"
+  out: "/home/rstudio/mnt_out/NK_project/"
+  data: "/home/rstudio/mnt_data/"
+  nb_tumors: "/home/rstudio/mnt_nb_tumors/"
+  GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
+  markers: "/home/rstudio/mnt_resources/MES_ADRN/"
 ---
 
 ```{r setup, include=FALSE}
@@ -30,16 +32,39 @@ library(parallel)
 future::plan(strategy = 'future::multicore', workers = 12)
 options(future.globals.maxSize = 8 * 10^9)
 
-source("/home/sara_wz/MapMet_project/MapMetSC/code/R/CCC_analysis/00_MapMet_color_code.R")
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_setup.R")
 
 print(params)
 ```
 
+
 ```{r}
-bm <- readRDS("/home/data/CancReg/BM/scBM_healthy.Rds")
-nb <- readRDS("/home/out/CancReg/sBM/scBM_healthy.Rds")
+bm <- readRDS(paste0(params$input,"/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"))
+nb <- readRDS(paste0(params$out,"Rds/fetahu2023_NK_cluster.Rds"))
 ```
 
+```{r}
+Idents(nb) <- nb@meta.data$sample
+nb <- RenameIdents(nb, 
+                    "2005_1702" = "ATRXmut_01", 
+                    "2006_2684" = "sporadic_01",
+                    "2014_0102" = "ctrl_01",
+                    "2016_1853" = "ctrl_02",
+                    "2016_2950" = "ctrl_03",
+                    "2016_3924" = "ATRXmut_02",
+                    "2016_4503" = "MYCNA_01",
+                    "2018_1404" = "MYCNA_02",
+                    "2018_1625" = "sporadic_02",
+                    "2018_4252" = "ctrl_04",
+                    "2018_6056" = "sporadic_03",
+                    "2019_2495" = "sporadic_04",
+                    "2019_5022" = "MYCNA_03",
+                    "2019_5754" = "MYCNA_04",
+                    "2020_1288" = "ctrl_05",
+                    "2020_1667" = "sporadic_05")
+
+nb@meta.data$patients <- Idents(nb)
+```
 
 
 # __DEG analysis__
@@ -49,26 +74,29 @@ nb <- readRDS("/home/out/CancReg/sBM/scBM_healthy.Rds")
 
 ```{r DEG analysis}
 # Set groups  to genetic subtypes
-Idents(rna) <- rna@meta.data$group
+Idents(nb) <- nb@meta.data$group.x
 
-# Normalize the data
-rna <- NormalizeData(rna)
+# Plot UMAP with 
+DimPlot(nb)
+
+#0. Normalize expression data
+rna <- NormalizeData(nb)
 
 # DEG analysis with DElegate
-de_results <- DElegate::findDE(object = rna, 
-                               group_column = "group")
+de_results <- DElegate::findDE(object = nb, 
+                               group_column = "group.x")
 
 # DEG analysis with Seurat
 #1. Find DE features between ATRXm vs. MYCNA
-ATRXm.de.MYCNA <- FindMarkers(rna, ident.1 = "II", ident.2 = "III")
+ATRXm.de.MYCNA <- FindMarkers(nb, ident.1 = "II", ident.2 = "III")
 ATRXm.de.MYCNA
 
 #2. Find DE features between ATRTXm vs. sporadic
-ATRXm.de.Sporadic <- FindMarkers(rna, ident.1 = "II", ident.2 = "IV")
+ATRXm.de.Sporadic <- FindMarkers(nb, ident.1 = "II", ident.2 = "IV")
 ATRXm.de.Sporadic
 
 #3. Find DE features between ATRTXm vs. non-DTC-infiltrated BM
-ATRXm.de.Ctrl <- FindMarkers(rna, ident.1 = "II", ident.2 = "I")
+ATRXm.de.Ctrl <- FindMarkers(nb, ident.1 = "II", ident.2 = "I")
 ATRXm.de.Ctrl
 ```
 
@@ -77,30 +105,17 @@ ATRX deleted NB genetic subtype, compare to other genetic subtypes (MYCN amplifi
 and sporadic) and in control BM.
 
 ```{r NK cells only}
-# Set groups as genetic groups
-Idents(rna) <- rna@meta.data$original_celltype
 
-# subset rna object to NK cell cluster 
-NK_cells <- "NK (4)"
-fetahu.NK <- subset(rna, idents = NK_cells, invert = FALSE)
-
-# Set groups to genetic subtypes
-Idents(fetahu.NK) <- fetahu.NK@meta.data$group
-
-# Plot UMAP with 
-DimPlot(fetahu.NK)
-
-#0. Normalize expression data
-rna <- NormalizeData(fetahu.NK)
-
+metadata <- as.data.frame(nb@meta.data)
 
 #1. DEG analysis with DElegate
-de_results <- DElegate::findDE(object = fetahu.NK, 
+de_results <- DElegate::findDE(object = nb, 
+                               replicate_column = "patients",
                                compare = "all_vs_all", 
                                order_results = TRUE,
                                meta_data = metadata,
                                compare_is_ref = TRUE,
-                               group_column = "group")
+                               group_column = "group.x")
 
 de_results
 write.table(de_results, file = paste0(params$out,"/tables/DEG_ATRXvsAll_DElegate.csv"),
@@ -108,19 +123,19 @@ write.table(de_results, file = paste0(params$out,"/tables/DEG_ATRXvsAll_DElegate
 
 #2. DEG analysis with Seurat
 #2.1 Find DE features between ATRXm vs. MYCNA
-ATRXm.de.MYCNA.NK <- FindMarkers(fetahu.NK, ident.1 = "III", ident.2 = "II")
+ATRXm.de.MYCNA.NK <- FindMarkers(nb, ident.1 = "III", ident.2 = "II")
 ATRXm.de.MYCNA.NK
 write.table(ATRXm.de.MYCNA.NK, file = paste0(params$out,"/tables/DEG_ATRXvsMYCNA.csv"),
             sep = "\t", row.names = TRUE, col.names = TRUE)
 
 #2.2 Find DE features between ATRTXm vs. sporadic
-ATRXm.de.Sporadic.NK <- FindMarkers(fetahu.NK, ident.1 = "III", ident.2 = "IV")
+ATRXm.de.Sporadic.NK <- FindMarkers(nb, ident.1 = "III", ident.2 = "IV")
 ATRXm.de.Sporadic.NK
 write.table(ATRXm.de.Sporadic.NK, file = paste0(params$out,"/tables/DEG_ATRXvsSporadic.csv"),
             sep = "\t", row.names = TRUE, col.names = TRUE)
 
 #2.3 Find DE features between ATRTXm vs. non-DTC-infiltrated BM
-ATRXm.de.Ctrl.NK <- FindMarkers(fetahu.NK, ident.1 = "III", ident.2 = "I")
+ATRXm.de.Ctrl.NK <- FindMarkers(nb, ident.1 = "III", ident.2 = "I")
 ATRXm.de.Ctrl.NK
 write.table(ATRXm.de.Ctrl.NK, file = paste0(params$out,"/tables/DEG_ATRXvsCtrl.csv"),
             sep = "\t", row.names = TRUE, col.names = TRUE)

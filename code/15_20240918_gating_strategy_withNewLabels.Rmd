@@ -1,0 +1,167 @@
+---
+title: "NK project: Gating strategy"
+author: "Dr. Sara Wernig-Zorc"
+date: "18.09.2024 - 20.09.2024"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  input_BM1: "/home/rstudio/mnt_data/BM/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"
+  input_BM2: "/home/rstudio/mnt_data/BM/yang2019/Rds/Human_BM_NK_seurat_v4.Rds"
+  input_BM3: "/home/rstudio/mnt_data/BM/Lee/disco_bone_marrow_v2.0.rds"
+  input_scRNA: "/home/rstudio/mnt_out/scRNA-seq_stage_M/results/published/data/rna_decontaminated.rds"
+  out: "/home/rstudio/mnt_out/NK_project/"
+  GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
+  markers: "/home/rstudio/mnt_resources/MES_ADRN/"
+  metadata: "/home/rstudio/scRNA.NB.integration/metadata/"
+---
+
+PROJECT DESCRIPTION
+
+Identify NK sub-populations in tumor-infiltrated bone marrow samples from
+Neuroblastoma patients.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 20)
+options(future.globals.maxSize = 8 * 10^9)
+
+print(params)
+
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_setup.R")
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_utils.R")
+
+library(EnhancedVolcano)
+```
+
+# ___Load data___
+
+## ___NB BM-derived NK cells___
+
+```{r}
+predicted_labels <- readRDS(paste0(params$out,
+                                   "/Rds/fetahu2023_predicted_NKclusters_from_Crinier2021_de.n=350.Rds"))
+ALL_NK <- readRDS(paste0(params$out,
+                         "/Rds/fetahu2023_NK_subclusters_from_Crinier2021_de.n=350.Rds"))
+
+ALL_NK <- ALL_NK %>% 
+  NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000) %>% ScaleData()
+
+# Reorder the levels of the group-by column based
+ALL_NK$group.y <- factor(ALL_NK$group.y,
+                         levels = c("control",
+                                    "ATRXdel",
+                                    "MNA",
+                                    "sporadic"))
+
+# Reorder the levels of the NK subset annotation column
+ALL_NK$predicted_NK_type_de.n350 <- factor(ALL_NK$predicted_NK_type_de.n350,
+                         levels = c("hNK_Bm1",
+                                    "hNK_Bm2",
+                                    "hNK_Bm3",
+                                    "hNK_Bm4"))
+```
+
+```{r}
+Idents(ALL_NK) <- ALL_NK@meta.data$group.y
+
+# identify cell IDs associated with each cluster
+M <- WhichCells(ALL_NK, ident = "MNA")
+S <- WhichCells(ALL_NK, ident = "sporadic")
+C <- WhichCells(ALL_NK, ident = "control")
+A <- WhichCells(ALL_NK, ident = "ATRXdel")
+
+ALL_NK@active.ident <- ALL_NK$orig.ident
+
+# re-label the NK cells to the corresponding predicted sub-clusters 
+Idents(object = ALL_NK, cells = M) <- "ATRXwt"
+Idents(object = ALL_NK, cells = S) <- "ATRXwt"
+Idents(object = ALL_NK, cells = A) <- "ATRXmut"
+Idents(object = ALL_NK, cells = C) <- "CTRL"
+
+# Add active identities to metadata column comparison_group
+ALL_NK$comparison_group <- ALL_NK@active.ident
+```
+
+```{r}
+CD6_expressing_cells <- subset(ALL_NK, subset = CD6 > 1)
+CD6_NOT_expressing_cells <- subset(ALL_NK, subset = CD6 > 1, 
+                                   invert = TRUE)
+
+# sanity check 
+FeaturePlot(object = CD6_expressing_cells, features = "CD6")
+
+# plot expression of TNFa and INTFG
+FeaturePlot(object = CD6_expressing_cells, 
+            features = NK_functional_markers$recruitment,
+            pt.size = 0.5, 
+            order = TRUE)
+
+FeaturePlot(object = CD6_NOT_expressing_cells, 
+            features = NK_functional_markers$recruitment,
+            pt.size = 0.5,
+            order = TRUE)
+```
+
+
+```{r}
+CD6_pos <- WhichCells(ALL_NK, expression = CD6 > 0, slot = "counts")
+CD6_neg <- WhichCells(ALL_NK, expression = CD6 == 0, slot = "counts")
+
+ALL_NK$CD6 <- NULL
+
+# re-label the NK cells to the corresponding predicted sub-clusters 
+Idents(object = ALL_NK, cells = CD6_pos) <- "pos"
+Idents(object = ALL_NK, cells = CD6_neg) <- "neg"
+
+ALL_NK$CD6 <- ALL_NK@active.ident
+
+do_DotPlot(ALL_NK, 
+           group.by = "CD6",
+           features = NK_functional_markers$recruitment,
+           axis.text.x.angle = 0,
+           plot.title = "INFG and TNFa RNA expression",
+           plot.subtitle = "CD6+ vs. CD6- NK cells",
+           scale = TRUE,
+           legend.length = 5,
+           font.size = 18,
+           dot.scale = 20,
+           use_viridis = TRUE,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+```
+
+
+```{r}
+FeatureScatter(object = ALL_NK, feature1 = 'rna_CD6', feature2 = 'IFNG')
+FeatureScatter(ALL_NK,"rna_CD6","TNF")
+
+FeatureScatter(object = ALL_NK, feature1 = 'rna_CD6', feature2 = 'IFNG',cells = CD6_pos)
+FeatureScatter(obALL_NK, feature1 =  "rna_CD6", feature2 = "TNF", cells = CD6_pos)
+```
+
+
+
+-------------------------------------------------------------------------------
+# ___Session Info___
+
+```{r}
+sessionInfo()
+```

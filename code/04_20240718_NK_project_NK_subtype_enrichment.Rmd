@@ -136,7 +136,6 @@ yang2019_clust6 <- filter(yang2019_clust_filt,
                           cluster == "6") # 79
 yang2019_clust7 <- filter(yang2019_clust_filt, 
                           cluster == "7") # 65
-
 ```
 
 ```{r eval=FALSE, include=FALSE}

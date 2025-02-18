@@ -1,0 +1,775 @@
+---
+title: "NK project: Data integration"
+author: "Dr. Sara Wernig-Zorc"
+date: "06.09.2024 - "
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  input_BM1: "/home/rstudio/mnt_data/BM/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"
+  input_BM2: "/home/rstudio/mnt_data/BM/yang2019/Rds/Human_BM_NK_seurat_v4.Rds"
+  input_BM3: "/home/rstudio/mnt_data/BM/Lee/disco_bone_marrow_v2.0.rds"
+  input_scRNA: "/home/rstudio/mnt_out/scRNA-seq_stage_M/results/published/data/rna_decontaminated.rds"
+  out: "/home/rstudio/mnt_out/NK_project/"
+  GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
+  markers: "/home/rstudio/mnt_resources/MES_ADRN/"
+  metadata: "/home/rstudio/scRNA.NB.integration/metadata/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 80)
+options(future.globals.maxSize = 80 * 10^9)
+options(Seurat.object.assay.version = "v5")
+print(params)
+```
+
+```{r load project specific R packages and color code}
+# install.packages(c("BPCells", "presto", "glmGamPoi"))
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_setup.R")
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_utils.R")
+```
+
+```{r eval=FALSE, include=FALSE}
+remotes::install_github(repo = "satijalab/seurat-object", ref = "v5.0.2")
+remotes::install_github(repo = "satijalab/seurat", ref = "v5.1.0")
+
+# Install from source code
+#path_to_file <- "/home/rstudio/mnt_tools/Seurat_5.1.0.tar.g"
+#install.packages(path_to_file, repos = NULL, type="source")
+
+devtools::install_github("bnprks/BPCells/r")
+devtools::install_github("saeyslab/nichenetr")
+devtools::install_github("saeyslab/multinichenetr")
+
+BiocManager::install('multtest')
+install.packages('metap')
+```
+
+# ___Input_data___
+
+```{r}
+ALL_NK <-  readRDS(file = paste0(params$out,"Rds/fetahu2023_NK_subclusters_from_Crinier2021_de.n=350.Rds"))
+crinier2021 <- readRDS(file = paste0(params$input_BM1))
+
+crinier2021$cohort <- "adult"
+ALL_NK$cohort <- "child"
+
+# sample/batch information with the same variable name
+ALL_NK$batch <- ALL_NK$patients 
+
+# convert a v4 assay to a v5 assay
+ALL_NK[["RNA"]] <- as(object = ALL_NK[["RNA"]], 
+                      Class = "Assay5")
+
+crinier2021[["RNA"]] <- as(object = crinier2021[["RNA"]], 
+                           Class = "Assay5")
+```
+
+# ___NEW clustering___
+
+```{r}
+NK.combined <- merge(x = ALL_NK, 
+                     y = crinier2021, 
+                     add.cell.ids = c("child", "adult"), 
+                     project = "BM_NK_cells")
+NK.combined
+
+adult <- is.na(NK.combined$group.x)
+NK.combined$group.y[adult] <- "V"
+
+adult <- is.na(NK.combined$group.y)
+NK.combined$group.y[adult] <- "adult_control"
+
+# split into layers
+# NK.combined[["RNA"]] <- split(NK.combined[["RNA"]], f = as.factor(NK.combined$cohort))
+```
+
+```{r}
+# run standard analysis on non-integrated, merged data
+NK.combined <- NormalizeData(NK.combined)
+NK.combined <- FindVariableFeatures(NK.combined)
+NK.combined <- ScaleData(NK.combined)
+NK.combined <- RunPCA(NK.combined)
+```
+
+```{r fig.height=5, fig.width=15}
+NK.combined <- FindNeighbors(NK.combined, 
+                             dims = 1:30, 
+                             reduction = "pca")
+NK.combined <- FindClusters(NK.combined, 
+                            resolution = 0.2, 
+                            cluster.name = "unintegrated_clusters")
+NK.combined <- RunUMAP(NK.combined, 
+                       dims = 1:30, 
+                       reduction = "pca", 
+                       reduction.name = "umap.unintegrated")
+DimPlot(NK.combined, reduction = "umap.unintegrated", 
+        group.by = c("cohort", "seurat_clusters"))
+```
+
+```{r}
+# Data integration
+NK.combined <- IntegrateLayers(object = NK.combined, 
+                        method = CCAIntegration, 
+                        orig.reduction = "pca", 
+                        new.reduction = "integrated.cca",
+                        verbose = FALSE)
+
+# re-join layers after integration
+NK.combined[["RNA"]] <- JoinLayers(NK.combined[["RNA"]])
+
+NK.combined <- FindNeighbors(NK.combined, 
+                             reduction = "integrated.cca", 
+                             dims = 1:30)
+NK.combined <- FindClusters(NK.combined, 
+                            resolution = 0.1,
+                            cluster.name = "integrated_clusters")
+# tested 0.2 and 2
+```
+
+```{r}
+NK.combined <- RunUMAP(NK.combined, 
+                dims = 1:10, 
+                reduction = "integrated.cca",
+                reduction.name = "umap.integrated")
+# Visualization
+DimPlot(NK.combined, 
+        reduction = "umap.integrated", 
+        group.by = c("cohort", "integrated_clusters"))
+
+DimPlot(NK.combined, 
+        reduction = "umap.integrated", 
+        split.by = "cohort")
+
+DimPlot(NK.combined, 
+        reduction = "umap.integrated", 
+        group.by = "predicted_NK_type_de.n350",
+        split.by = "cohort")
+
+DimPlot(NK.combined, 
+        reduction = "umap.integrated", 
+        group.by = "cluster2",
+        split.by = "cohort")
+```
+
+```{r fig.height=12, fig.width=7}
+plot <- DimPlot(NK.combined, 
+        reduction = "umap.integrated", 
+        group.by = c("integrated_clusters", 
+                     "cluster2",
+                     "predicted_NK_type_de.n350"),
+        split.by = "cohort")
+
+plot
+
+png(paste0(params$out,"figures/UMAP_BM-NK_adult+child_integrated_4clust_v2.png"),
+    width = 700, height = 1100)
+plot
+dev.off()
+```
+
+```{r NK Cell subset compositon}
+cluster_anno <- c("0","1","2","3")
+
+filter <- is.na(NK.combined$group.x)
+NK.combined$group.x[filter] <- "V"
+
+filter <- is.na(NK.combined$group.y)
+NK.combined$group.x[filter] <- "adult"
+
+factor(NK.combined$group.x)
+factor(NK.combined$group.y)
+
+DimPlot(NK.combined,
+        group.by = "integrated_clusters",
+        split.by = "group.y")
+
+percent_NK_group <- table(NK.combined$integrated_clusters,
+                          NK.combined$group.x)
+percent_NK_group
+
+
+percent_NK_sample <- table(NK.combined$integrated_clusters,
+                          NK.combined$batch)
+
+barplot(percent_NK_group,
+        col = COLOR_CODE_CLUST_v2, 
+        border = "white", 
+        xlab = "sample groups",
+        legend.text = cluster_anno)
+
+# Transform this data in %
+data_percentage <- apply(percent_NK_group, 2, 
+                         function(x){x*100/sum(x,na.rm=T)})
+ 
+data_percentage_sample <- apply(percent_NK_sample, 2, 
+                         function(x){x*100/sum(x,na.rm=T)})
+
+# Make a stacked barplot in %
+barplot(data_percentage, 
+        col = COLOR_CODE_CLUST_v2, 
+        border = "white", 
+        xlab = "NB genetic group",
+        legend.text = cluster_anno)
+
+barplot(data_percentage_sample, 
+        col = COLOR_CODE_CLUST_v2, 
+        border = "white", 
+        xlab = "NB genetic group",
+        legend.text = cluster_anno)
+
+table_NK_per_sample <- as.data.frame(percent_NK_sample)
+table_NK_per_sample$group <- gsub("_[0-9][0-9]", "", table_NK_per_sample$Var2)
+table_NK_per_sample$group <- gsub("*[0-9]*", "", table_NK_per_sample$group)
+table_NK_per_sample$group <- gsub("Moelle ", "adult", table_NK_per_sample$group)
+table_NK_per_sample$group <- gsub("MoBx*", "", table_NK_per_sample$group)
+table_NK_per_sample$group <- gsub("F", "", table_NK_per_sample$group)
+table_NK_per_sample
+
+# CLUSTER 1
+hNK_Bm1 <- filter(table_NK_per_sample, Var1 == "0")
+
+# Perform ANOVA testing
+hNK_Bm1_anova <- aov(Freq ~ group, data = hNK_Bm1)
+summary(hNK_Bm1_anova)
+
+# Extract p-value
+p_value <- summary(hNK_Bm1_anova)[[1]][["Pr(>F)"]][1]
+
+# perform wilcox testing
+p_value1 <- wilcox.test(Freq ~ group, 
+                        data = subset(hNK_Bm1, 
+                                      group %in% c("ATRXmut", "sporadic")))$p.value
+p_value2 <- wilcox.test(Freq ~ group, 
+                        data = subset(hNK_Bm1, 
+                                      group %in% c("ATRXmut", "ctrl")))$p.value
+p_value3 <- wilcox.test(Freq ~ group, 
+                        data = subset(hNK_Bm1, 
+                                      group %in% c("ATRXmut", "MYCNA")))$p.value
+p_value4 <- wilcox.test(Freq ~ group, 
+                        data = subset(hNK_Bm1, 
+                                      group %in% c("ATRXmut", "adult")))$p.value
+
+# Create boxplot and add p-value annotation
+boxplot1 <- hNK_Bm1 %>%
+  ggplot( aes(x = group, y = Freq, fill = group)) +
+    geom_boxplot() +
+    scale_fill_viridis(discrete = TRUE, alpha = 0.6) +
+    theme(legend.position="none",
+          axis.text = element_text(size = 18),
+          axis.title.y = element_text(size = 18),
+          plot.title = element_text(size = 18)) +
+    ggtitle("NK cluster per NB genetic group: cluster 0") +
+    xlab("") + ylab("Number of cells per group") +
+  geom_signif(comparisons = list(c("ATRXmut", "ctrl"),
+                                 c("ATRXmut", "MYCNA"),
+                                 c("ATRXmut", "sporadic"),
+                                 c("ATRXmut","adult")),
+              map_signif_level = FALSE, 
+              y_position = c(max(hNK_Bm1$Freq) + 50, 
+                             max(hNK_Bm1$Freq) + 65, 
+                             max(hNK_Bm1$Freq) + 80))
+
+
+# CLUSTER 2
+hNK_Bm2 <- filter(table_NK_per_sample, Var1 == "1")
+
+# Perform ANOVA
+hNK_Bm2_anova <- aov(Freq ~ group, data = hNK_Bm2)
+summary(hNK_Bm2_anova)
+
+# Extract p-value
+p_value <- summary(hNK_Bm2_anova)[[1]][["Pr(>F)"]][1]
+
+# perform wilcox testing
+p_value1 <- wilcox.test(Freq ~ group, 
+                        data = subset(hNK_Bm2, 
+                                      group %in% c("ATRXmut", "sporadic")))$p.value
+p_value2 <- wilcox.test(Freq ~ group, 
+                        data = subset(hNK_Bm2, 
+                                      group %in% c("ATRXmut", "ctrl")))$p.value
+p_value3 <- wilcox.test(Freq ~ group, 
+                        data = subset(hNK_Bm2, 
+                                      group %in% c("ATRXmut", "MYCNA")))$p.value
+p_value4 <- wilcox.test(Freq ~ group, 
+                        data = subset(hNK_Bm2, 
+                                      group %in% c("ATRXmut", "adult")))$p.value
+
+
+# plot boxplot
+boxplot2 <- hNK_Bm2 %>%
+  ggplot( aes(x = group, y = Freq, fill = group)) +
+    geom_boxplot() +
+    scale_fill_viridis(discrete = TRUE, alpha = 0.6) +
+    theme(legend.position="none",
+          axis.text = element_text(size = 18),
+          axis.title.y = element_text(size = 18),
+          plot.title = element_text(size = 18)) +
+    ggtitle("NK cluster per NB genetic group: hNK_Bm2") +
+    xlab("") + ylab("Number of cells per group") +
+  geom_signif(comparisons = list(c("ATRXmut", "ctrl"),
+                                 c("ATRXmut", "MYCNA"),
+                                 c("ATRXmut", "sporadic"),
+                                 c("ATRXmut","adult")),
+              map_signif_level = FALSE, 
+              y_position = c(max(hNK_Bm2$Freq) + 50, 
+                             max(hNK_Bm2$Freq) + 80, 
+                             max(hNK_Bm2$Freq) + 110)) 
+
+
+# CLUSTER 3
+hNK_Bm3 <- filter(table_NK_per_sample, Var1 == "2")
+
+# Perform ANOVA
+hNK_Bm3_anova <- aov(Freq ~ group, data = hNK_Bm3)
+summary(hNK_Bm3_anova)
+
+# Extract p-value
+p_value <- summary(hNK_Bm3_anova)[[1]][["Pr(>F)"]][1]
+
+# perform wilcox testing
+p_value1 <- wilcox.test(Freq ~ group, 
+                        data = subset(hNK_Bm3, 
+                                      group %in% c("ATRXmut", "sporadic")))$p.value
+p_value2 <- wilcox.test(Freq ~ group, 
+                        data = subset(hNK_Bm3, 
+                                      group %in% c("ATRXmut", "ctrl")))$p.value
+p_value3 <- wilcox.test(Freq ~ group, 
+                        data = subset(hNK_Bm3, 
+                                      group %in% c("ATRXmut", "MYCNA")))$p.value
+p_value4 <- wilcox.test(Freq ~ group, 
+                        data = subset(hNK_Bm3, 
+                                      group %in% c("ATRXmut", "adult")))$p.value
+
+
+# plot boxplot
+boxplot3 <- hNK_Bm3 %>%
+  ggplot( aes(x = group , y = Freq, fill = group)) +
+    geom_boxplot() +
+    scale_fill_viridis(discrete = TRUE, alpha = 0.6) +
+    theme(legend.position="none",
+          axis.text = element_text(size = 18),
+          axis.title.y = element_text(size = 18),
+          plot.title = element_text(size = 18)) +
+    ggtitle("NK cluster per NB genetic group: hNK_Bm3") +
+    xlab("") + ylab("Number of cells per group")  +
+  geom_signif(comparisons = list(c("ATRXmut", "ctrl"),
+                                 c("ATRXmut", "MYCNA"),
+                                 c("ATRXmut", "sporadic"),
+                                 c("ATRXmut","adult")),
+              map_signif_level = FALSE, 
+              y_position = c(max(hNK_Bm3$Freq) + 50, 
+                             max(hNK_Bm3$Freq) + 80, 
+                             max(hNK_Bm3$Freq) + 110))
+
+# CLUSTER 4
+hNK_Bm4 <- filter(table_NK_per_sample, Var1 == "3")
+
+# Perform ANOVA
+hNK_Bm4_anova <- aov(Freq ~ group, data = hNK_Bm4)
+summary(hNK_Bm4_anova)
+
+# Extract p-value
+p_value <- summary(hNK_Bm4_anova)[[1]][["Pr(>F)"]][1]
+
+# perform wilcox testing
+p_value1 <- wilcox.test(Freq ~ group, 
+                        data = subset(hNK_Bm4, 
+                                      group %in% c("ATRXmut", "sporadic")))$p.value
+p_value2 <- wilcox.test(Freq ~ group, 
+                        data = subset(hNK_Bm4, 
+                                      group %in% c("ATRXmut", "ctrl")))$p.value
+p_value3 <- wilcox.test(Freq ~ group, 
+                        data = subset(hNK_Bm4, 
+                                      group %in% c("ATRXmut", "MYCNA")))$p.value
+p_value4 <- wilcox.test(Freq ~ group, 
+                        data = subset(hNK_Bm4, 
+                                      group %in% c("ATRXmut", "adult")))$p.value
+
+# plot boxplot
+boxplot4 <- hNK_Bm4 %>%
+  ggplot( aes(x = group , y = Freq, fill = group)) +
+    geom_boxplot() +
+    scale_fill_viridis(discrete = TRUE, alpha = 0.6) +
+    theme(legend.position="none",
+          axis.text = element_text(size = 18),
+          axis.title.y = element_text(size = 18),
+          plot.title = element_text(size = 18)) +
+    ggtitle("NK cluster per NB genetic group: hNK_Bm4") +
+    xlab("") + ylab("Number of cells per group")  +
+  geom_signif(comparisons = list(c("ATRXmut", "ctrl"),
+                                 c("ATRXmut", "MYCNA"),
+                                 c("ATRXmut", "sporadic"),
+                                 c("ATRXmut","adult")),
+              map_signif_level = FALSE,
+              y_position = c(max(hNK_Bm4$Freq) + 5, 
+                             max(hNK_Bm4$Freq) + 8, 
+                             max(hNK_Bm4$Freq) + 11)) 
+
+# adding ANOVA test p-values
+boxplot1
+boxplot2
+boxplot3
+boxplot4
+```
+
+# ___DA testing___
+
+```{r}
+NK.combined@meta.data$batch <- factor(NK.combined@meta.data$batch)
+NK.combined@meta.data$integrated_clusters <- factor(NK.combined@meta.data$integrated_clusters)
+```
+
+If comparing more than two sample / groups, use DA testing with contrasts
+MiloR doesn't use the "original" clusters but rather creates neighborhoods
+based on similar logFC (note the fold change here is the number of cells
+per cell type)
+
+```{r miloR}
+NK.combined <- readRDS(file = paste0(params$out,"Rds/BM-NK_adult+child_integrated_4clust_v2.Rds"))
+
+library("statmod")
+library("miloR")
+library("SingleCellExperiment")
+library("scater")
+library("scran")
+library("dplyr")
+library("patchwork")
+
+#2. If comparing more than two sample / groups, use DA testing with contrasts
+
+# For differential abundance analysis on graph neighborhoods we first construct a Milo object. 
+# This extends the SingleCellExperiment class to store information about neighbourhoods on the KNN graph.
+
+rna_milo <- Milo(as.SingleCellExperiment(NK.combined))
+rna_milo
+
+reducedDim(rna_milo, "UMAP") <- reducedDim(as.SingleCellExperiment(NK.combined), 
+                                           "UMAP.INTEGRATED")
+plotUMAP(rna_milo, 
+         colour_by="group.y") + 
+  plotUMAP(rna_milo, 
+           colour_by="cohort")
+
+# Define cell neighbourhoods
+rna_milo <- buildGraph(rna_milo, 
+                       k = 10, 
+                       d = 30)
+
+## Constructing kNN graph with k = 10
+rna_milo <- makeNhoods(rna_milo, 
+                       prop = 0.1, 
+                       k = 10, 
+                       d = 30, 
+                       refined = TRUE, 
+                       refinement_scheme = "graph") 
+# make nhoods using graph-only as this is faster
+
+# metadata
+colData(rna_milo)$patients <- paste(colData(rna_milo)$group.x, 
+                                    colData(rna_milo)$cohort, sep="_")
+
+# Counting cells in neighbourhoods
+rna_milo <- countCells(rna_milo, meta.data = data.frame(colData(rna_milo)), 
+                       samples = "batch") # make the nhood X sample counts matrix
+
+
+# Defining experimental design
+rna_design <- data.frame(colData(rna_milo))[,c("batch", "group.x")]
+rna_design <- distinct(rna_design)
+rownames(rna_design) <- rna_design$batch
+rna_design
+
+# Computing neighborhood connectivity
+rna_milo <- calcNhoodDistance(rna_milo, 
+                              d = 30, 
+                              reduced.dim = "PCA")
+
+# DA testing
+da_results <- testNhoods(rna_milo, 
+                         design = ~ 0 + group.x,
+                         design.df = rna_design, 
+                         reduced.dim = "PCA")
+head(da_results)
+
+da_results %>%
+  arrange(SpatialFDR) %>%
+  head() 
+
+rna_milo <- buildNhoodGraph(rna_milo)
+
+
+# QUALITY CHECK OF THE DIFFERENTIAL ABUNDANCE TESTING
+# Plot single-cell UMAP
+umap_pl <- plotReducedDim(rna_milo, 
+                          dimred = "UMAP", 
+                          colour_by = "group.x", 
+                          text_by = "integrated_clusters", 
+                          text_size = 3, point_size = 0.5,) +
+  guides(fill = "none")
+
+rna_milo <- buildNhoodGraph(rna_milo)
+
+# Plot neighbourhood graph
+nh_graph_pl <- plotNhoodGraphDA(rna_milo, 
+                                da_results, 
+                                layout = "UMAP", 
+                                alpha = 0.05) 
+
+umap_pl + nh_graph_pl +
+  plot_layout(guides = "collect")
+
+# Differential abundance testing with contrasts
+rna_design <- data.frame(colData(rna_milo))[,c("batch", "group.x")]
+rna_design <- distinct(rna_design)
+rownames(rna_design) <- rna_design$batch
+
+# Reorder rownames to match columns of nhoodCounts(milo)
+rna_design <- rna_design[colnames(nhoodCounts(rna_milo)), , drop=FALSE]
+table(rna_design$group.x)
+```
+
+## ___ATRX mutated vs. wild-type___
+
+ATRXwt = NB MYCN amplified and sporadic samples
+
+```{r eval=FALSE, include=FALSE}
+# A. ATRXmut vs. ATRXwt ( MYCNA and sporadic )
+
+model <- model.matrix(~ 0 + group.x, data = rna_design)
+ave.contrast <- c("group.xIII - (group.xII + group.xIV) / 2")
+mod.constrast <- makeContrasts(contrasts = ave.contrast, levels = model)
+mod.constrast
+
+da_results_ATRXmutvsAll <- testNhoods(rna_milo, design = ~ 0 + group.x, 
+                         design.df = rna_design, 
+                         model.contrasts = ave.contrast, 
+                         fdr.weighting = "graph-overlap")
+
+table(da_results_ATRXmutvsAll$SpatialFDR < 0.1)
+
+# annotate hood with original cell type annotation
+da_results_ATRXmutvsAll <- annotateNhoods(rna_milo, 
+                                          da_results_ATRXmutvsAll, 
+                                          coldata_col = "integrated_clusters")
+
+# remove hoods that contained mixed cell type populations
+da_results_ATRXmutvsAll$integrated_clusters <- 
+  ifelse(da_results_ATRXmutvsAll$integrated_clusters_fraction < 0.7, 
+         "Mixed", da_results_ATRXmutvsAll$integrated_clusters)
+
+# filter only significant populations (less than 10% false discovery rate and 
+# fold change bigger than 0.5)
+results <- da_results_ATRXmutvsAll %>% 
+  arrange(FDR) %>% filter(FDR < 0.1 & abs(logFC) >= 0.5)
+results
+
+plotDAbeeswarm(da_results_ATRXmutvsAll, 
+               group.by = "integrated_clusters")
+```
+
+## ___ATRXm vs. healthy child___
+
+```{r eval=FALSE, include=FALSE}
+# B. ATRXmut vs. healthy child (control)
+
+model <- model.matrix(~ 0 + group.x, data = rna_design)
+ave.contrast <- c("(group.xIII - group.xI) / 3")
+mod.constrast <- makeContrasts(contrasts = ave.contrast, levels = model)
+mod.constrast
+
+da_results_ATRXmutvsAll <- testNhoods(rna_milo, design = ~ 0 + group.x, 
+                         design.df = rna_design, 
+                         model.contrasts = ave.contrast, 
+                         fdr.weighting = "graph-overlap")
+
+table(da_results_ATRXmutvsCTRL$SpatialFDR < 0.1)
+
+# annotate hood with original cell type annotation
+da_results_ATRXmutvsCTRL <- annotateNhoods(rna_milo, da_results_ATRXmutvsCTRL, 
+                             coldata_col = "integrated_clusters")
+
+# remove hoods that contained mixed cell type populations
+da_results_ATRXmutvsCTRL$integrated_clusters <- 
+  ifelse(da_results_ATRXmutvsCTRL$integrated_clusters_fraction < 0.7, 
+         "Mixed", da_results_ATRXmutvsCTRL$integrated_clusters)
+
+# filter only significant populations (less than 10% false discovery rate and 
+# fold change bigger than 0.5)
+results <- da_results_ATRXmutvsCTRL %>% 
+  arrange(FDR) %>% filter(FDR < 0.1 & abs(logFC) >= 0.5)
+results
+
+plotDAbeeswarm(da_results_ATRXmutvsCTRL, group.by = "integrated_clusters")
+```
+
+## ___heathy child vs. adult___
+
+```{r eval=FALSE, include=FALSE}
+# C. Child vs. Adult (both healthy)
+
+model <- model.matrix(~ 0 + group.x, data = rna_design)
+ave.contrast <- c("(group.xI - group.xV) / 3")
+mod.constrast <- makeContrasts(contrasts = ave.contrast, levels = model)
+mod.constrast
+
+da_results_ChildvsAdult <- testNhoods(rna_milo, design = ~ 0 + group.x, 
+                         design.df = rna_design, 
+                         model.contrasts = ave.contrast, 
+                         fdr.weighting = "graph-overlap")
+
+table(da_results_ChildvsAdult$SpatialFDR < 0.1)
+
+# annotate hood with original cell type annotation
+da_results_ChildvsAdult <- annotateNhoods(rna_milo, da_results_ChildvsAdult, 
+                             coldata_col = "integrated_clusters")
+
+# remove hoods that contained mixed cell type populations
+da_results_ChildvsAdult$integrated_clusters <- 
+  ifelse(da_results_ChildvsAdult$integrated_clusters_fraction < 0.7, 
+         "Mixed", da_results_ChildvsAdult$integrated_clusters)
+
+# filter only significant populations (less than 10% false discovery rate and 
+# fold change bigger than 0.5)
+results <- da_results_ChildvsAdult %>% 
+  arrange(FDR) %>% filter(FDR < 0.1 & abs(logFC) >= 0.5)
+results
+
+plotDAbeeswarm(da_results_ChildvsAdult, group.by = "integrated_clusters")
+```
+
+
+# ___Identify conserved cell type markers___
+
+## ___Adult vs. Child___
+
+```{r}
+Idents(NK.combined) <- "integrated_clusters"
+cluster_markers_0 <- FindConservedMarkers(NK.combined, 
+                                        ident.1 = "0",
+                                        grouping.var = "cohort", 
+                                        verbose = FALSE)
+head(cluster_markers_0)
+
+cluster_markers_1 <- FindConservedMarkers(NK.combined, 
+                                        ident.1 = "1",
+                                        grouping.var = "cohort", 
+                                        verbose = FALSE)
+head(cluster_markers_1)
+
+cluster_markers_2 <- FindConservedMarkers(NK.combined, 
+                                        ident.1 = "2",
+                                        grouping.var = "cohort", 
+                                        verbose = FALSE)
+head(cluster_markers_2)
+
+cluster_markers_3 <- FindConservedMarkers(NK.combined, 
+                                        ident.1 = "3",
+                                        grouping.var = "cohort", 
+                                        verbose = FALSE)
+head(cluster_markers_3)
+```
+
+## ___healthy vs. tumor___
+
+```{r}
+Idents(NK.combined) <- "integrated_clusters"
+cluster_markers_0_perGroup <- FindConservedMarkers(NK.combined, 
+                                        ident.1 = "0",
+                                        grouping.var = "group.x", 
+                                        verbose = FALSE)
+head(cluster_markers_0_perGroup)
+
+cluster_markers_1_perGroup <- FindConservedMarkers(NK.combined, 
+                                        ident.1 = "1",
+                                        grouping.var = "group.x", 
+                                        verbose = FALSE)
+head(cluster_markers_1_perGroup)
+
+cluster_markers_2_perGroup <- FindConservedMarkers(NK.combined, 
+                                        ident.1 = "2",
+                                        grouping.var = "group.x", 
+                                        verbose = FALSE)
+head(cluster_markers_2_perGroup)
+
+cluster_markers_3_perGroup <- FindConservedMarkers(NK.combined, 
+                                        ident.1 = "3",
+                                        grouping.var = "group.x", 
+                                        verbose = FALSE)
+head(cluster_markers_3_perGroup)
+```
+
+Here i am aggregating all reads into one pseudobulk expression profile per group
+
+```{r}
+library(ggplot2)
+library(cowplot)
+theme_set(theme_cowplot())
+
+aggregate_NK_combined <- AggregateExpression(NK.combined, 
+                                             group.by = "group.x", 
+                                             return.seurat = TRUE)
+
+genes.to.label = c("CD6", "CCL4")
+
+p1 <- CellScatter(aggregate_NK_combined,
+                  cell1 = "I", 
+                  cell2 = "III", 
+                  highlight = genes.to.label)
+p2 <- LabelPoints(plot = p1, 
+                  points = genes.to.label, 
+                  repel = TRUE)
+
+p3 <- CellScatter(aggregate_NK_combined, 
+                  cell1 = "I", 
+                  cell2 = "V", 
+                  highlight = genes.to.label)
+p4 <- LabelPoints(plot = p3, 
+                  points = genes.to.label, 
+                  repel = TRUE)
+
+p5 <- CellScatter(aggregate_NK_combined, 
+                  cell1 = "III", 
+                  cell2 = "II", 
+                  highlight = genes.to.label)
+p6 <- LabelPoints(plot = p5, 
+                  points = genes.to.label, 
+                  repel = TRUE)
+
+p7 <- CellScatter(aggregate_NK_combined, 
+                  cell1 = "III", 
+                  cell2 = "IV", 
+                  highlight = genes.to.label)
+p8 <- LabelPoints(plot = p7, 
+                  points = genes.to.label, 
+                  repel = TRUE)
+
+p2 + p4 + p6 + p8
+```
+
+```{r}
+saveRDS(NK.combined, 
+        file = paste0(params$out,"Rds/BM-NK_adult+child_integrated_4clust_v2.Rds"))
+```
+
+# ___END___
+
+```{r}
+sessionInfo()
+```
+
+

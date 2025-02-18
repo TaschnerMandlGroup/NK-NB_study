@@ -1,0 +1,829 @@
+---
+title: "NK project: Functional markers"
+author: "Dr. Sara Wernig-Zorc"
+date: "27.08.2024 - 30.08.2024"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  input_BM1: "/home/rstudio/mnt_data/BM/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"
+  input_BM2: "/home/rstudio/mnt_data/BM/yang2019/Rds/Human_BM_NK_seurat_v4.Rds"
+  input_BM3: "/home/rstudio/mnt_data/BM/Lee/disco_bone_marrow_v2.0.rds"
+  input_scRNA: "/home/rstudio/mnt_out/scRNA-seq_stage_M/results/published/data/rna_decontaminated.rds"
+  out: "/home/rstudio/mnt_out/NK_project/"
+  GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
+  markers: "/home/rstudio/mnt_resources/MES_ADRN/"
+  metadata: "/home/rstudio/scRNA.NB.integration/metadata/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 20)
+options(future.globals.maxSize = 8 * 10^9)
+
+print(params)
+```
+
+```{r load project specific R packages and color code}
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_setup.R")
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_utils.R")
+```
+
+# ___Input_data___
+
+```{r}
+ALL_NK <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_NK_cluster.Rds"))
+CTRL_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_fetal_BM_NK.Rds"))
+MNA_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_MNA_BM_NK.Rds"))
+ATRX_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_ATRXmut_BM_NK.Rds"))
+sporadic_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_sporadic_BM_NK.Rds"))
+```
+
+```{r}
+ALL_NK <- ALL_NK %>% ScaleData() %>% NormalizeData()
+CTRL_NK <- CTRL_NK %>% ScaleData() %>% NormalizeData()
+MNA_NK <- MNA_NK %>% ScaleData() %>% NormalizeData()
+ATRX_NK <- ATRX_NK %>% ScaleData() %>% NormalizeData()
+sporadic_NK <- sporadic_NK %>% ScaleData() %>% NormalizeData()
+```
+
+
+# ___NK Cluster markers in the NB dataset___
+
+Using predicted NK sub-clusters
+
+```{r cluster markers}
+de_results <- DElegate::findDE(object = ALL_NK,
+                               group_column = "predicted_NK_type",
+                               replicate_column = "patient")
+
+marker_results <- DElegate::FindAllMarkers2(object = ALL_NK,
+                                            group_column = "predicted_NK_type",
+                                            replicate_column = "patient")
+
+marker_results %>%
+    group_by(group1) %>%
+    top_n(n = 10, wt = log_fc) -> top10
+
+# TOP 10 markers per cluster 
+DEG_tumor <- DoHeatmap(ALL_NK, group.by = "predicted_NK_type",
+                       features = top10$feature) + NoLegend()
+DEG_tumor
+```
+
+# ___Exploration of age and sex dependence in the data___
+
+```{r}
+full_metadata <- read_excel(paste0(params$metadata,
+  "2024-07-29_Wernig-Zorc_Fetahu_complete_single_cell_cohort_EB_FINAL.xlsx"), 
+            col_types = c("text", "numeric", "text", "text", "text", "text", 
+                          "text", "date", "date", "text", "text", "text", 
+                          "text", "text", "numeric", "text", "text", "text", 
+                          "text", "text", "text", "text", "text", "text", 
+                          "text", "text", "text", "text", "text", "text", 
+                          "text", "text", "text", "text", "text", "text"))
+
+# filter by fetahu2023 dataset samples
+unique.metadata <- full_metadata %>% filter(cohort == "fetahu2023")
+
+# filter by unique sample ID
+unique.metadata <- unique.metadata %>% 
+  distinct(BM_ID,.keep_all = TRUE)
+
+unique.metadata <- as.data.frame(unique.metadata)
+
+# plot age distribution per comparison group
+ggplot(unique.metadata, aes(x = genetic_subtype, 
+               y = age_at_Dx_months, 
+               fill = genetic_subtype)) +
+  geom_boxplot()
+
+# input table
+input <- table(unique.metadata$genetic_subtype, 
+               unique.metadata$sex,
+               unique.metadata$stage)
+input <- as.data.frame(input)
+colnames(input) <- c("group","sex","stage","value")
+
+
+# plot sex distribution in the whole dataset
+ggplot(input, aes(x=sex,y=value,fill=sex)) +
+  geom_bar(stat = "identity") + 
+  theme_minimal() + 
+  scale_fill_manual(values=c("hotpink",
+                             "darkblue")) +
+  theme(text = element_text(size = 20, colour = "black"))
+
+# plot sex distribution per comparison group
+ggplot(input, aes(x=group,y=value,fill=sex)) +
+  geom_bar(stat = "identity", position = "dodge") + 
+  labs(title="Number of male/female donors per group") + 
+  theme_minimal() + 
+  scale_fill_manual(values=c("hotpink",
+                             "darkblue")) +
+  theme(text = element_text(size = 20, colour = "black"))
+
+```
+
+# ___NK functional markers___
+
+NK cell killing occurs either via secretion of perforin-1 (PRF1 Gene) and 
+granzyme B (GZMB gene) or direct cell-to-cell contact via death receptors 
+TRAIL (TNFRSF10B gene) and FAS receptor (TNFSF6 gene). FAS ligand (FASLG gene);
+TRAIL ligand (TNFSF10 gene) or mediate cell killing by recruiting other immune 
+cells via cytokine and chemokine secretion, and induce cell death via 
+Interferon-γ (IFNG gene) or TNF secretion
+
+## ___Canonical NK markers___
+
+### ___ALL___
+
+#### ___Featureplot___
+
+```{r fig.height=7, fig.width=7}
+do_FeaturePlot(ALL_NK, 
+               plot.title = "EOMES",
+               plot.subtitle = "gene expression in NK cells",
+               features = "EOMES",
+               reduction = "UMAP",
+               plot.axes = TRUE, 
+               pt.size = 0.5,
+               slot = "data",
+               assay = "RNA",
+               font.size = 16
+               )
+do_FeaturePlot(ALL_NK, 
+               plot.title = "ID2",
+               plot.subtitle = "gene expression in NK cells",
+               features = "ID2",
+               reduction = "UMAP",
+               plot.axes = TRUE, 
+               pt.size = 0.5,
+               slot = "data",
+               assay = "RNA",
+               font.size = 16
+               )
+do_FeaturePlot(ALL_NK, 
+               plot.title = "TBX21",
+               plot.subtitle = "gene expression in NK cells",
+               features = "TBX21",
+               reduction = "UMAP",
+               plot.axes = TRUE, 
+               pt.size = 0.5,
+               slot = "data",
+               assay = "RNA",
+               font.size = 16
+               )
+do_FeaturePlot(ALL_NK, 
+               plot.title = "NFIL3",
+               plot.subtitle = "gene expression in NK cells",
+               features = "NFIL3",
+               reduction = "UMAP",
+               plot.axes = TRUE, 
+               pt.size = 0.5,
+               slot = "data",
+               assay = "RNA",
+               font.size = 16
+               )
+do_FeaturePlot(ALL_NK, 
+               plot.title = "PLZF (ZBTB16)",
+               plot.subtitle = "gene expression in NK cells",
+               features = "ZBTB16",
+               reduction = "UMAP",
+               plot.axes = TRUE, 
+               pt.size = 0.5,
+               slot = "data",
+               assay = "RNA",
+               font.size = 16
+               )
+```
+
+#### ___Dotplot___
+
+```{r}
+do_DotPlot(ALL_NK, 
+           features = NK_functional_markers, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "ALL"
+           )
+
+do_DotPlot(ALL_NK, 
+           features = NK_functional_markers, 
+           group.by = "group.y", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "ALL"
+           )
+```
+
+### ___ATRX___
+
+```{r}
+do_DotPlot(ATRX_NK, 
+           features = NK_functional_markers, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1,
+           plot.title = "ATRX"
+           )
+```
+
+### ___MNA___
+
+```{r}
+do_DotPlot(MNA_NK, 
+           features = NK_functional_markers, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1,
+           plot.title = "MNA"
+           )
+```
+
+### ___Sporadic___
+
+```{r}
+do_DotPlot(sporadic_NK, 
+           features = NK_functional_markers, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1,
+           plot.title = "Sporadic"
+           )
+```
+
+### ___CTRL___
+
+```{r}
+do_DotPlot(CTRL_NK, 
+           features = NK_functional_markers, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1,
+           plot.title = "CTRL"
+           )
+```
+
+## ___NK TFs___
+
+### ___ALL___
+
+```{r fig.height=5, fig.width=8}
+do_DotPlot(ALL_NK, 
+           features = TFs, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1,
+           plot.title = "ALL",
+           legend.title = "Scaled expression"
+           )
+
+do_DotPlot(ALL_NK, 
+           features = TFs, 
+           group.by = "group.y",
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1,
+           plot.title = "ALL",
+           legend.title = "Scaled expression"
+           )
+```
+
+### ___ATRX___
+
+```{r fig.height=5, fig.width=8}
+do_DotPlot(ATRX_NK,
+           features = TFs, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1,
+           plot.title = "ATRX",
+           legend.title = "Scaled expression"
+           )
+```
+
+### ___MNA___
+
+```{r fig.height=5, fig.width=8}
+do_DotPlot(MNA_NK,
+           features = TFs, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1,
+           plot.title = "MNA",
+           legend.title = "Scaled expression"
+           )
+```
+
+### ___Sporadic___
+
+```{r fig.height=5, fig.width=8}
+do_DotPlot(sporadic_NK,
+           features = TFs, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1,
+           plot.title = "sporadic",
+           legend.title = "Scaled expression"
+           )
+```
+
+### ___CTRL___
+
+```{r fig.height=5, fig.width=8}
+do_DotPlot(CTRL_NK,
+           features = TFs, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1,
+           plot.title = "CTRL",
+           legend.title = "Scaled expression"
+           )
+```
+
+## ___NK cytokines___
+
+### ___ALL___
+
+```{r fig.height=4, fig.width=6}
+do_DotPlot(ALL_NK, 
+           features = cytokines, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "ALL cytokines",
+           legend.title = "Scaled expression",
+           cluster = TRUE
+           )
+
+do_DotPlot(ALL_NK, 
+           features = cytokines, 
+           group.by = "group.y",
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "ALL cytokines",
+           legend.title = "Scaled expression",
+           cluster = TRUE
+           )
+```
+
+### ___ATRX___
+
+```{r}
+do_DotPlot(ATRX_NK, 
+           features = cytokines, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "Cytokines",
+           plot.subtitle = "ATRX",
+           legend.title = "Scaled expression",
+           cluster = TRUE
+           )
+```
+
+### ___MNA___
+
+```{r}
+do_DotPlot(MNA_NK, 
+           features = cytokines, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "Cytokines",
+           plot.subtitle = "MNA",
+           legend.title = "Scaled expression",
+           cluster = TRUE
+           )
+```
+
+### ___Sporadic___
+
+```{r}
+do_DotPlot(sporadic_NK, 
+           features = cytokines, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "Cytokines",
+           plot.subtitle = "Sporadic",
+           legend.title = "Scaled expression",
+           cluster = TRUE
+           )
+```
+
+### ___CTRL___
+
+```{r}
+do_DotPlot(CTRL_NK, 
+           features = cytokines, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "Cytokines",
+           plot.subtitle = "CTRL",
+           legend.title = "Scaled expression",
+           cluster = TRUE
+           )
+```
+
+## ___NK maturation genes___
+
+```{r}
+do_DotPlot(ALL_NK, 
+           features = NK_maturation_genes, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "NK maturation genes",
+           plot.subtitle = "ALL",
+           legend.title = "Scaled expression",
+           cluster = TRUE
+           )
+
+do_DotPlot(ALL_NK, 
+           features = NK_maturation_genes, 
+           group.by = "group.y", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "NK maturation genes",
+           plot.subtitle = "ALL",
+           legend.title = "Scaled expression",
+           cluster = TRUE
+           )
+```
+
+### ___ATRX___
+
+```{r}
+do_DotPlot(ATRX_NK, 
+           features = NK_maturation_genes, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "NK maturation genes",
+           plot.subtitle = "ATRX",
+           legend.title = "Scaled expression",
+           cluster = TRUE
+           )
+```
+
+### ___Sporadic___
+
+```{r}
+do_DotPlot(sporadic_NK, 
+           features = NK_maturation_genes, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "NK maturation genes",
+           plot.subtitle = "sporadic",
+           legend.title = "Scaled expression",
+           cluster = TRUE
+           )
+```
+
+### ___MNA___
+
+```{r}
+do_DotPlot(MNA_NK, 
+           features = NK_maturation_genes, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "NK maturation genes",
+           plot.subtitle = "MNA",
+           legend.title = "Scaled expression",
+           cluster = TRUE
+           )
+```
+
+### ___CTRL___
+
+```{r}
+do_DotPlot(CTRL_NK, 
+           features = NK_maturation_genes, 
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "NK maturation genes",
+           plot.subtitle = "CTRL",
+           legend.title = "Scaled expression",
+           cluster = TRUE
+           )
+```
+
+## ___NK subtype genes___
+
+hNK_Bm2 subset was characterized by higher levels of CD122, CD27, and CD69, 
+whereas hNK_Bm3 cells had higher levels of CD127.
+
+Bone marrow NK cells revealed that the expression of CD160 and CD52 (CAMPATH-1) 
+on the surface of CD56bright cells was mutually exclusive, further discriminating 
+between hNK_Bm2 and hNK_Bm3, respectively.
+
+IL2RB gene = CD122 protein
+NCAM1 gene = CD56 protein
+IL7R gene = CD127 protein
+FCGR3A gene = CD16 protein
+
+### ___Dotplot___
+
+#### ___ALL___
+
+```{r fig.height=5, fig.width=5}
+do_DotPlot(ALL_NK,
+           features = NK_functional_markers$NK_subtype_markers,
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           legend.title = "Scaled expression",
+           cluster = TRUE
+           )
+
+do_DotPlot(ALL_NK,
+           features = NK_functional_markers$NK_subtype_markers,
+           group.by = "group.y", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           legend.title = "Scaled expression",
+           cluster = TRUE
+           )
+```
+
+#### ___ATRX___
+
+```{r fig.height=5, fig.width=5}
+do_DotPlot(ATRX_NK,
+           features = NK_functional_markers$NK_subtype_markers,
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           legend.title = "Scaled expression",
+           cluster = TRUE
+           )
+```
+
+#### ___MNA___
+
+```{r fig.height=5, fig.width=5}
+do_DotPlot(MNA_NK,
+           features = NK_functional_markers$NK_subtype_markers,
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           legend.title = "Scaled expression",
+           cluster = TRUE
+           )
+```
+
+#### ___Sporadic___
+
+```{r fig.height=5, fig.width=5}
+do_DotPlot(sporadic_NK,
+           features = NK_functional_markers$NK_subtype_markers,
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           legend.title = "Scaled expression",
+           cluster = TRUE
+           )
+```
+
+#### ___CTRL___
+
+```{r fig.height=5, fig.width=5}
+do_DotPlot(CTRL_NK,
+           features = NK_functional_markers$NK_subtype_markers,
+           group.by = "predicted_NK_type", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           legend.title = "Scaled expression",
+           cluster = TRUE
+           )
+```
+
+### ___Violinplot___
+
+#### ___ALL___
+
+```{r fig.height=12, fig.width=10}
+VlnPlot(ALL_NK,
+        features = NK_functional_markers$NK_subtype_markers,
+        log = FALSE,
+        layer = "data",
+        slot = "data")
+```
+#### ___ATRX___
+
+```{r fig.height=12, fig.width=10}
+VlnPlot(ATRX_NK,
+        features = NK_functional_markers$NK_subtype_markers,
+        group.by = "predicted_NK_type",
+        log = FALSE,
+        layer = "data",
+        slot = "data")
+```
+
+#### ___MNA___
+
+```{r fig.height=12, fig.width=10}
+VlnPlot(MNA_NK,
+        features = NK_functional_markers$NK_subtype_markers,
+        group.by = "predicted_NK_type",
+        log = FALSE,
+        layer = "data",
+        slot = "data")
+```
+
+#### ___CTRL___
+
+```{r fig.height=12, fig.width=10}
+VlnPlot(CTRL_NK,
+        features = NK_functional_markers$NK_subtype_markers,
+        group.by = "predicted_NK_type",
+        log = FALSE,
+        layer = "data",
+        slot = "data")
+```
+
+#### ___Sporadic___
+
+```{r fig.height=12, fig.width=10}
+VlnPlot(sporadic_NK,
+        features = NK_functional_markers$NK_subtype_markers,
+        group.by = "predicted_NK_type",
+        log = FALSE,
+        layer = "data",
+        slot = "data")
+```
+
+# ___Session Info___
+
+```{r}
+sessionInfo()
+```

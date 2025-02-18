@@ -1,5 +1,5 @@
 ---
-title: "NK project: DE analysis"
+title: "NK project: DEG analysis"
 author: "Dr. Sara Wernig-Zorc"
 date: "22.07.2024 - 26.07.2024"
 output: 
@@ -20,6 +20,7 @@ params:
   out: "/home/rstudio/mnt_out/NK_project/"
   GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
   markers: "/home/rstudio/mnt_resources/MES_ADRN/"
+  metadata: "/home/rstudio/scRNA.NB.integration/metadata/"
 ---
 
 PROJECT DESCRIPTION
@@ -27,9 +28,8 @@ PROJECT DESCRIPTION
 Identify NK sub-populations in tumor-infiltrated bone marrow samples from
 Neuroblastoma patients.
 
-
 Here i am looking at the differences between adult and infant BM-derived
-NK cells
+NK cells and between NB genetic subtypes
 
 
 ```{r setup, include=FALSE}
@@ -44,41 +44,18 @@ future::plan(strategy = 'future::multicore', workers = 20)
 options(future.globals.maxSize = 8 * 10^9)
 
 print(params)
-```
-
-```{r load project specific R packages and color code}
-suppressPackageStartupMessages(library(knitr))
-suppressPackageStartupMessages(library(dplyr))
-suppressPackageStartupMessages(library(ggplot2))
-suppressPackageStartupMessages(library(Seurat))
-suppressPackageStartupMessages(library(SingleR))
-suppressPackageStartupMessages(library(RColorBrewer))
-suppressPackageStartupMessages(library(ggpubr))
-suppressPackageStartupMessages(library(stats))
-suppressPackageStartupMessages(library(viridis))
-suppressPackageStartupMessages(library(SCpubr))
-suppressPackageStartupMessages(library(scCustomize))
-suppressPackageStartupMessages(library(DElegate))
-suppressPackageStartupMessages(library(clusterProfiler))
-suppressPackageStartupMessages(library(org.Hs.eg.db))
-suppressPackageStartupMessages(library(enrichplot))
-suppressPackageStartupMessages(library(AnnotationDbi))
-suppressPackageStartupMessages(library(pathview))
-suppressPackageStartupMessages(library(aggregateBioVar))
-suppressPackageStartupMessages(library(SummarizedExperiment))
-suppressPackageStartupMessages(library(SingleCellExperiment))
-suppressPackageStartupMessages(library(DESeq2))
-suppressPackageStartupMessages(library(magrittr))
-suppressPackageStartupMessages(library(pheatmap))
-suppressPackageStartupMessages(library(ggtext))
 
 source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_setup.R")
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_utils.R")
 ```
 
 # ___Load data: Healthy BM-derived NK cells___
 
 ```{r}
 crinier2021 <- readRDS(file = paste0(params$input_BM1))
+```
+
+```{r eval=FALSE, include=FALSE}
 lee2023 <- readRDS(file = paste0(params$input_BM3))
 
 DefaultAssay(lee2023) <- "RNA"
@@ -88,10 +65,6 @@ col_clusters <- read.csv2("/home/rstudio/mnt_data/BM/Lee/celltype_metacluster.cs
                           sep = ";")
 col_clusters <- as.data.frame(col_clusters)
 
-```
-
-
-```{r}
 Idents(lee2023) <- lee2023$age
 DefaultAssay(lee2023) <- "RNA"
 hBm_age2 <- WhichCells(lee2023, idents = 2)
@@ -117,31 +90,13 @@ hBM_age2_NK # 771 cells
 DimPlot(hBM_age2_NK,group.by = "ct")
 ```
 
-
-## ___NK gene lists___
-
-```{r all genes}
-adaptive_NK_genes <- read.csv("/home/rstudio/mnt_resources/NK_cells_gene_sets/adaptive_NK_marker_genes.txt", header = FALSE)
-adaptive_NK_genes <- adaptive_NK_genes$V1
-conventional_NK_genes <- read.csv("/home/rstudio/mnt_resources/NK_cells_gene_sets/conventional_NK_marker_genes.txt", header = FALSE)
-conventional_NK_genes <- conventional_NK_genes$V1
-mature_NK_genes <- read.csv("/home/rstudio/mnt_resources/NK_cells_gene_sets/mature_NK_marker_genes.txt", header = FALSE)
-mature_NK_genes <- mature_NK_genes$V1
-NKP_genes <- read.csv("/home/rstudio/mnt_resources/NK_cells_gene_sets/NKP_marker_genes.txt", header = FALSE)
-NKP_genes <- NKP_genes$V1
-```
-
-```{r top 10 DEGs per NK cluster}
-# From figure 2, D
-```
-
 # ___Load data: Diseased BM-MNCs___
 
 ```{r}
 fetahu2023 <- readRDS(file = paste0(params$input_scRNA))
 metadata <- readRDS("/home/rstudio/mnt_out/scRNA-seq_stage_M/results/published/data/metadata.rds")
 
-fetahu2023 <- as.Seurat(fetahu2023, data=NULL)
+fetahu2023 <- SeuratObject::as.Seurat(fetahu2023, data=NULL)
 fetahu2023 <- RenameAssays(object = fetahu2023, originalexp = 'RNA')
 
 # set cell type annotation to the original annotation
@@ -157,15 +112,23 @@ DefaultAssay(fetahu2023) <- "RNA"
 # add sex and age information
 # Merge the metadata with the Seurat object's metadata based on the sample_ID and sample columns
 # Ensure column names match those in your data
-fetahu2023.metadata <- read.csv("/home/rstudio/mnt_nb_tumors/fetahu2023.scRNA/metadata/fetahu2023_scRNA_seq_metadata.csv", 
-                                sep = "\t", header = TRUE)
+full_metadata <- read_excel(paste0(params$metadata,
+  "2024-07-29_Wernig-Zorc_Fetahu_complete_single_cell_cohort_EB_FINAL.xlsx"), 
+            col_types = c("text", "numeric", "text", "text", "text", "text", 
+                          "text", "date", "date", "text", "text", "text", 
+                          "text", "text", "numeric", "text", "text", "text", 
+                          "text", "text", "text", "text", "text", "text", 
+                          "text", "text", "text", "text", "text", "text", 
+                          "text", "text", "text", "text", "text", "text"))
 
 metadata <- fetahu2023@meta.data
 metadata$cell_ID <- row.names(metadata)
 
+names(full_metadata)[names(full_metadata) == 'BM_ID'] <- 'sample'
+
 # Perform the merge using left_join from dplyr, keeping the row order of df1
 merged_metadata <- metadata %>%
-  left_join(fetahu2023.metadata, by = "sample") %>% 
+  left_join(full_metadata, by = "sample") %>% 
   distinct(cell_ID, .keep_all = TRUE)
 
 row.names(merged_metadata) <- merged_metadata$cell_ID 
@@ -177,12 +140,6 @@ fetahu2023@meta.data
 saveRDS(fetahu2023, file = paste0(params$out,"/Rds/fetahu2023_withMetadata.Rds"))
 ```
 
-## ___Load data: NB BM-derived NK cells___
-
-```{r}
-predicted_labels <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_predicted_NKclusters_from_Crinier2021.Rds"))
-fetahu2023_NK <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_NK_subclusters_from_Crinier2021.Rds"))
-```
 
 ## ___Subset Fetahu2023 to NK cells only___
 
@@ -208,20 +165,33 @@ merged_metadata <- NK.metadata %>%
   distinct(cell_ID, .keep_all = TRUE)
 
 merged_metadata <- merged_metadata %>%
-  rename(predicted_NK_type = labels)
+  rename(predicted_NK_type_de.n350 = labels)
   
 row.names(merged_metadata) <- merged_metadata$cell_ID 
   
 fetahu2023_NK@meta.data <- merged_metadata
 
-saveRDS(fetahu2023_NK, file = paste0(params$out,"/Rds/fetahu2023_NK_cluster.Rds"))
+fetahu2023_NK <- ScaleData(fetahu2023_NK)
+
+#saveRDS(fetahu2023_NK, file = paste0(params$out,"/Rds/fetahu2023_NK_cluster.Rds"))
 ```
+
+------------------------------ START HERE -------------------------------------
+
+## ___Load data: NB BM-derived NK cells___
+
+```{r}
+predicted_labels <- readRDS(file = paste0(params$out,
+                                          "/Rds/fetahu2023_predicted_NKclusters_from_Crinier2021_de.n=350.Rds"))
+fetahu2023_NK <- readRDS(file = paste0(params$out,
+                                       "/Rds/fetahu2023_NK_subclusters_from_Crinier2021_de.n=350.Rds"))
+```
+
 
 # ___NK types in tumor-infiltrated and non-infiltrated BM, vs. adult BM___
 
-
 ```{r}
-percent_NK_group <- table(fetahu2023_NK$predicted_NK_type,
+percent_NK_group <- table(fetahu2023_NK$predicted_NK_type_de.n350_de.n350,
                           fetahu2023_NK$group)
 
 percent_NK_group
@@ -239,22 +209,22 @@ barplot(percent_NK_group,
 # ___CD6 expression in NK sub-clusters___
 
 ```{r fig.height=5, fig.width=10}
-fetahu2023_NK <- NormalizeData(fetahu2023_NK,
-                               normalization.method = "LogNormalize")
-
+fetahu2023_NK <- fetahu2023_NK %>% 
+  NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000)
 
 FeaturePlot(fetahu2023_NK,features = "CD6",
             split.by = "group")
 
 VlnPlot(fetahu2023_NK,
-         group.by = "predicted_NK_type",
+         group.by = "predicted_NK_type_de.n350",
          split.by = "group",
          features = "CD6",
          log = TRUE,
          layer = "data")
 
 VlnPlot(fetahu2023_NK,
-         group.by = "predicted_NK_type",
+         group.by = "predicted_NK_type_de.n350",
          features = "CD6",
          log = TRUE,
          layer = "data",
@@ -379,7 +349,7 @@ do_FeaturePlot(sample = fetahu2023_NK,
                plot.axes = TRUE,
                legend.title = "Gene expression",
                legend.length = 10,
-               split.by = "predicted_NK_type")
+               split.by = "predicted_NK_type_de.n350")
 
 do_FeaturePlot(sample = fetahu2023_NK, 
                features = "conventional_NK_module1",
@@ -417,7 +387,7 @@ do_FeaturePlot(sample = fetahu2023_NK,
                plot.axes = TRUE,
                legend.title = "Gene expression",
                legend.length = 10,
-               split.by = "predicted_NK_type")
+               split.by = "predicted_NK_type_de.n350")
 
 do_FeaturePlot(sample = fetahu2023_NK, 
                features = "NKP_module1",
@@ -455,7 +425,7 @@ do_FeaturePlot(sample = fetahu2023_NK,
                plot.axes = TRUE,
                legend.title = "Gene expression",
                legend.length = 10,
-               split.by = "predicted_NK_type")
+               split.by = "predicted_NK_type_de.n350")
 
 do_FeaturePlot(sample = fetahu2023_NK, 
                features = "mature_NK_module1",
@@ -493,7 +463,7 @@ do_FeaturePlot(sample = fetahu2023_NK,
                plot.axes = TRUE,
                legend.title = "Gene expression",
                legend.length = 10,
-               split.by = "predicted_NK_type")
+               split.by = "predicted_NK_type_de.n350")
 ```
 
 
@@ -501,31 +471,31 @@ do_FeaturePlot(sample = fetahu2023_NK,
 VlnPlot(fetahu2023_NK,
         features = "adaptive_NK_module1", 
         group.by = "group", 
-        split.by = "predicted_NK_type",
+        split.by = "predicted_NK_type_de.n350",
         cols = COLOR_CODE_GROUP)
 
 VlnPlot(fetahu2023_NK,
         features = "conventional_NK_module1", 
         group.by = "group", 
-        split.by = "predicted_NK_type",
+        split.by = "predicted_NK_type_de.n350",
         cols = COLOR_CODE_GROUP)
 
 VlnPlot(fetahu2023_NK,
         features = "NKP_module1", 
         group.by = "group", 
-        split.by = "predicted_NK_type",
+        split.by = "predicted_NK_type_de.n350",
         cols = COLOR_CODE_GROUP)
 
 VlnPlot(fetahu2023_NK,
         features = "mature_NK_module1", 
         group.by = "group", 
-        split.by = "predicted_NK_type",
+        split.by = "predicted_NK_type_de.n350",
         cols = COLOR_CODE_GROUP)
 
 do_ViolinPlot(fetahu2023_NK,
               features = "mature_NK_module1", 
               group.by = "group", 
-              colors.use = COLOR_CODE_GROUP,
+              colors.use = COLOR_CODE,
               font.size = 18,
               legend.title = "",
               legend.position = "none")
@@ -534,22 +504,22 @@ do_ViolinPlot(fetahu2023_NK,
 
 do_ViolinPlot(fetahu2023_NK,
               features = "adaptive_NK_module1", 
-              group.by = "predicted_NK_type", 
+              group.by = "predicted_NK_type_de.n350", 
               colors.use = COLOR_CODE_v2)
 
 do_ViolinPlot(fetahu2023_NK,
               features = "conventional_NK_module1", 
-              group.by = "predicted_NK_type", 
+              group.by = "predicted_NK_type_de.n350", 
               colors.use = COLOR_CODE_v2)
 
 do_ViolinPlot(fetahu2023_NK,
               features = "NKP_module1", 
-              group.by = "predicted_NK_type", 
+              group.by = "predicted_NK_type_de.n350", 
               colors.use = COLOR_CODE_v2)
 
 do_ViolinPlot(fetahu2023_NK,
               features = "mature_NK_module1", 
-              group.by = "predicted_NK_type", 
+              group.by = "predicted_NK_type_de.n350", 
               colors.use = COLOR_CODE_v2)
 
 
@@ -563,7 +533,7 @@ do_ViolinPlot(fetahu2023_NK,
 
 ```{r} 
 # extract counts
-counts <- LayerData(fetal_NK, assay="RNA", layer='data')
+counts <- LayerData(fetahu2023_NK, assay="RNA", layer='data')
 var_genes <- dimnames(counts)[[1]]
 
 # remove genes not present in dataset
@@ -571,34 +541,29 @@ adaptive_NK_genes <- intersect(adaptive_NK_genes, var_genes)
 conventional_NK_genes <- intersect(conventional_NK_genes, var_genes)
 mature_NK_genes <- intersect(mature_NK_genes, var_genes)
 NKP_genes <- intersect(NKP_genes, var_genes)
-
-# log scale counts
-fetal_NK <- fetal_NK %>% 
-  NormalizeData(normalization.method = "LogNormalize",
-                scale.factor = 10000)
 ```
 
 
 ```{r}
-fetal_NK <- AddModuleScore(object = fetal_NK,
+fetahu2023_NK <- AddModuleScore(object = fetahu2023_NK,
                                 features = adaptive_NK_genes,
                                 ctrl = 5,
                                 name = "adaptive_NK_module",
                                 seed = 2805)
 
-fetal_NK <- AddModuleScore(object = fetal_NK,
+fetahu2023_NK <- AddModuleScore(object = fetahu2023_NK,
                                 features = conventional_NK_genes,
                                 ctrl = 5,
                                 name = "conventional_NK_module",
                                 seed = 2805)
 
-fetal_NK <- AddModuleScore(object = fetal_NK,
+fetahu2023_NK <- AddModuleScore(object = fetahu2023_NK,
                                 features = NKP_genes,
                                 ctrl = 5,
                                 name = "NKP_module",
                                 seed = 2805)
 
-fetal_NK <- AddModuleScore(object = fetal_NK,
+fetahu2023_NK <- AddModuleScore(object = fetahu2023_NK,
                                 features = mature_NK_genes,
                                 ctrl = 5,
                                 name = "mature_NK_module",
@@ -607,30 +572,29 @@ fetal_NK <- AddModuleScore(object = fetal_NK,
 
 
 ```{r}
-do_ViolinPlot(fetal_NK,
+do_ViolinPlot(fetahu2023_NK,
               features = "adaptive_NK_module1", 
-              group.by = "predicted_NK_type", 
+              group.by = "predicted_NK_type_de.n350", 
               colors.use = COLOR_CODE_v2)
 
-do_ViolinPlot(fetal_NK,
+do_ViolinPlot(fetahu2023_NK,
               features = "conventional_NK_module1", 
-              group.by = "predicted_NK_type", 
+              group.by = "predicted_NK_type_de.n350", 
               colors.use = COLOR_CODE_v2)
 
-do_ViolinPlot(fetal_NK,
+do_ViolinPlot(fetahu2023_NK,
               features = "NKP_module1", 
-              group.by = "predicted_NK_type", 
+              group.by = "predicted_NK_type_de.n350", 
               colors.use = COLOR_CODE_v2)
 
-do_ViolinPlot(fetal_NK,
+do_ViolinPlot(fetahu2023_NK,
               features = "mature_NK_module1", 
-              group.by = "predicted_NK_type", 
+              group.by = "predicted_NK_type_de.n350", 
               colors.use = COLOR_CODE_v2)
 ```
 
 
-
-### ___adult___
+### ___adults___
 
 ```{r}
 # extract counts
@@ -709,6 +673,7 @@ single cell RNA-seq DEG analysis
 # DE analysis for the whole NK cluster
 DEG_NK <- DElegate::findDE(fetahu2023_NK,
                            group_column = "group",
+                           replicate_column = "sample",
                            order_results = TRUE)
 
 # results specific to ATRXm vs. rest
@@ -717,7 +682,7 @@ DEG_ATRXm <- DEG_NK[filter,]
 head(DEG_ATRXm, 10)
 
 # Change idents to cluster annotations
-Idents(fetahu2023_NK) <- fetahu2023_NK@meta.data$predicted_NK_type
+Idents(fetahu2023_NK) <- fetahu2023_NK@meta.data$predicted_NK_type_de.n350
 
 # subset to cluster 2
 cluster_of_interest <- "hNK_Bm2"
@@ -773,6 +738,44 @@ head(common_genes,10)
 head(common_genes_all,10)
 ```
 
+### ___Vulcano plot___
+
+```{r fig.height=7, fig.width=7}
+common_genes_all
+rownames(common_genes_all) <- common_genes_all$feature
+
+library(EnhancedVolcano)
+
+EnhancedVolcano(common_genes_all, 
+                lab = rownames(common_genes_all),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs",
+                selectLab = c('CD6','ALCAM','TGFB1','IL32','KLRF1','FCER1G',
+                              'PFN1'),
+                subtitle = "ATRXm vs. rest",
+                pCutoff = 0.01,
+                FCcutoff = 1,
+                pointSize = 3,
+                labSize = 6
+                )
+
+EnhancedVolcano(common_genes_all, 
+                lab = rownames(common_genes_all),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs",
+                subtitle = "ATRXm vs. rest",
+                pCutoff = 0.01,
+                FCcutoff = 1,
+                pointSize = 3,
+                labSize = 6,
+                drawConnectors = TRUE,
+                widthConnectors = 0.75
+                )
+```
+
+
 ## ___Pathways enrichment analysis___
 
 ```{r}
@@ -790,8 +793,7 @@ map_gene_to_entrez <- function(gene_names) {
 }
 ```
 
-
-```{r pathway enrichment analysis}
+```{r pathway enrichment analysis, fig.height=10, fig.width=6}
 # the background genes here should be all expressed (and detected) in all NK cells
 genes <- DEG_hNK_Bm2_ATRXm_top$feature
 
@@ -857,14 +859,16 @@ head(kegg_enrichment, 10)
 barplot(kegg_enrichment, showCategory = 10)
 dotplot(kegg_enrichment, showCategory=20) + 
   ggtitle("NK cluster 2 in ATRXm: KEGG enrichment")
+```
 
 
+```{r eval=FALSE, include=FALSE}
 # Wiki pathways
 wiki.path <- enrichWP(gene = entrez_ids,
                       #universe = geneUniverse,
                       organism = "Homo sapiens",
                       pAdjustMethod = "fdr",
-                      pvalueCutoff = 0.01, 
+                      pvalueCutoff = 0.01
 )
 
 wiki.path <- DOSE::setReadable(wiki.path, 
@@ -879,6 +883,7 @@ barplot(wiki.path, showCategory = 10) +
 dotplot(wiki.path, showCategory = 20) + 
   ggtitle("NK cluster 2 in ATRXm: Wiki pathway enrichment")
 ```
+
 
 ## ___Gene set enrichment analysis___
 
@@ -935,49 +940,55 @@ enrichMap(gsea_result)
 pseudo bulk RNA-seq DEG analysis
 
 The aim here is to see if the low scores in the label transfer from adult BM
-to fetal healthy and diseased BM, stem from the differences observed between
-fetal and adult BM-NK cells or are these differences due to the tumor-infiltration
+to toddler healthy and diseased BM, stem from the differences observed between
+toddler and adult BM-NK cells or are these differences due to the tumor-infiltration
 in the bone marrow and tumor-induced rewiring of the bone marrow immune cells.
 
 inspo: https://hbctraining.github.io/scRNA-seq_online/lessons/pseudobulk_DESeq2_scrnaseq.html
 
-```{r subset fetal BM-NK cells}
+## ___subset per group___
+
+### ___subset control BM-NK cells___
+
+```{r subset control BM-NK cells}
 Idents(fetahu2023_NK) <- fetahu2023_NK$group
 levels(Idents(fetahu2023_NK))
 
 # subset scRNA-seq data 
-# NK cells in control (fetal) BM only
-fetal_NK <- subset(fetahu2023_NK, 
+# NK cells in control (toddler) BM only
+CTRL_NK <- subset(fetahu2023_NK, 
                    idents = "I", 
                    invert = FALSE)
 
 # sanity check
-Idents(fetal_NK) <- fetal_NK$predicted_NK_type
-DimPlot(fetal_NK, 
-        group.by = "predicted_NK_type", 
+Idents(CTRL_NK) <- CTRL_NK$predicted_NK_type_de.n350
+DimPlot(CTRL_NK, 
+        group.by = "predicted_NK_type_de.n350", 
         cols = COLOR_CODE_v2, 
         raster = FALSE)
 
 # number of cells per cluster
-table(fetal_NK$predicted_NK_type)
+table(CTRL_NK$predicted_NK_type_de.n350)
 
-saveRDS(fetal_NK, file = paste0(params$out,"Rds/fetahu2023_fetal_BM_NK.Rds"))
+#saveRDS(fetahu2023_NK, file = paste0(params$out,"Rds/fetahu2023_fetal_BM_NK.Rds"))
 ```
+
+### ___subset ATRXm BM-NK cells___
 
 ```{r subset ATRXm BM-NK cells}
 Idents(fetahu2023_NK) <- fetahu2023_NK$group
 levels(Idents(fetahu2023_NK))
 
 # subset scRNA-seq data 
-# NK cells in control (fetal) BM only
+# NK cells in control (toddler) BM only
 ATRX_NK <- subset(fetahu2023_NK, 
                    idents = "III", 
                    invert = FALSE)
 
 # sanity check
-Idents(ATRX_NK) <- ATRX_NK$predicted_NK_type
+Idents(ATRX_NK) <- ATRX_NK$predicted_NK_type_de.n350
 DimPlot(ATRX_NK, 
-        group.by = "predicted_NK_type", 
+        group.by = "predicted_NK_type_de.n350", 
         cols = COLOR_CODE_v2, 
         raster = FALSE)
 
@@ -987,33 +998,71 @@ DimPlot(ATRX_NK,
         raster = FALSE)
 
 # number of cells per cluster
-table(ATRX_NK$predicted_NK_type)
+table(ATRX_NK$predicted_NK_type_de.n350)
 
 saveRDS(ATRX_NK, file = paste0(params$out,"Rds/fetahu2023_ATRXmut_BM_NK.Rds"))
 ```
 
+### ___subset MNA BM-NK cells___
 
+```{r subset MNA BM-NK cells}
+Idents(fetahu2023_NK) <- fetahu2023_NK$group
+levels(Idents(fetahu2023_NK))
 
-```{r scPHeatmap function}
-# from: https://www.bioconductor.org/packages/release/bioc/vignettes/aggregateBioVar/inst/doc/multi-subject-scRNA-seq.html
-scPHeatmap <- function(sumExp, subjectVar, gtVar, logSample = 1:100, ...) {
-    orderSumExp <- sumExp[, order(sumExp[[subjectVar]])]
-    sumExpCounts <- as.matrix(
-        SummarizedExperiment::assay(orderSumExp, "counts"))
-    logcpm <- log2(
-        1e6*t(t(sumExpCounts) / colSums(sumExpCounts)) + 1)
-    annotations <- data.frame(
-        Sex = orderSumExp[[gtVar]],
-        Donor = orderSumExp[[subjectVar]])
-    rownames(annotations) <- colnames(orderSumExp)
+# subset scRNA-seq data 
+# NK cells in control (toddler) BM only
+MNA_NK <- subset(fetahu2023_NK, 
+                   idents = "II", 
+                   invert = FALSE)
 
-    singleCellpHeatmap <- pheatmap::pheatmap(
-        mat = logcpm[logSample, ], annotation_col = annotations,
-        cluster_cols = FALSE, show_rownames = FALSE, show_colnames = FALSE,
-        scale = "none", ...)
-    return(singleCellpHeatmap)
-}
+# sanity check
+Idents(MNA_NK) <- MNA_NK$predicted_NK_type_de.n350
+DimPlot(MNA_NK, 
+        group.by = "predicted_NK_type_de.n350", 
+        cols = COLOR_CODE_v2, 
+        raster = FALSE)
+
+DimPlot(MNA_NK, 
+        group.by = "sample",
+        cols = COLOR_CODE_PATIENTS_v6,
+        raster = FALSE)
+
+# number of cells per cluster
+table(MNA_NK$predicted_NK_type_de.n350)
+
+saveRDS(MNA_NK, file = paste0(params$out,"Rds/fetahu2023_MNA_BM_NK.Rds"))
 ```
+
+### ___subset sporadic BM-NK cells___
+
+```{r subset sporadic BM-NK cells}
+Idents(fetahu2023_NK) <- fetahu2023_NK$group
+levels(Idents(fetahu2023_NK))
+
+# subset scRNA-seq data 
+# NK cells in control (toddler) BM only
+sporadic_NK <- subset(fetahu2023_NK, 
+                   idents = "IV", 
+                   invert = FALSE)
+
+# sanity check
+Idents(sporadic_NK) <- sporadic_NK$predicted_NK_type_de.n350
+DimPlot(sporadic_NK, 
+        group.by = "predicted_NK_type_de.n350", 
+        cols = COLOR_CODE_v2, 
+        raster = FALSE)
+
+DimPlot(sporadic_NK, 
+        group.by = "sample",
+        cols = COLOR_CODE_PATIENTS_v6,
+        raster = FALSE)
+
+# number of cells per cluster
+table(sporadic_NK$predicted_NK_type_de.n350)
+
+saveRDS(sporadic_NK, file = paste0(params$out,"Rds/fetahu2023_sporadic_BM_NK.Rds"))
+```
+
 
 ## ___Pseudo bulk - aggregate counts___
 
@@ -1044,14 +1093,14 @@ dim(counts(ATRX_NK_sc))
 
 # metadata
 table(ATRX_NK_sc$sample)
-table(ATRX_NK_sc$predicted_NK_type)
+table(ATRX_NK_sc$predicted_NK_type_de.n350)
 
 head(colData(ATRX_NK_sc),10)
 
 # aggregate counts
 ATRX_NK_agg_counts <- aggregateBioVar(scExp = ATRX_NK_sc,
                                        subjectVar = "orig.ident", 
-                                       cellVar = "predicted_NK_type")
+                                       cellVar = "predicted_NK_type_de.n350")
 
 # Heatmap of log2 expression from aggregate gene-by-subject count matrix
 ann_colors <- list(
@@ -1062,7 +1111,7 @@ scPHeatmap(
     sumExp = ATRX_NK_agg_counts$hNK_Bm2, 
     logSample = 1:100,
     subjectVar = "orig.ident",
-    gtVar = "predicted_NK_type",
+    gtVar = "predicted_NK_type_de.n350",
     color = viridis::viridis(75), 
     annotation_colors = ann_colors,
     treeheight_row = 0, 
@@ -1070,11 +1119,11 @@ scPHeatmap(
 )
 ```
 
-```{r aggregate counts in fetal BM, results='asis'}
-fetal_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_fetal_BM_NK.Rds"))
-#fetal_NK$patients
+```{r aggregate counts in toddler BM, results='asis'}
+CTRL_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_fetal_BM_NK.Rds"))
+#fetahu2023_NK$patients
 
-fetal_NK@meta.data$orig.ident <- fetal_NK@meta.data$sample
+CTRL_NK@meta.data$orig.ident <- CTRL_NK@meta.data$sample
 
 # Create a named vector for the new values
 new_names <- c("2014_0102" = "donor1", 
@@ -1084,31 +1133,31 @@ new_names <- c("2014_0102" = "donor1",
                "2016_2950" = "donor3")
 
 # Apply the renaming
-fetal_NK@meta.data$orig.ident <- new_names[fetal_NK@meta.data$orig.ident]
+CTRL_NK@meta.data$orig.ident <- new_names[CTRL_NK@meta.data$orig.ident]
 
 
 # convert to single cell experiment
-fetal_NK_sc <- as.SingleCellExperiment(fetal_NK)
+CTRL_NK_sc <- as.SingleCellExperiment(CTRL_NK)
 
 # explore sc object
-#assays(fetal_NK_sc)
+#assays(fetahu2023_NK_sc)
 
 # Dimensions of gene-by-cell count matrix
-dim(counts(fetal_NK_sc))
+dim(counts(CTRL_NK_sc))
 
 # Access dgCMatrix with gene counts
-#counts(fetal_NK_sc)
+#counts(fetahu2023_NK_sc)
 
 # metadata
-table(fetal_NK_sc$orig.ident)
-table(fetal_NK_sc$predicted_NK_type)
+#table(CTRL_NK_sc$orig.ident)
+#table(CTRL_NK_sc$predicted_NK_type_de.n350)
 
-head(colData(fetal_NK_sc),10)
+#head(colData(CTRL_NK_sc),10)
 
 # aggregate counts
-fetal_NK_agg_counts <- aggregateBioVar(scExp = fetal_NK_sc,
+CTRL_NK_agg_counts <- aggregateBioVar(scExp = CTRL_NK_sc,
                                        subjectVar = "orig.ident", 
-                                       cellVar = "predicted_NK_type")
+                                       cellVar = "predicted_NK_type_de.n350")
 
 # Heatmap of log2 expression from aggregate gene-by-subject count matrix
 ann_colors <- list(
@@ -1116,10 +1165,10 @@ ann_colors <- list(
     Patients = COLOR_CODE_PATIENTS_v7)
 
 scPHeatmap(
-    sumExp = fetal_NK_agg_counts$hNK_Bm2, 
+    sumExp = CTRL_NK_agg_counts$hNK_Bm2, 
     logSample = 1:100,
     subjectVar = "orig.ident",
-    gtVar = "predicted_NK_type",
+    gtVar = "predicted_NK_type_de.n350",
     color = viridis::viridis(75), 
     annotation_colors = ann_colors,
     treeheight_row = 0, 
@@ -1132,7 +1181,8 @@ crinier2021$orig.ident <- crinier2021$batch
 
 # Create a named vector for the new values
 
-new_names <- c("Moelle 3" = "donor3",
+new_names <- c(
+  "Moelle 3" = "donor3",
   "Moelle 4" = "donor4",
   "Moelle 1" = "donor1",
   "Moelle 2" = "donor2",
@@ -1143,7 +1193,6 @@ new_names <- c("Moelle 3" = "donor3",
 
 # Apply the renaming
 crinier2021@meta.data$orig.ident <- new_names[crinier2021@meta.data$orig.ident]
-
 
 # convert to single cell experiment
 crinier2021_sc <- as.SingleCellExperiment(crinier2021)
@@ -1191,44 +1240,47 @@ scPHeatmap(
 
 ### ___DEG analysis: hNK_Bm1 cluster___
 
-```{r DEG adult vs. fetal BM: hNK_Bm1, results='asis'}
-df_fetal <- assay(fetal_NK_agg_counts$hNK_Bm1, "counts")
+```{r DEG adult vs. toddler BM: hNK_Bm1, results='asis'}
+df_toddler <- assay(CTRL_NK_agg_counts$hNK_Bm1, "counts")
 df_adult <- assay(adult_NK_agg_counts$hNK_Bm1, "counts")
 
-dim(df_fetal)
+dim(df_toddler)
 dim(df_adult)
 
 # Check that the rownames match 
-common_rownames <- intersect(rownames(df_adult), rownames(df_fetal))
+common_rownames <- intersect(rownames(df_adult), rownames(df_toddler))
 
 # Subset the dataframes to the common genes
 df_adult <- df_adult[common_rownames, , drop = FALSE]
-df_fetal <- df_fetal[common_rownames, , drop = FALSE]
+df_toddler <- df_toddler[common_rownames, , drop = FALSE]
 
 # Combine the dataframes by columns
-merged_df <- cbind(df_adult, df_fetal)
+merged_df <- cbind(df_adult, df_toddler)
 
 # View the dimensions of the merged dataframe
 dim(merged_df)
 
 # merge metadata
-metadata_fetal <- colData(fetal_NK_agg_counts$hNK_Bm1)
+metadata_toddler <- colData(CTRL_NK_agg_counts$hNK_Bm1)
 metadata_adult <- colData(adult_NK_agg_counts$hNK_Bm1)
 
 # match column names
-colnames(metadata_adult) <- c("donor", "batch","cluster","predicted_NK_type","sex","run") 
+colnames(metadata_adult) <- c("donor", "batch","cluster","predicted_NK_type_de.n350","sex","run") 
 metadata_adult <- subset(metadata_adult,select = "donor")
 
-metadata_fetal$donor <- metadata_fetal$orig.ident
-metadata_fetal <- subset(metadata_fetal,select = "donor")
+metadata_toddler$donor <- metadata_toddler$orig.ident
+metadata_toddler <- subset(metadata_toddler,select = "orig.ident")
+
+colnames(metadata_toddler) <- "donor"
+
 
 # merge metadata
-merged_metadata <- rbind(metadata_adult,metadata_fetal)
+merged_metadata <- rbind(metadata_adult,metadata_toddler)
 
 # add comparison groups
 merged_metadata$group <- c("adult","adult","adult","adult",
                            "adult","adult","adult","adult",
-                           "fetal","fetal","fetal","fetal","fetal")
+                           "toddler","toddler","toddler","toddler","toddler")
 
 
 rownames(merged_metadata) <- paste(as.character(merged_metadata$group),
@@ -1236,8 +1288,8 @@ rownames(merged_metadata) <- paste(as.character(merged_metadata$group),
                                    sep="")
 rownames(merged_metadata)
 colnames(merged_df) <- c("adult4","adult1","adult2","adult5","adult6",
-                         "adult7","adult3","adult8","fetal1","fetal5",
-                         "fetal4","fetal2","fetal3")
+                         "adult7","adult3","adult8","toddler1","toddler5",
+                         "toddler4","toddler2","toddler3")
 
 # Drop unused factor levels
 merged_metadata$donor <- factor(merged_metadata$donor)
@@ -1273,57 +1325,60 @@ ggplot(pca_data, aes(x = PC1, y = PC2, label = name, color = group)) +
   xlab(paste0("PC1: ", percentVar[1], "% variance")) +
   ylab(paste0("PC2: ", percentVar[2], "% variance")) +
   scale_color_manual(values=c("#161B33","#419D78"))  +
-  labs(color = "Group", title = "DEGs Adult vs. Fetal BM-NK cluster 1") +
+  labs(color = "Group", title = "DEGs Adult vs. toddler BM-NK cluster 1") +
   theme_light(base_size = 18) +  geom_point(size = 4)
 
 # DEG analysis
 deseq_analysis <- DESeq(deseq)
 
-deseq_results_AdultvsFetal_c1 <-
-    results(deseq_analysis, contrast = c("group", "adult", "fetal"))
-head(deseq_results_AdultvsFetal_c1,50)
+deseq_results_Adultvstoddler_c1 <-
+    results(deseq_analysis, contrast = c("group", "adult", "toddler"))
+head(deseq_results_Adultvstoddler_c1,50)
 ```
 
 ### ___DEG analysis: hNK_Bm2 cluster___
 
-```{r DEG adult vs. fetal BM: hNK_Bm2, results='asis'}
-df_fetal <- assay(fetal_NK_agg_counts$hNK_Bm2, "counts")
+```{r DEG adult vs. toddler BM: hNK_Bm2, results='asis'}
+df_toddler <- assay(CTRL_NK_agg_counts$hNK_Bm2, "counts")
 df_adult <- assay(adult_NK_agg_counts$hNK_Bm2, "counts")
 
-dim(df_fetal)
+dim(df_toddler)
 dim(df_adult)
 
 # Check that the rownames match 
-common_rownames <- intersect(rownames(df_adult), rownames(df_fetal))
+common_rownames <- intersect(rownames(df_adult), rownames(df_toddler))
 
 # Subset the dataframes to the common genes
 df_adult <- df_adult[common_rownames, , drop = FALSE]
-df_fetal <- df_fetal[common_rownames, , drop = FALSE]
+df_toddler <- df_toddler[common_rownames, , drop = FALSE]
 
 # Combine the dataframes by columns
-merged_df <- cbind(df_adult, df_fetal)
+merged_df <- cbind(df_adult, df_toddler)
 
 # View the dimensions of the merged dataframe
 dim(merged_df)
 
 # merge metadata
-metadata_fetal <- colData(fetal_NK_agg_counts$hNK_Bm2)
+metadata_toddler <- colData(CTRL_NK_agg_counts$hNK_Bm2)
 metadata_adult <- colData(adult_NK_agg_counts$hNK_Bm2)
 
 # match column names
-colnames(metadata_adult) <- c("donor", "batch","cluster","predicted_NK_type","sex","run") 
+colnames(metadata_adult) <- c("donor", "batch","cluster","predicted_NK_type_de.n350","sex","run") 
 metadata_adult <- subset(metadata_adult,select = "donor")
 
-metadata_fetal$donor <- metadata_fetal$orig.ident
-metadata_fetal <- subset(metadata_fetal,select = "donor")
+metadata_toddler$donor <- metadata_toddler$orig.ident
+metadata_toddler <- subset(metadata_toddler,select = "orig.ident")
+
+colnames(metadata_toddler) <- "donor"
+
 
 # merge metadata
-merged_metadata <- rbind(metadata_adult,metadata_fetal)
+merged_metadata <- rbind(metadata_adult,metadata_toddler)
 
 # add comparison groups
 merged_metadata$group <- c("adult","adult","adult","adult",
                            "adult","adult","adult","adult",
-                           "fetal","fetal","fetal","fetal","fetal")
+                           "toddler","toddler","toddler","toddler","toddler")
 
 
 rownames(merged_metadata) <- paste(as.character(merged_metadata$group),
@@ -1332,8 +1387,8 @@ rownames(merged_metadata) <- paste(as.character(merged_metadata$group),
 merged_metadata
 
 colnames(merged_df) <- c("adult4","adult1","adult2","adult5","adult6",
-                         "adult7","adult3","adult8","fetal1","fetal5",
-                         "fetal4","fetal2","fetal3")
+                         "adult7","adult3","adult8","toddler1","toddler5",
+                         "toddler4","toddler2","toddler3")
 
 # Drop unused factor levels
 merged_metadata$donor <- factor(merged_metadata$donor)
@@ -1369,65 +1424,68 @@ ggplot(pca_data, aes(x = PC1, y = PC2, label = name, color = group)) +
   xlab(paste0("PC1: ", percentVar[1], "% variance")) +
   ylab(paste0("PC2: ", percentVar[2], "% variance")) +
   scale_color_manual(values=c("#161B33","#419D78"))  +
-  labs(color = "Group", title = "DEGs Adult vs. Fetal BM-NK cluster 2") +
+  labs(color = "Group", title = "DEGs Adult vs. toddler BM-NK cluster 2") +
   theme_light(base_size = 18) +  geom_point(size = 4)
 
 
 # DEG analysis
 deseq_analysis <- DESeq(deseq)
 
-deseq_results_AdultvsFetal_c2 <-
-    results(deseq_analysis, contrast = c("group", "adult", "fetal"))
-head(deseq_results_AdultvsFetal_c2,50)
+deseq_results_Adultvstoddler_c2 <-
+    results(deseq_analysis, contrast = c("group", "adult", "toddler"))
+head(deseq_results_Adultvstoddler_c2,50)
 ```
 
 ### ___DEG analysis: hNK_Bm3 cluster___
 
-```{r DEG adult vs. fetal BM: hNK_Bm3, results='asis'}
-df_fetal <- assay(fetal_NK_agg_counts$hNK_Bm3, "counts")
+```{r DEG adult vs. toddler BM: hNK_Bm3, results='asis'}
+df_toddler <- assay(CTRL_NK_agg_counts$hNK_Bm3, "counts")
 df_adult <- assay(adult_NK_agg_counts$hNK_Bm3, "counts")
 
-dim(df_fetal)
+dim(df_toddler)
 dim(df_adult)
 
 # Check that the rownames match 
-common_rownames <- intersect(rownames(df_adult), rownames(df_fetal))
+common_rownames <- intersect(rownames(df_adult), rownames(df_toddler))
 
 # Subset the dataframes to the common genes
 df_adult <- df_adult[common_rownames, , drop = FALSE]
-df_fetal <- df_fetal[common_rownames, , drop = FALSE]
+df_toddler <- df_toddler[common_rownames, , drop = FALSE]
 
 # Combine the dataframes by columns
-merged_df <- cbind(df_adult, df_fetal)
+merged_df <- cbind(df_adult, df_toddler)
 
 # View the dimensions of the merged dataframe
 dim(merged_df)
 
 # merge metadata
-metadata_fetal <- colData(fetal_NK_agg_counts$hNK_Bm3)
+metadata_toddler <- colData(CTRL_NK_agg_counts$hNK_Bm3)
 metadata_adult <- colData(adult_NK_agg_counts$hNK_Bm3)
 
 # match column names
-colnames(metadata_adult) <- c("donor", "batch","cluster","predicted_NK_type","sex","run") 
+colnames(metadata_adult) <- c("donor", "batch","cluster","predicted_NK_type_de.n350","sex","run") 
 metadata_adult <- subset(metadata_adult,select = "donor")
-metadata_fetal$donor <- metadata_fetal$orig.ident
-metadata_fetal <- subset(metadata_fetal,select = "donor")
+metadata_toddler$donor <- metadata_toddler$orig.ident
+metadata_toddler <- subset(metadata_toddler,select = "orig.ident")
+
+colnames(metadata_toddler) <- "donor"
+
 
 # merge metadata
-merged_metadata <- rbind(metadata_adult,metadata_fetal)
+merged_metadata <- rbind(metadata_adult,metadata_toddler)
 
 # add comparison groups
 merged_metadata$group <- c("adult","adult","adult","adult",
                            "adult","adult","adult","adult",
-                           "fetal","fetal","fetal","fetal","fetal")
+                           "toddler","toddler","toddler","toddler","toddler")
 
 rownames(merged_metadata) <- paste(as.character(merged_metadata$group),
                                    as.character(merged_metadata$donor),
                                    sep="")
 merged_metadata
 colnames(merged_df) <- c("adult4","adult1","adult2","adult5","adult6",
-                         "adult7","adult3","adult8","fetal1","fetal5",
-                         "fetal4","fetal2","fetal3")
+                         "adult7","adult3","adult8","toddler1","toddler5",
+                         "toddler4","toddler2","toddler3")
 
 # Drop unused factor levels
 merged_metadata$donor <- factor(merged_metadata$donor)
@@ -1464,55 +1522,58 @@ ggplot(pca_data, aes(x = PC1, y = PC2, label = name, color = group)) +
   xlab(paste0("PC1: ", percentVar[1], "% variance")) +
   ylab(paste0("PC2: ", percentVar[2], "% variance")) +
   scale_color_manual(values=c("#161B33","#419D78"))  +
-  labs(color = "Group", title = "DEGs Adult vs. Fetal BM-NK cluster 3") +
+  labs(color = "Group", title = "DEGs Adult vs. toddler BM-NK cluster 3") +
   theme_light(base_size = 18) +  geom_point(size = 4)
 
 # DEG analysis
 deseq_analysis <- DESeq(deseq)
 
-deseq_results_AdultvsFetal_c3 <-
-    results(deseq_analysis, contrast = c("group", "adult", "fetal"))
-head(deseq_results_AdultvsFetal_c3,50)
+deseq_results_Adultvstoddler_c3 <-
+    results(deseq_analysis, contrast = c("group", "adult", "toddler"))
+head(deseq_results_Adultvstoddler_c3,50)
 ```
 
 ### ___DEG analysis: hNK_Bm4 cluster___
 
-```{r DEG adult vs. fetal BM: hNK_Bm4, results='asis'}
-df_fetal <- assay(fetal_NK_agg_counts$hNK_Bm4, "counts")
+```{r DEG adult vs. toddler BM: hNK_Bm4, results='asis'}
+df_toddler <- assay(CTRL_NK_agg_counts$hNK_Bm4, "counts")
 df_adult <- assay(adult_NK_agg_counts$hNK_Bm4, "counts")
 
-dim(df_fetal)
+dim(df_toddler)
 dim(df_adult)
 
 # Check that the rownames match 
-common_rownames <- intersect(rownames(df_adult), rownames(df_fetal))
+common_rownames <- intersect(rownames(df_adult), rownames(df_toddler))
 
 # Subset the dataframes to the common genes
 df_adult <- df_adult[common_rownames, , drop = FALSE]
-df_fetal <- df_fetal[common_rownames, , drop = FALSE]
+df_toddler <- df_toddler[common_rownames, , drop = FALSE]
 
 # Combine the dataframes by columns
-merged_df <- cbind(df_adult, df_fetal)
+merged_df <- cbind(df_adult, df_toddler)
 
 # View the dimensions of the merged dataframe
 dim(merged_df)
 
 # merge metadata
-metadata_fetal <- colData(fetal_NK_agg_counts$hNK_Bm4)
+metadata_toddler <- colData(CTRL_NK_agg_counts$hNK_Bm4)
 metadata_adult <- colData(adult_NK_agg_counts$hNK_Bm4)
 
 # match column names
-colnames(metadata_adult) <- c("donor", "batch","cluster","predicted_NK_type","sex","run") 
+colnames(metadata_adult) <- c("donor", "batch","cluster","predicted_NK_type_de.n350","sex","run") 
 metadata_adult <- subset(metadata_adult,select = "donor")
-metadata_fetal$donor <- metadata_fetal$orig.ident
-metadata_fetal <- subset(metadata_fetal,select = "donor")
+metadata_toddler$donor <- metadata_toddler$orig.ident
+metadata_toddler <- subset(metadata_toddler,select = "orig.ident")
+
+colnames(metadata_toddler) <- "donor"
+
 
 # merge metadata
-merged_metadata <- rbind(metadata_adult,metadata_fetal)
+merged_metadata <- rbind(metadata_adult,metadata_toddler)
 
 # add comparison groups (not all adult BM samples have cluster 4)
 merged_metadata$group <- c("adult","adult","adult", 
-                           "fetal","fetal","fetal","fetal","fetal")
+                           "toddler","toddler","toddler","toddler","toddler")
 
 
 rownames(merged_metadata) <- paste(as.character(merged_metadata$group),
@@ -1520,8 +1581,8 @@ rownames(merged_metadata) <- paste(as.character(merged_metadata$group),
                                    sep="")
 merged_metadata
 colnames(merged_df) <- c("adult3","adult2","adult5",
-                         "fetal1","fetal5",
-                         "fetal4","fetal2","fetal3")
+                         "toddler1","toddler5",
+                         "toddler4","toddler2","toddler3")
 
 # Drop unused factor levels
 merged_metadata$donor <- factor(merged_metadata$donor)
@@ -1558,172 +1619,64 @@ ggplot(pca_data, aes(x = PC1, y = PC2, label = name, color = group)) +
   xlab(paste0("PC1: ", percentVar[1], "% variance")) +
   ylab(paste0("PC2: ", percentVar[2], "% variance")) +
   scale_color_manual(values=c("#161B33","#419D78"))  +
-  labs(color = "Group", title = "DEGs Adult vs. Fetal BM-NK cluster 4") +
+  labs(color = "Group", title = "DEGs Adult vs. toddler BM-NK cluster 4") +
   theme_light(base_size = 18) +  geom_point(size = 4)
 
 # DEG analysis
 deseq_analysis <- DESeq(deseq)
 
-deseq_results_AdultvsFetal_c4 <-
-    results(deseq_analysis, contrast = c("group", "adult", "fetal"))
-head(deseq_results_AdultvsFetal_c4,50)
+deseq_results_Adultvstoddler_c4 <-
+    results(deseq_analysis, contrast = c("group", "adult", "toddler"))
+head(deseq_results_Adultvstoddler_c4,50)
 ```
 
 ## ___DEG analysis: tumor-infiltrated vs. non-infiltrated BM-NK___
 
 ### ___DEG analysis: hNK_Bm1 cluster___
 
-```{r DEG NB vs. fetal BM: hNK_Bm1, results='asis'}
-df_fetal <- assay(fetal_NK_agg_counts$hNK_Bm1, "counts")
-df_ATRX <- assay(ATRX_NK_agg_counts$hNK_Bm1, "counts")
-
-dim(df_fetal)
-dim(df_ATRX)
-
-# Check that the rownames match 
-common_rownames <- intersect(rownames(df_ATRX), rownames(df_fetal))
-
-# Subset the dataframes to the common genes
-df_ATRX <- df_ATRX[common_rownames, , drop = FALSE]
-df_fetal <- df_fetal[common_rownames, , drop = FALSE]
-
-# Combine the dataframes by columns
-merged_df <- cbind(df_ATRX, df_fetal)
-
-# View the dimensions of the merged dataframe
-dim(merged_df)
-
-# merge metadata
-metadata_fetal <- colData(fetal_NK_agg_counts$hNK_Bm2)
-metadata_ATRX <- colData(ATRX_NK_agg_counts$hNK_Bm2)
-
-# match column names
-colnames(metadata_ATRX) <- c("donor", "sample","group","patients","predicted_NK_type","ident") 
-metadata_ATRX <- subset(metadata_ATRX,select = "donor")
-colnames(metadata_fetal) <- c("orig.ident","sample", "group","donor","predicted_NK_type","ident")
-metadata_fetal <- subset(metadata_fetal,select = "donor")
-
-# merge metadata
-merged_metadata <- rbind(metadata_ATRX,metadata_fetal)
-
-# add comparison groups
-merged_metadata$group <- c("ATRX","ATRX",
-                           "fetal","fetal","fetal","fetal","fetal")
-
-# unique column names with group and donor info
-merged_metadata$donor = gsub("ctrl_0","",merged_metadata$donor)
-merged_metadata$donor = gsub("ATRXmut_0","",merged_metadata$donor)
-kable(merged_metadata)
-
-rownames(merged_metadata) <- paste(as.character(merged_metadata$group),
-                                   as.character(merged_metadata$donor),
-                                   sep="")
-rownames(merged_metadata)
-colnames(merged_df) <- c("ATRX2","ATRX1",
-                         "fetal1","fetal5","fetal4", "fetal2","fetal3")
-
-# Drop unused factor levels
-merged_metadata$donor <- factor(merged_metadata$donor)
-merged_metadata$donor <- droplevels(merged_metadata$donor)
-merged_metadata$donor 
-
-merged_metadata$group <- factor(merged_metadata$group)
-merged_metadata$group <- droplevels(merged_metadata$group)
-merged_metadata$group
-
-rownames(merged_metadata) <- NULL
-
-# bulk RNA-seq DEG analysis
-deseq <-
-    DESeqDataSetFromMatrix(
-        countData = merged_df,
-        colData = merged_metadata,
-        design = ~ group + donor 
-    )
-
-# Transform counts for data visualization
-rld <- rlog(deseq, blind=TRUE)
-
-# Plot PCA
-DESeq2::plotPCA(rld, ntop = 1000, intgroup = "group") + 
-  scale_color_manual(values=c("#161B33","#419D78"))  +
-  labs(color = "Group", title = "DEGs ATRXmut NB vs. Fetal BM-NK cluster 1") +
-  theme_light(base_size = 18) +  geom_point(size = 4)
-
-DESeq2::plotPCA(rld, ntop = 500, intgroup = "sizeFactor") + 
-  scale_color_continuous(type = "gradient")  +
-  labs(color = "Cell number", title = "DEGs ATRXmut NB vs. Fetal BM-NK cluster 1") +
-  theme_light(base_size = 18) +  geom_point(size = 4)
-
-# Extract the rlog matrix from the object and compute pairwise correlation values
-rld_mat <- assay(rld)
-rld_cor <- cor(rld_mat)
-
-# Plot heatmap
-pheatmap(rld_cor)
-
-# DEG analysis
-deseq_analysis <- DESeq(deseq)
-
-plotDispEsts(deseq_analysis)
-
-deseq_results_ATRXvsFetal_c1 <-
-    results(deseq_analysis, contrast = c("group", "ATRX", "fetal"))
-head(deseq_results_ATRXvsFetal_c1,50)
-
-# Shrink the log2 fold changes to be more appropriate using the apeglm method - should cite [paper]() when using this method
-# Generate results object
-#resultsNames(deseq_results_ATRXvsFetal_c1)
-res <- results(deseq_results_ATRXvsFetal_c1, 
-               name = "group_fetal_vs_ATRX",
-               alpha = 0.05)
-
-res <- lfcShrink(deseq_results_ATRXvsFetal_c1, 
-                 coef = "group_fetal_vs_ATRX",
-                 res = res,
-                 type = "apeglm")
-
-head(res, 50)
-```
+Cluster 1 is only present in small amounts in one ATRX samples/patient, while
+missing in the other sample/patient
 
 ### ___DEG analysis: hNK_Bm2 cluster___
 
-```{r DEG NB vs. fetal BM: hNK_Bm2, results='asis'}
-df_fetal <- assay(fetal_NK_agg_counts$hNK_Bm2, "counts")
+```{r DEG NB vs. toddler BM: hNK_Bm2, results='asis'}
+df_toddler <- assay(CTRL_NK_agg_counts$hNK_Bm2, "counts")
 df_ATRX <- assay(ATRX_NK_agg_counts$hNK_Bm2, "counts")
 
-dim(df_fetal)
+dim(df_toddler)
 dim(df_ATRX)
 
 # Check that the rownames match 
-common_rownames <- intersect(rownames(df_ATRX), rownames(df_fetal))
+common_rownames <- intersect(rownames(df_ATRX), rownames(df_toddler))
 
 # Subset the dataframes to the common genes
 df_ATRX <- df_ATRX[common_rownames, , drop = FALSE]
-df_fetal <- df_fetal[common_rownames, , drop = FALSE]
+df_toddler <- df_toddler[common_rownames, , drop = FALSE]
 
 # Combine the dataframes by columns
-merged_df <- cbind(df_ATRX, df_fetal)
+merged_df <- cbind(df_ATRX, df_toddler)
 
 # View the dimensions of the merged dataframe
 dim(merged_df)
 
 # merge metadata
-metadata_fetal <- colData(fetal_NK_agg_counts$hNK_Bm2)
+metadata_toddler <- colData(CTRL_NK_agg_counts$hNK_Bm2)
 metadata_ATRX <- colData(ATRX_NK_agg_counts$hNK_Bm2)
 
 # match column names
-colnames(metadata_ATRX) <- c("donor", "sample","group","patients","predicted_NK_type","ident") 
+colnames(metadata_ATRX) <- c("donor", "sample","group","patients","predicted_NK_type_de.n350","ident") 
 metadata_ATRX <- subset(metadata_ATRX,select = "donor")
-colnames(metadata_fetal) <- c("orig.ident","sample", "group","donor","predicted_NK_type","ident")
-metadata_fetal <- subset(metadata_fetal,select = "donor")
+colnames(metadata_toddler) <- c("orig.ident","sample", "group","donor","predicted_NK_type_de.n350","ident")
+metadata_toddler <- subset(metadata_toddler,select = "orig.ident")
+
+colnames(metadata_toddler) <- "donor"
 
 # merge metadata
-merged_metadata <- rbind(metadata_ATRX,metadata_fetal)
+merged_metadata <- rbind(metadata_ATRX,metadata_toddler)
 
 # add comparison groups
 merged_metadata$group <- c("ATRX","ATRX",
-                           "fetal","fetal","fetal","fetal","fetal")
+                           "toddler","toddler","toddler","toddler","toddler")
 
 # unique column names with group and donor info
 merged_metadata$donor = gsub("ctrl_0","",merged_metadata$donor)
@@ -1735,7 +1688,7 @@ rownames(merged_metadata) <- paste(as.character(merged_metadata$group),
                                    sep="")
 rownames(merged_metadata)
 colnames(merged_df) <- c("ATRX2","ATRX1",
-                         "fetal1","fetal5","fetal4", "fetal2","fetal3")
+                         "toddler1","toddler5","toddler4", "toddler2","toddler3")
 
 # Drop unused factor levels
 merged_metadata$donor <- factor(merged_metadata$donor)
@@ -1762,12 +1715,12 @@ rld <- rlog(deseq, blind=TRUE)
 # Plot PCA
 DESeq2::plotPCA(rld, ntop = 1000, intgroup = "group") + 
   scale_color_manual(values=c("#161B33","#419D78"))  +
-  labs(color = "Group", title = "DEGs ATRXmut NB vs. Fetal BM-NK cluster 2") +
+  labs(color = "Group", title = "DEGs ATRXmut NB vs. toddler BM-NK cluster 2") +
   theme_light(base_size = 18) +  geom_point(size = 4)
 
 DESeq2::plotPCA(rld, ntop = 500, intgroup = "sizeFactor") + 
   scale_color_continuous(type = "gradient")  +
-  labs(color = "Cell number", title = "DEGs ATRXmut NB vs. Fetal BM-NK cluster 2") +
+  labs(color = "Cell number", title = "DEGs ATRXmut NB vs. toddler BM-NK cluster 2") +
   theme_light(base_size = 18) +  geom_point(size = 4)
 
 # Extract the rlog matrix from the object and compute pairwise correlation values
@@ -1782,20 +1735,21 @@ deseq_analysis <- DESeq(deseq)
 
 plotDispEsts(deseq_analysis)
 
-deseq_results_ATRXvsFetal_c2 <-
-    results(deseq_analysis, contrast = c("group", "ATRX", "fetal"))
-head(deseq_results_ATRXvsFetal_c2,50)
+deseq_results_ATRXvstoddler_c2 <-
+    results(deseq_analysis, contrast = c("group", "ATRX", "toddler"))
+
+head(deseq_results_ATRXvstoddler_c2,50)
 
 # Shrink the log2 fold changes to be more appropriate using the apeglm method - should cite [paper]() when using this method
 # Generate results object
-#resultsNames(deseq_results_ATRXvsFetal_c2)
-res <- results(deseq_results_ATRXvsFetal_c2, 
-               name = "group_fetal_vs_ATRX",
-               alpha = 0.05)
+#resultsNames(deseq_results_ATRXvstoddler_c2)
+deseq_results_ATRXvstoddler_c2 <- results(deseq_analysis, 
+                                          name = "group_toddler_vs_ATRX",
+                                          alpha = 0.05)
 
-res <- lfcShrink(deseq_results_ATRXvsFetal_c2, 
-                 coef = "group_fetal_vs_ATRX",
-                 res = res,
+res <- lfcShrink(deseq_analysis, 
+                 coef = "group_toddler_vs_ATRX",
+                 res = deseq_results_ATRXvstoddler_c2,
                  type = "apeglm")
 
 head(res, 50)
@@ -1803,42 +1757,44 @@ head(res, 50)
 
 ### ___DEG analysis: hNK_Bm3 cluster___
 
-```{r DEG NB vs. fetal BM: hNK_Bm3, results='asis'}
-df_fetal <- assay(fetal_NK_agg_counts$hNK_Bm3, "counts")
+```{r DEG NB vs. toddler BM: hNK_Bm3, results='asis'}
+df_toddler <- assay(CTRL_NK_agg_counts$hNK_Bm3, "counts")
 df_ATRX <- assay(ATRX_NK_agg_counts$hNK_Bm3, "counts")
 
-dim(df_fetal)
+dim(df_toddler)
 dim(df_ATRX)
 
 # Check that the rownames match 
-common_rownames <- intersect(rownames(df_ATRX), rownames(df_fetal))
+common_rownames <- intersect(rownames(df_ATRX), rownames(df_toddler))
 
 # Subset the dataframes to the common genes
 df_ATRX <- df_ATRX[common_rownames, , drop = FALSE]
-df_fetal <- df_fetal[common_rownames, , drop = FALSE]
+df_toddler <- df_toddler[common_rownames, , drop = FALSE]
 
 # Combine the dataframes by columns
-merged_df <- cbind(df_ATRX, df_fetal)
+merged_df <- cbind(df_ATRX, df_toddler)
 
 # View the dimensions of the merged dataframe
 dim(merged_df)
 
 # merge metadata
-metadata_fetal <- colData(fetal_NK_agg_counts$hNK_Bm2)
+metadata_toddler <- colData(CTRL_NK_agg_counts$hNK_Bm2)
 metadata_ATRX <- colData(ATRX_NK_agg_counts$hNK_Bm2)
 
 # match column names
-colnames(metadata_ATRX) <- c("donor", "sample","group","patients","predicted_NK_type","ident") 
+colnames(metadata_ATRX) <- c("donor", "sample","group","patients","predicted_NK_type_de.n350","ident") 
 metadata_ATRX <- subset(metadata_ATRX,select = "donor")
-colnames(metadata_fetal) <- c("orig.ident","sample", "group","donor","predicted_NK_type","ident")
-metadata_fetal <- subset(metadata_fetal,select = "donor")
+colnames(metadata_toddler) <- c("orig.ident","sample", "group","donor","predicted_NK_type_de.n350","ident")
+metadata_toddler <- subset(metadata_toddler,select = "orig.ident")
+
+colnames(metadata_toddler) <- "donor"
 
 # merge metadata
-merged_metadata <- rbind(metadata_ATRX,metadata_fetal)
+merged_metadata <- rbind(metadata_ATRX,metadata_toddler)
 
 # add comparison groups
 merged_metadata$group <- c("ATRX","ATRX",
-                           "fetal","fetal","fetal","fetal","fetal")
+                           "toddler","toddler","toddler","toddler","toddler")
 
 # unique column names with group and donor info
 merged_metadata$donor = gsub("ctrl_0","",merged_metadata$donor)
@@ -1850,7 +1806,7 @@ rownames(merged_metadata) <- paste(as.character(merged_metadata$group),
                                    sep="")
 rownames(merged_metadata)
 colnames(merged_df) <- c("ATRX2","ATRX1",
-                         "fetal1","fetal5","fetal4", "fetal2","fetal3")
+                         "toddler1","toddler5","toddler4", "toddler2","toddler3")
 
 # Drop unused factor levels
 merged_metadata$donor <- factor(merged_metadata$donor)
@@ -1877,12 +1833,12 @@ rld <- rlog(deseq, blind=TRUE)
 # Plot PCA
 DESeq2::plotPCA(rld, ntop = 1000, intgroup = "group") + 
   scale_color_manual(values=c("#161B33","#419D78"))  +
-  labs(color = "Group", title = "DEGs ATRXmut NB vs. Fetal BM-NK cluster 3") +
+  labs(color = "Group", title = "DEGs ATRXmut NB vs. toddler BM-NK cluster 3") +
   theme_light(base_size = 18) +  geom_point(size = 4)
 
 DESeq2::plotPCA(rld, ntop = 500, intgroup = "sizeFactor") + 
   scale_color_continuous(type = "gradient")  +
-  labs(color = "Cell number", title = "DEGs ATRXmut NB vs. Fetal BM-NK cluster 3") +
+  labs(color = "Cell number", title = "DEGs ATRXmut NB vs. toddler BM-NK cluster 3") +
   theme_light(base_size = 18) +  geom_point(size = 4)
 
 # Extract the rlog matrix from the object and compute pairwise correlation values
@@ -1897,63 +1853,65 @@ deseq_analysis <- DESeq(deseq)
 
 plotDispEsts(deseq_analysis)
 
-deseq_results_ATRXvsFetal_c3 <-
-    results(deseq_analysis, contrast = c("group", "ATRX", "fetal"))
-head(deseq_results_ATRXvsFetal_c3,50)
+deseq_results_ATRXvstoddler_c3 <-
+    results(deseq_analysis, contrast = c("group", "ATRX", "toddler"))
+head(deseq_results_ATRXvstoddler_c3,50)
 
 # Shrink the log2 fold changes to be more appropriate using the apeglm method - should cite [paper]() when using this method
 # Generate results object
-#resultsNames(deseq_results_ATRXvsFetal_c3)
-res <- results(deseq_results_ATRXvsFetal_c3, 
-               name = "group_fetal_vs_ATRX",
-               alpha = 0.05)
+#resultsNames(deseq_results_ATRXvstoddler_c3)
+deseq_results_ATRXvstoddler_c3 <- results(deseq_analysis, 
+                                          name = "group_toddler_vs_ATRX",
+                                          alpha = 0.05)
 
-res <- lfcShrink(deseq_results_ATRXvsFetal_c3, 
-                 coef = "group_fetal_vs_ATRX",
-                 res = res,
+res <- lfcShrink(deseq_analysis, 
+                 coef = "group_toddler_vs_ATRX",
+                 res = deseq_results_ATRXvstoddler_c3,
                  type = "apeglm")
 
 head(res, 50)
 ```
 
-### ___DEG analysis: hNK_Bm3 cluster___
+### ___DEG analysis: hNK_Bm4 cluster___
 
-```{r DEG NB vs. fetal BM: hNK_Bm4, results='asis'}
-df_fetal <- assay(fetal_NK_agg_counts$hNK_Bm4, "counts")
+```{r DEG NB vs. toddler BM: hNK_Bm4, results='asis'}
+df_toddler <- assay(CTRL_NK_agg_counts$hNK_Bm4, "counts")
 df_ATRX <- assay(ATRX_NK_agg_counts$hNK_Bm4, "counts")
 
-dim(df_fetal)
+dim(df_toddler)
 dim(df_ATRX)
 
 # Check that the rownames match 
-common_rownames <- intersect(rownames(df_ATRX), rownames(df_fetal))
+common_rownames <- intersect(rownames(df_ATRX), rownames(df_toddler))
 
 # Subset the dataframes to the common genes
 df_ATRX <- df_ATRX[common_rownames, , drop = FALSE]
-df_fetal <- df_fetal[common_rownames, , drop = FALSE]
+df_toddler <- df_toddler[common_rownames, , drop = FALSE]
 
 # Combine the dataframes by columns
-merged_df <- cbind(df_ATRX, df_fetal)
+merged_df <- cbind(df_ATRX, df_toddler)
 
 # View the dimensions of the merged dataframe
 dim(merged_df)
 
 # merge metadata
-metadata_fetal <- colData(fetal_NK_agg_counts$hNK_Bm2)
+metadata_toddler <- colData(CTRL_NK_agg_counts$hNK_Bm2)
 metadata_ATRX <- colData(ATRX_NK_agg_counts$hNK_Bm2)
 
 # match column names
-colnames(metadata_ATRX) <- c("donor", "sample","group","patients","predicted_NK_type","ident") 
+colnames(metadata_ATRX) <- c("donor", "sample","group","patients","predicted_NK_type_de.n350","ident") 
 metadata_ATRX <- subset(metadata_ATRX,select = "donor")
-colnames(metadata_fetal) <- c("orig.ident","sample", "group","donor","predicted_NK_type","ident")
-metadata_fetal <- subset(metadata_fetal,select = "donor")
+colnames(metadata_toddler) <- c("orig.ident","sample", "group","donor","predicted_NK_type_de.n350","ident")
+metadata_toddler <- subset(metadata_toddler,select = "orig.ident")
+
+colnames(metadata_toddler) <- "donor"
 
 # merge metadata
-merged_metadata <- rbind(metadata_ATRX,metadata_fetal)
+merged_metadata <- rbind(metadata_ATRX,metadata_toddler)
 
 # add comparison groups
 merged_metadata$group <- c("ATRX","ATRX",
-                           "fetal","fetal","fetal","fetal","fetal")
+                           "toddler","toddler","toddler","toddler","toddler")
 
 # unique column names with group and donor info
 merged_metadata$donor = gsub("ctrl_0","",merged_metadata$donor)
@@ -1965,7 +1923,7 @@ rownames(merged_metadata) <- paste(as.character(merged_metadata$group),
                                    sep="")
 rownames(merged_metadata)
 colnames(merged_df) <- c("ATRX2","ATRX1",
-                         "fetal1","fetal5","fetal4", "fetal2","fetal3")
+                         "toddler1","toddler5","toddler4", "toddler2","toddler3")
 
 # Drop unused factor levels
 merged_metadata$donor <- factor(merged_metadata$donor)
@@ -1992,12 +1950,12 @@ rld <- rlog(deseq, blind=TRUE)
 # Plot PCA
 DESeq2::plotPCA(rld, ntop = 1000, intgroup = "group") + 
   scale_color_manual(values=c("#161B33","#419D78"))  +
-  labs(color = "Group", title = "DEGs ATRXmut NB vs. Fetal BM-NK cluster 4") +
+  labs(color = "Group", title = "DEGs ATRXmut NB vs. toddler BM-NK cluster 4") +
   theme_light(base_size = 18) +  geom_point(size = 4)
 
 DESeq2::plotPCA(rld, ntop = 500, intgroup = "sizeFactor") + 
   scale_color_continuous(type = "gradient")  +
-  labs(color = "Cell number", title = "DEGs ATRXmut NB vs. Fetal BM-NK cluster 4") +
+  labs(color = "Cell number", title = "DEGs ATRXmut NB vs. toddler BM-NK cluster 4") +
   theme_light(base_size = 18) +  geom_point(size = 4)
 
 # Extract the rlog matrix from the object and compute pairwise correlation values
@@ -2012,388 +1970,213 @@ deseq_analysis <- DESeq(deseq)
 
 plotDispEsts(deseq_analysis)
 
-deseq_results_ATRXvsFetal_c4 <-
-    results(deseq_analysis, contrast = c("group", "ATRX", "fetal"))
-head(deseq_results_ATRXvsFetal_c4,50)
+deseq_results_ATRXvstoddler_c4 <-
+    results(deseq_analysis, contrast = c("group", "ATRX", "toddler"))
+head(deseq_results_ATRXvstoddler_c4,50)
 
 # Shrink the log2 fold changes to be more appropriate using the apeglm method - should cite [paper]() when using this method
 # Generate results object
-#resultsNames(deseq_results_ATRXvsFetal_c4)
-res <- results(deseq_results_ATRXvsFetal_c4, 
-               name = "group_fetal_vs_ATRX",
-               alpha = 0.05)
+#resultsNames(deseq_results_ATRXvstoddler_c4)
+deseq_results_ATRXvstoddler_c4 <- results(deseq_analysis, 
+                                          name = "group_toddler_vs_ATRX",
+                                          alpha = 0.05)
 
-res <- lfcShrink(deseq_results_ATRXvsFetal_4, 
-                 coef = "group_fetal_vs_ATRX",
-                 res = res,
+res <- lfcShrink(deseq_analysis, 
+                 coef = "group_toddler_vs_ATRX",
+                 res = deseq_results_ATRXvstoddler_c4,
                  type = "apeglm")
 
 head(res, 50)
 ```
 
-## ___Compare results: Adult vs. Child BM-NK and Healthy vs. tumor-infiltrated BM-NK___
+## ___Compare results: Adult vs. toddler BM-NK and Healthy vs. tumor-infiltrated BM-NK___
+
+## ___Adult BM-NK vs. toddler BM-NK___
 
 ```{r compare results, results='asis'}
-# Adult vs. fetal BM: Cluster 1
-pos_val <- deseq_results_AdultvsFetal_c1$baseMean > 0
-deseq_results_AdultvsFetal_posVal <- deseq_results_AdultvsFetal_c1[pos_val,]
+# Adult vs. toddler BM: Cluster 1
+pos_val <- deseq_results_Adultvstoddler_c1$baseMean > 0
+deseq_results_Adultvstoddler_posVal <- deseq_results_Adultvstoddler_c1[pos_val,]
 
-deseq_results_AdultvsFetal_transf_c1 <- as.data.frame(deseq_results_AdultvsFetal_posVal) %>%
-    bind_cols(feature = rownames(deseq_results_AdultvsFetal_posVal)) %>%
+deseq_results_Adultvstoddler_transf_c1 <- as.data.frame(deseq_results_Adultvstoddler_posVal) %>%
+    bind_cols(feature = rownames(deseq_results_Adultvstoddler_posVal)) %>%
     mutate(log_padj = - log(.data$padj, base = 10))
-head(deseq_results_AdultvsFetal_transf_c1,50)
+head(deseq_results_Adultvstoddler_transf_c1,50)
 
-deseq_results_AdultvsFetal_signif_c1 <- 
-  deseq_results_AdultvsFetal_transf_c1 %>% 
+deseq_results_Adultvstoddler_signif_c1 <- 
+  deseq_results_Adultvstoddler_transf_c1 %>% 
   filter(padj < 0.1)
 
-head(deseq_results_AdultvsFetal_signif_c1,50)
+head(deseq_results_Adultvstoddler_signif_c1,50)
 
-# Adult vs. fetal BM: Cluster 2
-pos_val <- deseq_results_AdultvsFetal_c2$baseMean > 0
-deseq_results_AdultvsFetal_posVal <- deseq_results_AdultvsFetal_c2[pos_val,]
+# Adult vs. toddler BM: Cluster 2
+pos_val <- deseq_results_Adultvstoddler_c2$baseMean > 0
+deseq_results_Adultvstoddler_posVal <- deseq_results_Adultvstoddler_c2[pos_val,]
 
-deseq_results_AdultvsFetal_transf_c2 <- as.data.frame(deseq_results_AdultvsFetal_posVal) %>%
-    bind_cols(feature = rownames(deseq_results_AdultvsFetal_posVal)) %>%
+deseq_results_Adultvstoddler_transf_c2 <- as.data.frame(deseq_results_Adultvstoddler_posVal) %>%
+    bind_cols(feature = rownames(deseq_results_Adultvstoddler_posVal)) %>%
     mutate(log_padj = - log(.data$padj, base = 10))
 
-deseq_results_AdultvsFetal_signif_c2 <- 
-  deseq_results_AdultvsFetal_transf_c2 %>% 
+deseq_results_Adultvstoddler_signif_c2 <- 
+  deseq_results_Adultvstoddler_transf_c2 %>% 
   filter(padj < 0.1)
 
-head(deseq_results_AdultvsFetal_signif_c2,50)
+head(deseq_results_Adultvstoddler_signif_c2,50)
 
-# Adult vs. fetal BM: Cluster 3
-pos_val <- deseq_results_AdultvsFetal_c3$baseMean > 0
-deseq_results_AdultvsFetal_posVal <- deseq_results_AdultvsFetal_c3[pos_val,]
+# Adult vs. toddler BM: Cluster 3
+pos_val <- deseq_results_Adultvstoddler_c3$baseMean > 0
+deseq_results_Adultvstoddler_posVal <- deseq_results_Adultvstoddler_c3[pos_val,]
 
-deseq_results_AdultvsFetal_transf_c3 <- as.data.frame(deseq_results_AdultvsFetal_posVal) %>%
-    bind_cols(feature = rownames(deseq_results_AdultvsFetal_posVal)) %>%
+deseq_results_Adultvstoddler_transf_c3 <- as.data.frame(deseq_results_Adultvstoddler_posVal) %>%
+    bind_cols(feature = rownames(deseq_results_Adultvstoddler_posVal)) %>%
     mutate(log_padj = - log(.data$padj, base = 10))
 
-deseq_results_AdultvsFetal_signif_c3 <- 
-  deseq_results_AdultvsFetal_transf_c3 %>% 
+deseq_results_Adultvstoddler_signif_c3 <- 
+  deseq_results_Adultvstoddler_transf_c3 %>% 
   filter(padj < 0.1)
 
-head(deseq_results_AdultvsFetal_signif_c3,50)
+head(deseq_results_Adultvstoddler_signif_c3,50)
 
-# Adult vs. fetal BM: Cluster 4
-pos_val <- deseq_results_AdultvsFetal_c4$baseMean > 0
-deseq_results_AdultvsFetal_posVal <- deseq_results_AdultvsFetal_c4[pos_val,]
+# Adult vs. toddler BM: Cluster 4
+pos_val <- deseq_results_Adultvstoddler_c4$baseMean > 0
+deseq_results_Adultvstoddler_posVal <- deseq_results_Adultvstoddler_c4[pos_val,]
 
-deseq_results_AdultvsFetal_transf_c4 <- as.data.frame(deseq_results_AdultvsFetal_posVal) %>%
-    bind_cols(feature = rownames(deseq_results_AdultvsFetal_posVal)) %>%
+deseq_results_Adultvstoddler_transf_c4 <- as.data.frame(deseq_results_Adultvstoddler_posVal) %>%
+    bind_cols(feature = rownames(deseq_results_Adultvstoddler_posVal)) %>%
     mutate(log_padj = - log(.data$padj, base = 10))
 
-deseq_results_AdultvsFetal_signif_c4 <- 
-  deseq_results_AdultvsFetal_transf_c4 %>% 
+deseq_results_Adultvstoddler_signif_c4 <- 
+  deseq_results_Adultvstoddler_transf_c4 %>% 
   filter(padj < 0.1)
 
-head(deseq_results_AdultvsFetal_signif_c4,50)
+head(deseq_results_Adultvstoddler_signif_c4,50)
+```
 
-# ATRXmutated NB vs. fetal BM
-
-pos_val <- deseq_results_ATRXvsFetal$baseMean > 0
-deseq_results_ATRXvsFetal_posVal <- deseq_results_ATRXvsFetal[pos_val,]
-
-deseq_results_ATRXvsFetal_transf <- as.data.frame(deseq_results_ATRXvsFetal_posVal) %>%
-    bind_cols(feature = rownames(deseq_results_ATRXvsFetal_posVal)) %>%
-    mutate(log_padj = - log(.data$padj, base = 10))
-
-deseq_results_ATRXvsFetal_signif <- 
-  deseq_results_ATRXvsFetal_transf %>% 
-  filter(padj < 0.1)
-
-head(deseq_results_ATRXvsFetal_signif,50)
-
-# Function to add theme for ggplot
-deseq_themes <- function() {
-    list(
-        theme_classic(),
-        lims(x = c(-4, 5), y = c(0, 80)),
-        labs(
-            x = "log<sub>2</sub> (fold change)",
-            y = "-log<sub>10</sub> (p<sub>adj</sub>)"
-        ),
-        ggplot2::theme(
-            axis.title.x = ggtext::element_markdown(),
-            axis.title.y = ggtext::element_markdown())
-    )
-}
-
-
-# Vulcano plot: Adult vs Fetal BM-NK cluster 1, DEGs
-ggplot_AdultvsFetal_c1 <- ggplot(data = deseq_results_AdultvsFetal_transf_c1) +
+```{r}
+# Vulcano plot: Adult vs toddler BM-NK cluster 1, DEGs
+ggplot_Adultvstoddler_c1 <- ggplot(data = deseq_results_Adultvstoddler_transf_c1) +
     geom_point(aes(x = log2FoldChange, y = log_padj), na.rm = TRUE) +
     geom_point(
         data = filter(
-            .data = deseq_results_AdultvsFetal_transf_c1,
+            .data = deseq_results_Adultvstoddler_transf_c1,
             abs(.data$log2FoldChange) > 1, .data$padj < 0.05
         ),
         aes(x = log2FoldChange, y = log_padj), color = "red"
     ) +
     geom_label(
         data = filter(
-            .data = deseq_results_AdultvsFetal_transf_c1,
+            .data = deseq_results_Adultvstoddler_transf_c1,
             abs(.data$log2FoldChange) > 1, .data$padj < 0.01
         ),
         aes(x = log2FoldChange + 0.5, y = log_padj + 5, label = feature)
     ) +
     deseq_themes() + ylim(c(0,20))
 
-# Vulcano plot: Adult vs Fetal BM-NK cluster 2, DEGs
-ggplot_AdultvsFetal_c2 <- ggplot(data = deseq_results_AdultvsFetal_transf_c2) +
+
+# Vulcano plot: Adult vs toddler BM-NK cluster 2, DEGs
+ggplot_Adultvstoddler_c2 <- ggplot(data = deseq_results_Adultvstoddler_transf_c2) +
     geom_point(aes(x = log2FoldChange, y = log_padj), na.rm = TRUE) +
     geom_point(
         data = filter(
-            .data = deseq_results_AdultvsFetal_transf_c2,
+            .data = deseq_results_Adultvstoddler_transf_c2,
             abs(.data$log2FoldChange) > 1, .data$padj < 0.05
         ),
         aes(x = log2FoldChange, y = log_padj), color = "red"
     ) +
     geom_label(
         data = filter(
-            .data = deseq_results_AdultvsFetal_transf_c2,
+            .data = deseq_results_Adultvstoddler_transf_c2,
             abs(.data$log2FoldChange) > 1, .data$padj < 0.01
         ),
         aes(x = log2FoldChange + 0.5, y = log_padj + 5, label = feature)
     ) +
     deseq_themes() + ylim(c(0,20))
 
-# Vulcano plot: Adult vs Fetal BM-NK cluster 2, DEGs
-ggplot_AdultvsFetal_c3 <- ggplot(data = deseq_results_AdultvsFetal_transf_c3) +
+# Vulcano plot: Adult vs toddler BM-NK cluster 3, DEGs
+ggplot_Adultvstoddler_c3 <- ggplot(data = deseq_results_Adultvstoddler_transf_c3) +
     geom_point(aes(x = log2FoldChange, y = log_padj), na.rm = TRUE) +
     geom_point(
         data = filter(
-            .data = deseq_results_AdultvsFetal_transf_c3,
+            .data = deseq_results_Adultvstoddler_transf_c3,
             abs(.data$log2FoldChange) > 1, .data$padj < 0.05
         ),
         aes(x = log2FoldChange, y = log_padj), color = "red"
     ) +
     geom_label(
         data = filter(
-            .data = deseq_results_AdultvsFetal_transf_c3,
+            .data = deseq_results_Adultvstoddler_transf_c3,
             abs(.data$log2FoldChange) > 1, .data$padj < 0.01
         ),
         aes(x = log2FoldChange + 0.5, y = log_padj + 5, label = feature)
     ) +
     deseq_themes() + ylim(c(0,20))
 
-# Vulcano plot: Adult vs Fetal BM-NK cluster 2, DEGs
-ggplot_AdultvsFetal_c4 <- ggplot(data = deseq_results_AdultvsFetal_transf_c4) +
+# Vulcano plot: Adult vs toddler BM-NK cluster 4, DEGs
+ggplot_Adultvstoddler_c4 <- ggplot(data = deseq_results_Adultvstoddler_transf_c4) +
     geom_point(aes(x = log2FoldChange, y = log_padj), na.rm = TRUE) +
     geom_point(
         data = filter(
-            .data = deseq_results_AdultvsFetal_transf_c4,
+            .data = deseq_results_Adultvstoddler_transf_c4,
             abs(.data$log2FoldChange) > 1, .data$padj < 0.05
         ),
         aes(x = log2FoldChange, y = log_padj), color = "red"
     ) +
     geom_label(
         data = filter(
-            .data = deseq_results_AdultvsFetal_transf_c4,
+            .data = deseq_results_Adultvstoddler_transf_c4,
             abs(.data$log2FoldChange) > 1, .data$padj < 0.01
         ),
         aes(x = log2FoldChange + 0.5, y = log_padj + 5, label = feature)
     ) +
     deseq_themes() + ylim(c(0,20))
+```
 
-# Vulcano plot: ATRXmut vs Fetal BM-NK cluster 2, DEGs
-ggplot_ATRXvsFetal <- ggplot(data = deseq_results_ATRXvsFetal_transf) +
+```{r plots}
+ggplot_Adultvstoddler_c1
+ggplot_Adultvstoddler_c2
+ggplot_Adultvstoddler_c3
+ggplot_Adultvstoddler_c4
+```
+
+## ___ATRXmutated NB BM-NK vs. healthy toddler BM-NK___
+
+```{r}
+pos_val <- deseq_results_ATRXvstoddler_c2$baseMean > 0
+deseq_results_ATRXvstoddler_c2_posVal <- deseq_results_ATRXvstoddler_c2[pos_val,]
+
+deseq_results_ATRXvstoddler_c2_transf <- as.data.frame(deseq_results_ATRXvstoddler_c2_posVal) %>%
+    bind_cols(feature = rownames(deseq_results_ATRXvstoddler_c2_posVal)) %>%
+    mutate(log_padj = - log(.data$padj, base = 10))
+
+deseq_results_ATRXvstoddler_c2_signif <- 
+  deseq_results_ATRXvstoddler_c2_transf %>% 
+  filter(padj < 0.1)
+
+head(deseq_results_ATRXvstoddler_c2_signif,50)
+
+# Vulcano plot: ATRXmut vs toddler BM-NK cluster 2, DEGs
+ggplot_ATRXvstoddler_c2 <- ggplot(data = deseq_results_ATRXvstoddler_c2_transf) +
     geom_point(aes(x = log2FoldChange, y = log_padj), na.rm = TRUE) +
     geom_point(
         data = filter(
-            .data = deseq_results_ATRXvsFetal_transf,
+            .data = deseq_results_ATRXvstoddler_c2_transf,
             abs(.data$log2FoldChange) > 1, .data$padj < 0.05
         ),
         aes(x = log2FoldChange, y = log_padj), color = "red"
     ) +
     geom_label(
         data = filter(
-            .data = deseq_results_ATRXvsFetal_transf,
+            .data = deseq_results_ATRXvstoddler_c2_transf,
             abs(.data$log2FoldChange) > 1, .data$padj < 0.01
         ),
         aes(x = log2FoldChange + 0.5, y = log_padj + 5, label = feature)
     ) +
     deseq_themes() + ylim(c(0,5))
-
-# plots
-ggplot_AdultvsFetal_c1
-ggplot_AdultvsFetal_c2
-ggplot_AdultvsFetal_c3
-ggplot_AdultvsFetal_c4
-ggplot_ATRXvsFetal
 ```
 
-# ___Cluster markers in NB dataset on predicted NK sub-clusters___
-
-```{r cluster markers}
-# "healthy" fetal/toddler BM-NK cells
-
-library(DElegate)
-
-de_results <- DElegate::findDE(object = fetal_NK,
-                               group_column = "predicted_NK_type")
-marker_results <- DElegate::FindAllMarkers2(object = fetal_NK,
-                                            group_column = "predicted_NK_type")
-
-marker_results_top5 <- dplyr::filter(marker_results, feature_rank < 6)
-marker_results_top5
-
-marker_results %>%
-    group_by(group1) %>%
-    slice_max(n = 10, order_by = log_fc)
-
-marker_results %>%
-    group_by(group1) %>%
-    top_n(n = 10, wt = log_fc) -> top10
-
-DEG_tumor <- DoHeatmap(fetal_NK, 
-                       features = top10$feature) + NoLegend()
-DEG_tumor
+```{r plots - ATRX}
+ggplot_ATRXvstoddler_c2
 ```
-# ___Exploration of age and sex dependence in the data___
-
-```{r}
-# filter by unique sample ID
-library(dplyr) 
-unique.metadata <- fetahu2023.metadata %>% 
-  distinct(sample_ID,.keep_all = TRUE)
-
-# plot age distribution per comparison group
-ggplot(unique.metadata, aes(x = group, 
-               y = age_at_Dx_years, 
-               fill = group)) +
-  geom_boxplot()
-
-# input table
-input <- table(unique.metadata$group, unique.metadata$sex)
-input <- as.data.frame(input)
-colnames(input) <- c("group","sex","value")
-
-
-# plot sex distribution in the whole dataset
-ggplot(input, aes(x=sex,y=value,fill=sex)) +
-  geom_bar(stat = "identity") + 
-  theme_minimal() + 
-  scale_fill_manual(values=c("hotpink",
-                             "darkblue")) +
-  theme(text = element_text(size = 20, colour = "black"))
-
-# plot sex distribution per comparison group
-ggplot(input, aes(x=group,y=value,fill=sex)) +
-  geom_bar(stat = "identity", position = "dodge") + 
-  labs(title="Number of male/female donors per group") + 
-  theme_minimal() + 
-  scale_fill_manual(values=c("hotpink",
-                             "darkblue")) +
-  theme(text = element_text(size = 20, colour = "black"))
-
-```
-
-
-```{r fig.height=7, fig.width=7}
-canonical_NK_markers <- c("EOMES","ID2","TBX21")
-
-do_FeaturePlot(fetahu2023_NK, 
-               plot.title = "EOMES",
-               plot.subtitle = "gene expression in NK cells",
-               features = "EOMES",
-               reduction = "UMAP",
-               plot.axes = TRUE, 
-               pt.size = 0.5,
-               slot = "data",
-               assay = "RNA",
-               font.size = 18,
-               #order = TRUE
-               )
-do_FeaturePlot(fetahu2023_NK, 
-               plot.title = "ID2",
-               plot.subtitle = "gene expression in NK cells",
-               features = "ID2",
-               reduction = "UMAP",
-               plot.axes = TRUE, 
-               pt.size = 0.5,
-               slot = "data",
-               assay = "RNA",
-               font.size = 18,
-               #order = TRUE
-               )
-do_FeaturePlot(fetahu2023_NK, 
-               plot.title = "TBX21",
-               plot.subtitle = "gene expression in NK cells",
-               features = "TBX21",
-               reduction = "UMAP",
-               plot.axes = TRUE, 
-               pt.size = 0.5,
-               slot = "data",
-               assay = "RNA",
-               font.size = 18,
-               #order = TRUE
-               )
-do_FeaturePlot(fetahu2023_NK, 
-               plot.title = "NFIL3",
-               plot.subtitle = "gene expression in NK cells",
-               features = "NFIL3",
-               reduction = "UMAP",
-               plot.axes = TRUE, 
-               pt.size = 0.5,
-               slot = "data",
-               assay = "RNA",
-               font.size = 18,
-               #order = TRUE
-               )
-do_FeaturePlot(fetahu2023_NK, 
-               plot.title = "PLZF (ZBTB16)",
-               plot.subtitle = "gene expression in NK cells",
-               features = "ZBTB16",
-               reduction = "UMAP",
-               plot.axes = TRUE, 
-               pt.size = 0.5,
-               slot = "data",
-               assay = "RNA",
-               font.size = 18,
-               #order = TRUE
-               )
-
-canonical_NK_markers <- c("EOMES","ID2","TBX21")
-NK_cytotoxic_markers <- list(canonical_markers = c("EOMES","ID2","TBX21"),
-                             indirect = c("PRF1","GZMB"),
-                             #direct_R = c("TNFRSF10B","TNFSF6"),
-                             direct = c("TNFSF10","FASLG"),
-                             recruitment = c("IFNG","TNF"))
-
-
-do_DotPlot(fetahu2023_NK, 
-           features = NK_cytotoxic_markers, 
-           group.by = "predicted_NK_type", 
-           scale = TRUE,
-           dot.scale = 10,
-           font.size = 18,
-           number.breaks = 4,
-           use_viridis = TRUE,
-           viridis.palette = "A",
-           viridis.direction = -1, 
-           #sequential.palette = "PRGn",
-           #colors.use = COLOR_CODE_DOTPLOT
-           )
-
-do_DotPlot(fetahu2023_NK, 
-           features = NK_cytotoxic_markers, 
-           group.by = "group",
-           scale = TRUE,
-           dot.scale = 10)
-
-# NK cell killing occurs either via secretion of 
-# perforin-1 (PRF1 Gene) and granzyme B (GZMB gene) or 
-# direct cell-to-cell contact via death receptors TRAIL (TNFRSF10B gene) and  
-# FAS receptor (TNFSF6 gene). FAS ligand (FASLG gene); TRAIL ligand (TNFSF10 gene) 
-# or mediate cell killing by recruiting other immune cells via cytokine and
-# chemokine secretion, and induce cell death via Interferon-γ (IFNG gene) or  
-# TNF secretion
-
-```
-
 
 
 # ___Session Info___

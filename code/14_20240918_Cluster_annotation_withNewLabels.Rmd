@@ -1,0 +1,414 @@
+---
+title: "NK project: Cluster annotation"
+author: "Dr. Sara Wernig-Zorc"
+date: "18.09.2024 - 20.09.2024"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  input_BM1: "/home/rstudio/mnt_data/BM/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"
+  input_BM2: "/home/rstudio/mnt_data/BM/yang2019/Rds/Human_BM_NK_seurat_v4.Rds"
+  input_BM3: "/home/rstudio/mnt_data/BM/Lee/disco_bone_marrow_v2.0.rds"
+  input_scRNA: "/home/rstudio/mnt_out/scRNA-seq_stage_M/results/published/data/rna_decontaminated.rds"
+  out: "/home/rstudio/mnt_out/NK_project/"
+  GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
+  markers: "/home/rstudio/mnt_resources/MES_ADRN/"
+  metadata: "/home/rstudio/scRNA.NB.integration/metadata/"
+---
+
+PROJECT DESCRIPTION
+
+Identify NK sub-populations in tumor-infiltrated bone marrow samples from
+Neuroblastoma patients.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 20)
+options(future.globals.maxSize = 8 * 10^9)
+
+print(params)
+
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_setup.R")
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_utils.R")
+
+library(EnhancedVolcano)
+```
+
+# ___Load data___
+
+## ___NB BM-derived NK cells___
+
+```{r}
+predicted_labels <- readRDS(paste0(params$out,
+                                   "/Rds/fetahu2023_predicted_NKclusters_from_Crinier2021_de.n=350.Rds"))
+ALL_NK <- readRDS(paste0(params$out,
+                         "/Rds/fetahu2023_NK_subclusters_from_Crinier2021_de.n=350.Rds"))
+
+ALL_NK <- ALL_NK %>% 
+  NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000) %>% ScaleData()
+
+# Reorder the levels of the group-by column based
+ALL_NK$group.y <- factor(ALL_NK$group.y,
+                         levels = c("control",
+                                    "ATRXdel",
+                                    "MNA",
+                                    "sporadic"))
+
+# Reorder the levels of the NK subset annotation column
+ALL_NK$predicted_NK_type_de.n350 <- factor(ALL_NK$predicted_NK_type_de.n350,
+                         levels = c("hNK_Bm1",
+                                    "hNK_Bm2",
+                                    "hNK_Bm3",
+                                    "hNK_Bm4"))
+```
+
+```{r}
+Idents(ALL_NK) <- ALL_NK@meta.data$group.y
+
+# identify cell IDs associated with each cluster
+M <- WhichCells(ALL_NK, ident = "MNA")
+S <- WhichCells(ALL_NK, ident = "sporadic")
+C <- WhichCells(ALL_NK, ident = "control")
+A <- WhichCells(ALL_NK, ident = "ATRXdel")
+
+ALL_NK@active.ident <- ALL_NK$orig.ident
+
+# re-label the NK cells to the corresponding predicted sub-clusters 
+Idents(object = ALL_NK, cells = M) <- "ATRXwt"
+Idents(object = ALL_NK, cells = S) <- "ATRXwt"
+Idents(object = ALL_NK, cells = A) <- "ATRXmut"
+Idents(object = ALL_NK, cells = C) <- "CTRL"
+
+# Add active identities to metadata column comparison_group
+ALL_NK$comparison_group <- ALL_NK@active.ident
+```
+
+# ___NK type gene signatures in NB BM-NK cells___
+
+Gene lists as defined in Yang at al., 2019
+
+```{r}
+length(yang2019_clust$gene)
+
+yang2019_clust_filt <- filter(yang2019_clust, 
+                              avg_logFC > 0.1) 
+
+yang2019_clust1 <- filter(yang2019_clust_filt, 
+                          cluster == "1") 
+yang2019_clust2 <- filter(yang2019_clust_filt, 
+                          cluster == "2") 
+yang2019_clust3 <- filter(yang2019_clust_filt, 
+                          cluster == "3") 
+yang2019_clust4 <- filter(yang2019_clust_filt, 
+                          cluster == "4") 
+yang2019_clust5 <- filter(yang2019_clust_filt, 
+                          cluster == "5") 
+yang2019_clust6 <- filter(yang2019_clust_filt, 
+                          cluster == "6")
+yang2019_clust7 <- filter(yang2019_clust_filt, 
+                          cluster == "7") 
+```
+
+
+```{r}
+# extract counts
+counts <- LayerData(ALL_NK, assay="RNA", layer='data')
+var_genes <- dimnames(counts)[[1]]
+
+# remove genes not present in dataset
+yang2019_cluster_01 <- intersect(yang2019_clust1$gene, var_genes)
+print("Number of genes in the yang2019_clust1 gene list: ")
+length(yang2019_cluster_01)
+
+yang2019_cluster_02 <- intersect(yang2019_clust2$gene, var_genes)
+print("Number of genes in the yang2019_clust2 gene list: ")
+length(yang2019_cluster_02)
+
+yang2019_cluster_03 <- intersect(yang2019_clust3$gene, var_genes)
+print("Number of genes in the yang2019_clust3 gene list: ")
+length(yang2019_cluster_03)
+
+yang2019_cluster_04 <- intersect(yang2019_clust4$gene, var_genes)
+print("Number of genes in the yang2019_clust4 gene list: ")
+length(yang2019_cluster_04)
+
+yang2019_cluster_05 <- intersect(yang2019_clust5$gene, var_genes)
+print("Number of genes in the yang2019_clust5 gene list: ")
+length(yang2019_cluster_05)
+
+yang2019_cluster_06 <- intersect(yang2019_clust6$gene, var_genes)
+print("Number of genes in the yang2019_clust6 gene list: ")
+length(yang2019_cluster_06)
+
+yang2019_cluster_07 <- intersect(yang2019_clust7$gene, var_genes)
+print("Number of genes in the yang2019_clust7 gene list: ")
+length(yang2019_cluster_07)
+```
+
+## ___Calculate module scores___
+
+```{r}
+# remove previously calculated module scores
+metadata <- ALL_NK@meta.data
+cols_to_remove <- grep("module", colnames(metadata), value = TRUE)
+ALL_NK@meta.data <- metadata[, !colnames(metadata) %in% cols_to_remove]
+
+head(ALL_NK@meta.data)
+```
+
+```{r}
+ALL_NK <- AddModuleScore(object = ALL_NK,
+                         ctrl = 140,
+                         features = yang2019_cluster_01,
+                         name = "yang2019_cluster_01_",
+                         seed = 2805)
+
+ALL_NK <- AddModuleScore(object = ALL_NK,
+                         ctrl = 5,
+                         features = yang2019_cluster_02,
+                         name = "yang2019_cluster_02_",
+                         seed = 2805)
+
+ALL_NK <- AddModuleScore(object = ALL_NK,
+                         ctrl = 50,
+                         features = yang2019_cluster_03,
+                         name = "yang2019_cluster_03_",
+                         seed = 2805)
+
+ALL_NK <- AddModuleScore(object = ALL_NK,
+                         ctrl = 5,
+                         features = yang2019_cluster_04,
+                         name = "yang2019_cluster_04_",
+                         seed = 2805)
+
+ALL_NK <- AddModuleScore(object = ALL_NK,
+                         ctrl = 140,
+                         features = yang2019_cluster_05,
+                         name = "yang2019_cluster_05_",
+                         seed = 2805)
+
+ALL_NK <- AddModuleScore(object = ALL_NK,
+                         ctrl = 50, 
+                         features = yang2019_cluster_06,
+                         name = "yang2019_cluster_06_",
+                         seed = 2805)
+
+ALL_NK <- AddModuleScore(object = ALL_NK,
+                         ctrl = 50, 
+                         features = yang2019_cluster_07,
+                         name = "yang2019_cluster_07_",
+                         seed = 2805)
+```
+
+## ___Plot module scores___
+
+```{r fig.height=6.1, fig.width=7}
+do_DotPlot(sample = ALL_NK, 
+           axis.text.x.angle = 0,
+           features = "yang2019_cluster_01_1",
+           plot.title = "Yang et al., 2019",
+           plot.subtitle = "Cluster 1 gene module scores",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "predicted_NK_type_de.n350",
+           use_viridis = TRUE,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 22,
+           dot.scale = 30,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Module score")
+
+do_DotPlot(sample = ALL_NK, 
+           axis.text.x.angle = 0,
+           features = "yang2019_cluster_02_1",
+           plot.title = "Yang et al., 2019",
+           plot.subtitle = "Cluster 2 gene module scores",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "predicted_NK_type_de.n350",
+           use_viridis = TRUE,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 22,
+           dot.scale = 30,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Module score")
+
+do_DotPlot(sample = ALL_NK, 
+           axis.text.x.angle = 0,
+           features = "yang2019_cluster_03_1",
+           plot.title = "Yang et al., 2019",
+           plot.subtitle = "Cluster 3 gene module scores",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "predicted_NK_type_de.n350",
+           use_viridis = TRUE,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 22,
+           dot.scale = 30,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Module score")
+
+do_DotPlot(sample = ALL_NK, 
+           axis.text.x.angle = 0,
+           features = "yang2019_cluster_04_1",
+           plot.title = "Yang et al., 2019",
+           plot.subtitle = "Cluster 4 gene module scores",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "predicted_NK_type_de.n350",
+           use_viridis = TRUE,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 22,
+           dot.scale = 30,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Module score")
+
+
+do_DotPlot(sample = ALL_NK, 
+           axis.text.x.angle = 0,
+           features = "yang2019_cluster_05_1",
+           plot.title = "Yang et al., 2019",
+           plot.subtitle = "Cluster 5 gene module scores",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "predicted_NK_type_de.n350",
+           use_viridis = TRUE,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 22,
+           dot.scale = 30,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Module score")
+
+do_DotPlot(sample = ALL_NK, 
+           axis.text.x.angle = 0,
+           features = "yang2019_cluster_06_1",
+           plot.title = "Yang et al., 2019",
+           plot.subtitle = "Cluster 6 gene module scores",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "predicted_NK_type_de.n350",
+           use_viridis = TRUE,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 22,
+           dot.scale = 30,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Module score")
+
+do_DotPlot(sample = ALL_NK, 
+           axis.text.x.angle = 0,
+           features = "yang2019_cluster_07_1",
+           plot.title = "Yang et al., 2019",
+           plot.subtitle = "Cluster 7 gene module scores",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "predicted_NK_type_de.n350",
+           use_viridis = TRUE,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 22,
+           dot.scale = 30,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Module score")
+```
+
+```{r}
+VlnPlot(ALL_NK,
+        features = "yang2019_cluster_07_1", 
+        group.by = "group.y", 
+        split.by = "predicted_NK_type_de.n350",
+        cols = COLOR_CODE_v2)
+
+VlnPlot(ALL_NK,
+        features = "yang2019_cluster_02_1", 
+        group.by = "group.y", 
+        split.by = "predicted_NK_type_de.n350",
+        cols = COLOR_CODE_v2)
+
+VlnPlot(ALL_NK,
+        features = "yang2019_cluster_03_1", 
+        group.by = "group.y", 
+        split.by = "predicted_NK_type_de.n350",
+        cols = COLOR_CODE_v2)
+
+VlnPlot(ALL_NK,
+        features = "yang2019_cluster_04_1", 
+        group.by = "group.y", 
+        split.by = "predicted_NK_type_de.n350",
+        cols = COLOR_CODE_v2)
+
+VlnPlot(ALL_NK,
+        features = "yang2019_cluster_05_1", 
+        group.by = "group.y", 
+        split.by = "predicted_NK_type_de.n350",
+        cols = COLOR_CODE_v2)
+
+VlnPlot(ALL_NK,
+        features = "yang2019_cluster_06_1", 
+        group.by = "group.y", 
+        split.by = "predicted_NK_type_de.n350",
+        cols = COLOR_CODE_v2,
+        y.max = 0.2)
+
+VlnPlot(ALL_NK,
+        features = "yang2019_cluster_07_1", 
+        group.by = "group.y", 
+        split.by = "predicted_NK_type_de.n350",
+        cols = COLOR_CODE_v2,
+        y.max = 3)
+```
+
+-------------------------------------------------------------------------------
+
+My intepretation: 
+<br>
+<br>
+- Cluster Bm_hNK1 maps to Active and Mature NK cells
+<br>
+<br>
+- Cluster Bm_hNK2 maps to CD56 bright, Transitional NK cells, 
+<br>
+with a sub-population mapping to active and Inflammed NK cells
+<br>
+<br>
+- Cluster Bm_hNK3 (similar to Bm_hNK2) maps to CD56 bright, Transitional NK cells,
+<br>
+with a sub-population mapping to Inflammed NK cells [but not active NK cells as in cluster Bm_hNK2]
+<br>
+<br>
+- Cluster Bm_hNK4 maps to Adaptive, mature, terminal and inflammed NK cells
+<br>
+
+-------------------------------------------------------------------------------
+
+# ___Session Info___
+
+```{r}
+sessionInfo()
+```
