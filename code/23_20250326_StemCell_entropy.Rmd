@@ -1,0 +1,176 @@
+---
+title: "NK project: Entropy calculations"
+author: "Dr. Sara Wernig-Zorc"
+date: "`r format(Sys.time(), '%B %Y')`"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  input_BM1: "/home/rstudio/mnt_data/CancReg/BM/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"
+  input_BM2: "/home/rstudio/mnt_data/CancReg/BM/yang2019/Rds/Human_BM_NK_seurat_v4.Rds"
+  input_BM3: "/home/rstudio/mnt_data/CancReg/BM/Lee/disco_bone_marrow_v2.0.rds"
+  input_scRNA: "/home/rstudio/mnt_out/NK_project/Rds/fetahu2023_withNewMetadata.Rds"
+  input_NK: "/home/rstudio/mnt_out/NK_project/Rds/ALL_NK_cluster_withNewMetadata.Rds"
+  out: "/home/rstudio/mnt_out/NK_project/"
+  GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
+  markers: "/home/rstudio/mnt_resources/MES_ADRN/"
+  metadata: "/home/rstudio/mnt_out/CancReg/scRNA-seq_stage_M/results/metadata/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 80)
+options(future.globals.maxSize = 80 * 10^9)
+options(Seurat.object.assay.version = "v5")
+print(params)
+```
+
+```{r load project specific R packages and color code}
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_setup.R")
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_utils.R")
+```
+
+# ___Input_data___
+
+```{r}
+#fetahu2023 <- readRDS(file = params$input_scRNA)
+ALL_NK <-  readRDS(file = params$input_NK)
+```
+
+```{r}
+library(LandSCENT)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+```
+
+# ___1. Preprocessing___
+
+```{r}
+# extract log-normalized count matrix
+ALL_NK_mat <- GetAssayData(ALL_NK, 
+                        assay = "RNA", 
+                        slot = "counts") # extract raw counts
+
+# landSCENT expects genes as rows and cells as columns
+count_matrix <- as.matrix(ALL_NK_mat)
+gene_symbols <- rownames(count_matrix)
+
+gene_annot_vector <- mapIds(org.Hs.eg.db,
+                            keys = gene_symbols,
+                            column = "ENTREZID",
+                            keytype = "SYMBOL",
+                            multiVals = "first")
+
+# Check how many genes were successfully mapped
+print(paste("Number of genes originally:", length(gene_symbols)))
+print(paste("Number of genes mapped to Entrez IDs:", sum(!is.na(gene_annot_vector))))
+print(paste("Number of genes NOT mapped:", sum(is.na(gene_annot_vector))))
+
+# Filter the count matrix and annotation vector to include only genes with Entrez IDs
+valid_genes_mask <- !is.na(gene_annot_vector)
+count_matrix_filtered <- count_matrix[valid_genes_mask, ]
+gene_annot_vector_filtered <- gene_annot_vector[valid_genes_mask]
+
+# Double-check dimensions
+print(paste("Dimensions of filtered count matrix:", 
+            dim(count_matrix_filtered)[1], "genes x", 
+            dim(count_matrix_filtered)[2], "cells"))
+```
+
+```{r}
+entrez_ids <- gene_annot_vector[valid_genes_mask]
+rownames(count_matrix_filtered) <- entrez_ids
+```
+
+```{r}
+# We need to add an offset value of 1.1 before log-transformation!!
+# The offset is added in order to ensure that the minimum value after log-transformation would not be 0, but a nonzero value (typically log2(1.1)~0.14).
+# We do not want zeroes in our final matrix since the computation of signaling entropy rate involves ratios of gene expression values and zeros in the denominator are undefined
+
+# Add offset of 1.1 and apply log2 transformation
+mat <- count_matrix_filtered + 1.1
+
+# log transform
+log_mat <- log2(mat)
+
+# minimal expression value should be above 0.1 !
+min(log_mat)
+```
+```{r}
+# Entrez IDs in character format
+rownames(log_mat) <- as.character(rownames(log_mat))
+```
+
+
+# ___2. Integration of scRNA-seq data with a gene functional network___
+
+```{r}
+rna_gene_network <- DoIntegPPI(exp.m = log_mat, 
+                               ppiA.m = net13Jun12.m)  # or the newer version net17Jan2016.m
+str(rna_gene_network)
+```
+
+# ___3. Calculating the signalling entropy rate___
+
+In order to approximate the differentiation potency of single cells
+
+```{r}
+signalling_entropy <- CompSRana(rna_gene_network, 
+                                local = TRUE, 
+                                mc.cores = 20)
+
+# The output argument SR.o is a list that added four elements onto the input rna_gene_network:
+# SR: the SR value of the cells.
+# inv: a matrix specifying the invariant measures, or steady-state probabilities, for each cell/sample over the network. That is, each column labels a cell/sample and is of length equal to the number of nodes in the adjMC matrix, with its entries adding to 1.
+# s: a matrix containing the unnormalized local signaling entropies, and therefore row number equals to the number of nodes in the adjMC matrix, column number equals to cell number.
+# ns: if local=TRUE, a matrix containing normalized local signaling entropies.
+
+# Add metadata for grouping (e.g., predicted_NK_type)
+cell_metadata <- ALL_NK@meta.data
+group_vector <- ALL_NK@meta.data$predicted_NK_type_de.n350
+group_vector <- ALL_NK@meta.data$NK_subtype_per_group
+names(group_vector) <- rownames(cell_metadata)
+names(group_vector)  <- as.character(names(group_vector))
+names(signalling_entropy$SR) <- names(group_vector) # ideally the signalling_entropy$SR object would already contain the cell IDs - NOT SURE WHY IT DOESN'T
+
+# remove cells with NULL SR value (these might be cells with low read counts,
+# or no reads for genese which are included in the gene network etc.
+filter_NULL <- signalling_entropy$SR != "NULL"
+filtered_values <- signalling_entropy$SR[filter_NULL]
+
+# Match ordering
+group_vector <- group_vector[names(filtered_values)]
+
+boxplot(unlist(filtered_values) ~ group_vector,  
+        main = "SR values against NK cell clusters", 
+        xlab = "NK-cell clusters", 
+        ylab = "SR values")
+
+saveRDS(signalling_entropy, 
+        file = paste0(params$out,"Rds/NK_cells_signalling_entropy.Rds"))
+```
+
+# ___4. Infer the potency states in a cell population____
+
+```{r}
+# filter based on cells / values in filtered_values
+
+infer_potency <- InferPotency(filtered_values, pheno.v = group_vector)
+infer_potency <- InferPotency(signalling_entropy)
+
+
+```
+

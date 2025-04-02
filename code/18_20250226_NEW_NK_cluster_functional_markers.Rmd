@@ -1,0 +1,584 @@
+---
+title: "NK project: Functional markers"
+author: "Dr. Sara Wernig-Zorc"
+date: "`r format(Sys.time(), '%B %Y')`"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  input_BM1: "/home/rstudio/mnt_data/BM/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"
+  input_BM2: "/home/rstudio/mnt_data/BM/yang2019/Rds/Human_BM_NK_seurat_v4.Rds"
+  input_BM3: "/home/rstudio/mnt_data/BM/Lee/disco_bone_marrow_v2.0.rds"
+  input_scRNA: "/home/rstudio/mnt_out/scRNA-seq_stage_M/results/published/data/rna_decontaminated.rds"
+  out: "/home/rstudio/mnt_out/NK_project/"
+  GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
+  markers: "/home/rstudio/mnt_resources/MES_ADRN/"
+  metadata: "/home/rstudio/scRNA.scATAC/metadata/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 20)
+options(future.globals.maxSize = 8 * 10^9)
+
+print(params)
+```
+
+```{r load project specific R packages and color code}
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_setup.R")
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_utils.R")
+```
+
+# ___Load data I___
+
+```{r}
+fetahu2023 <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_withNewMetadata.Rds"))
+predicted_labels <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_predicted_NKclusters_from_Crinier2021_de.n=350.Rds"))
+ALL_NK <- readRDS(file = paste0(params$out,"/Rds/ALL_NK_cluster_withNewMetadata.Rds"))
+```
+
+
+## ___some processing___
+
+```{r eval=FALSE, include=FALSE}
+Idents(ALL_NK) <- ALL_NK$genetic_subtype
+levels(Idents(ALL_NK))
+
+# subset scRNA-seq data 
+## ATRX
+ATRX_NK <- subset(ALL_NK, 
+                   idents = "ATRXm", 
+                   invert = FALSE)
+
+## MNA
+MNA_NK <- subset(ALL_NK, 
+                   idents = "MYCNamp", 
+                   invert = FALSE)
+
+## ATRXwtMYCNwt
+sporadic_NK <- subset(ALL_NK, 
+                   idents = "ATRXwtMYCNwt", 
+                   invert = FALSE)
+
+## control
+CTRL_NK <- subset(ALL_NK, 
+                   idents = "control", 
+                   invert = FALSE)
+```
+
+```{r eval=FALSE, include=FALSE}
+ALL_NK <- ALL_NK %>% NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000) %>% ScaleData()
+CTRL_NK <- CTRL_NK %>% NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000) %>% ScaleData()
+MNA_NK <- MNA_NK %>% NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000) %>% ScaleData()
+ATRX_NK <- ATRX_NK %>% NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000) %>% ScaleData()
+sporadic_NK <- sporadic_NK %>% NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000) %>% ScaleData()
+```
+
+```{r eval=FALSE, include=FALSE}
+saveRDS(ATRX_NK, 
+        file = paste0(params$out,"/Rds/fetahu2023_ATRXmut_BM_NK.Rds"))
+saveRDS(sporadic_NK, 
+        file = paste0(params$out,"/Rds/fetahu2023_sporadic_BM_NK.Rds"))
+saveRDS(CTRL_NK, 
+        file = paste0(params$out,"/Rds/fetahu2023_fetal_BM_NK.Rds"))
+saveRDS(MNA_NK, 
+        file = paste0(params$out,"/Rds/fetahu2023_MNA_BM_NK.Rds"))
+```
+
+# ___Load data II___
+
+```{r}
+CTRL_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_fetal_BM_NK.Rds"))
+MNA_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_MNA_BM_NK.Rds"))
+ATRX_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_ATRXmut_BM_NK.Rds"))
+sporadic_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_sporadic_BM_NK.Rds"))
+```
+
+```{r eval=FALSE, include=FALSE}
+Idents(ATRX_NK) <- ATRX_NK$predicted_NK_type_de.n350
+table(ATRX_NK$predicted_NK_type_de.n350)
+
+clusters_of_interest <- c("hNK_Bm2","hNK_Bm3")
+
+# subset to hNK_Bm2 & hNK_Bm3 only !
+ATRX_NK_sub <- subset(ATRX_NK, 
+                   idents = clusters_of_interest, 
+                   invert = FALSE)
+
+ATRX_NK_sub <- ATRX_NK_sub %>% NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000) %>% ScaleData()
+```
+
+```{r eval=FALSE, include=FALSE}
+saveRDS(ATRX_NK_sub, 
+        file = paste0(params$out,"/Rds/fetahu2023_ATRXmut_BM_NK_subset_hNK_Bm2_3.Rds"))
+```
+
+
+```{r}
+ATRX_NK_sub <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_ATRXmut_BM_NK_subset_hNK_Bm2_3.Rds"))
+```
+
+
+# ___NK Cluster markers in the NB dataset___
+
+```{r cluster markers: CTRL}
+de_results <- DElegate::findDE(object = CTRL_NK,
+                               group_column = "predicted_NK_type_de.n350",
+                               replicate_column = "sample")
+
+marker_results <- DElegate::FindAllMarkers2(object = CTRL_NK,
+                                            group_column = "predicted_NK_type_de.n350",
+                                            replicate_column = "sample")
+
+marker_results %>%
+    group_by(group1) %>%
+    top_n(n = 10, wt = log_fc) -> top10
+
+signif_DEGs <- top10 %>% filter(padj < 0.05)
+
+# TOP 10 markers per cluster 
+DEG_tumor <- DoHeatmap(CTRL_NK, group.by = "predicted_NK_type_de.n350",
+                       features = signif_DEGs$feature) + NoLegend()
+DEG_tumor
+
+do_DotPlot(CTRL_NK,
+           features = signif_DEGs$feature, 
+           group.by = "predicted_NK_type_de.n350", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "CTRL"
+           )
+
+signif_DEGs_hNK_Bm1 <- top10 %>% filter(group1 == "hNK_Bm1")
+signif_DEGs_hNK_Bm2 <- top10 %>% filter(group1 == "hNK_Bm2")
+signif_DEGs_hNK_Bm3 <- top10 %>% filter(group1 == "hNK_Bm3")
+signif_DEGs_hNK_Bm4 <- top10 %>% filter(group1 == "hNK_Bm4")
+```
+
+hNK_Bm1: SPON2+, CX3CR1+, CXCR2+ NK cells = Cytotoxic, inflammatory, tissue-resident NK cells	- typically found in peripheral tissues or inflamed sites - Function: High cytotoxicity, tissue adaptation
+hNK_Bm2: TOX2+, CXCR6+, XCL1+ NK cells = Activated, effector, and exhausted-like NK cells - typically fopund in tumor microenvironment, chronic infections - Function: Effector function, but signs of exhaustion
+hNK_Bm3: SELL+, CCR7+, IFIT3+ NK cells = Circulating, naïve/memory-like, and antiviral NK cells - typically found in blood, lymphoid tissues - Function: Naïve or memory-like, migratory, antiviral response
+hNK_Bm4: B3GAT1+, GPR27+, SLC1A7+ NK cells =	Metabolically adapted, tissue-resident, suppressive NK cells - typically found in specialized tissues (brain, tumor niches) - Function:	Long-lived, stress-adapted, immune regulation
+
+
+Now let's look at ATRXm samples and how do those differ (we have mainly hNK_Bm2
+and hNK_Bm3 NK cells here so i will focus on those):
+
+```{r cluster markers: ATRX}
+de_results <- DElegate::findDE(object = ATRX_NK,
+                               group_column = "predicted_NK_type_de.n350",
+                               replicate_column = "sample")
+
+marker_results <- DElegate::FindAllMarkers2(object = ATRX_NK,
+                                            group_column = "predicted_NK_type_de.n350",
+                                            replicate_column = "sample")
+
+marker_results %>%
+    group_by(group1) %>%
+    top_n(n = 10, wt = log_fc) -> top10
+
+signif_DEGs <- top10 %>% filter(padj < 0.05)
+
+# TOP 10 markers per cluster 
+DEG_tumor <- DoHeatmap(ATRX_NK, group.by = "predicted_NK_type_de.n350",
+                       features = signif_DEGs$feature) + NoLegend()
+DEG_tumor
+
+do_DotPlot(ATRX_NK,
+           features = signif_DEGs$feature, 
+           group.by = "predicted_NK_type_de.n350", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "ATRXm"
+           )
+# should we remove cluster 1 and 4 when plotting dotplots of ATRXm samples?
+# since we have only few cells mapping to clusters 1 and 4, they tend to
+# give a wrong impression
+
+signif_DEGs_hNK_Bm2 <- signif_DEGs %>% filter(group1  == "hNK_Bm2")
+signif_DEGs_hNK_Bm3 <- signif_DEGs %>% filter(group1  == "hNK_Bm3")
+
+print(signif_DEGs_hNK_Bm2$feature)
+print(signif_DEGs_hNK_Bm3$feature)
+
+```
+
+In Rebuffet et al., 2024 (Eric Vivier lab), they defined these genes as markers of
+NK cytotoxicity: GZMB and PRF1, and markers of NK cell maturity: CD160, CD247, 
+ADGRG1, NKG7, FCER1G, LAIR2, SPON2, CLIC3 and CHST2 
+
+If we look at the genes that are differentially expressed in NK cluster 2 and 3,
+compared to all other clusters:
+
+hNK_Bm3: FGFBP2+, GZMB+, FCGR3A+ NK cells = tumor-infiltrating cytotoxic NK cells;
+are highly cytotoxic NK cells, likely involved in direct tumor killing. 
+Their strong ADCC function suggests they are effector cells involved in rapid immune responses.
+
+hNK_Bm2: ID3+, LTB+, CD28+ NK cells = resident, adaptive-like NK cells involved in immune surveillance. They appear more memory-like, tissue-adapted, and immune-regulatory. 
+Their expression of ID3, CD28, and TNFSF8 suggests they could be long-lived, 
+adaptive-like NK cells that respond to persistent stimuli, such as chronic inflammation 
+or tumor microenvironment. They might be quiescent, metabolically flexible NK population 
+capable of responding to chronic immune challenges rather than acting as immediate cytotoxic effectors,
+as as hNK_Bm3 NK cluster.
+
+
+# ___Exploration of age and sex dependence in the data___
+
+```{r}
+full_metadata <- read.csv(paste0(params$metadata,
+  "2024-10-04_Fetahu_complete_single_cell_cohort_EB_FINAL_Rimport.csv"), 
+  sep = ";")
+
+
+# filter by unique sample ID
+unique.metadata <- full_metadata %>% 
+  distinct(BM_ID,.keep_all = TRUE)
+
+unique.metadata <- as.data.frame(unique.metadata)
+
+# plot age distribution per comparison group
+ggplot(unique.metadata, aes(x = genetic_subtype, 
+               y = age_at_Dx_months, 
+               fill = genetic_subtype)) +
+  geom_boxplot()
+
+# input table
+input <- table(unique.metadata$genetic_subtype, 
+               unique.metadata$sex,
+               unique.metadata$stage)
+input <- as.data.frame(input)
+colnames(input) <- c("group","sex","stage","value")
+
+
+# plot sex distribution in the whole dataset
+ggplot(input, aes(x=sex,y=value,fill=sex)) +
+  geom_bar(stat = "identity") + 
+  theme_minimal() + 
+  scale_fill_manual(values=c("hotpink",
+                             "darkblue")) +
+  theme(text = element_text(size = 20, colour = "black"))
+
+# plot sex distribution per comparison group
+ggplot(input, aes(x=group,y=value,fill=sex)) +
+  geom_bar(stat = "identity", position = "dodge") + 
+  labs(title="Number of male/female donors per group") + 
+  theme_minimal() + 
+  scale_fill_manual(values=c("hotpink",
+                             "darkblue")) +
+  theme(text = element_text(size = 20, colour = "black"))
+
+```
+
+Since in ATRXm samples, only 30 cells map to the NK clusters 1 or 4, 
+i removed those from downstream analysis (below)
+
+# ___NK functional markers___
+
+NK cell killing occurs either via secretion of perforin-1 (PRF1 Gene) and 
+granzyme B (GZMB gene) or direct cell-to-cell contact via death receptors 
+TRAIL (TNFRSF10B gene) and FAS receptor (TNFSF6 gene). FAS ligand (FASLG gene);
+TRAIL ligand (TNFSF10 gene) or mediate cell killing by recruiting other immune 
+cells via cytokine and chemokine secretion, and induce cell death via 
+Interferon-γ (IFNG gene) or TNF secretion
+
+## ___Canonical NK markers___
+
+### ___ALL___
+
+#### ___Dotplot___
+
+```{r fig.height=7.9, fig.width=11.38}
+do_DotPlot(ALL_NK, 
+           features = NK_functional_markers, 
+           group.by = "group_per_NK_subtype", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "ALL"
+           )
+```
+
+### ___ATRX clusters 2&3 only___
+
+```{r}
+do_DotPlot(ATRX_NK_sub, 
+           features = NK_functional_markers, 
+           group.by = "predicted_NK_type_de.n350", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1,
+           plot.title = "ATRX"
+           )
+```
+
+## ___NK TFs___
+
+### ___ALL___
+
+```{r fig.height=7.9, fig.width=11.38}
+do_DotPlot(ALL_NK, 
+           features = TFs, 
+           group.by = "group_per_NK_subtype",
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1,
+           plot.title = "ALL",
+           legend.title = "Scaled expression"
+           )
+```
+
+### ___ATRX clusters 2&3 only___
+
+```{r fig.height=5, fig.width=8}
+do_DotPlot(ATRX_NK_sub,
+           features = TFs, 
+           group.by = "predicted_NK_type_de.n350", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1,
+           plot.title = "ATRX",
+           legend.title = "Scaled expression"
+           )
+```
+
+## ___NK cytokines___
+
+### ___ALL___
+
+```{r fig.height=7.9, fig.width=11.38}
+do_DotPlot(ALL_NK, 
+           features = cytokines, 
+           group.by = "group_per_NK_subtype",
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "ALL cytokines",
+           legend.title = "Scaled expression",
+           cluster = FALSE
+           )
+```
+
+### ___ATRX clusters 2&3 only___
+
+```{r}
+do_DotPlot(ATRX_NK_sub, 
+           features = cytokines, 
+           group.by = "predicted_NK_type_de.n350", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "Cytokines",
+           plot.subtitle = "ATRX",
+           legend.title = "Scaled expression",
+           cluster = FALSE
+           )
+```
+
+## ___NK maturation genes___
+
+### ___ALL___
+
+```{r fig.height=7.9, fig.width=11.38}
+do_DotPlot(ALL_NK, 
+           features = NK_maturation_genes, 
+           group.by = "group_per_NK_subtype", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "NK maturation genes",
+           plot.subtitle = "ALL",
+           legend.title = "Scaled expression",
+           cluster = FALSE
+           )
+```
+
+### ___ATRX clusters 2&3 only___
+
+```{r}
+do_DotPlot(ATRX_NK_sub, 
+           features = NK_maturation_genes, 
+           group.by = "predicted_NK_type_de.n350", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "NK maturation genes",
+           plot.subtitle = "ATRX",
+           legend.title = "Scaled expression",
+           cluster = FALSE
+           )
+```
+
+## ___NK subtype genes___
+
+hNK_Bm2 subset was characterized by higher levels of CD122, CD27, and CD69, 
+whereas hNK_Bm3 cells had higher levels of CD127.
+
+Bone marrow NK cells revealed that the expression of CD160 and CD52 (CAMPATH-1) 
+on the surface of CD56bright cells was mutually exclusive, further discriminating 
+between hNK_Bm2 and hNK_Bm3, respectively.
+
+IL2RB gene = CD122 protein
+NCAM1 gene = CD56 protein
+IL7R gene = CD127 protein
+FCGR3A gene = CD16 protein
+
+### ___Dotplot___
+
+#### ___ALL___
+
+```{r fig.height=7.9, fig.width=11.38}
+do_DotPlot(ALL_NK,
+           features = NK_functional_markers$NK_subtype_markers,
+           group.by = "group_per_NK_subtype", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           legend.title = "Scaled expression",
+           cluster = FALSE
+           )
+```
+
+### ___ATRX clusters 2&3 only___
+
+```{r}
+do_DotPlot(ATRX_NK_sub,
+           features = NK_functional_markers$NK_subtype_markers,
+           group.by = "predicted_NK_type_de.n350", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           legend.title = "Scaled expression",
+           cluster = FALSE
+           )
+```
+
+### ___Violinplot___
+
+#### ___ALL___
+
+```{r fig.height=12, fig.width=10}
+VlnPlot(ALL_NK,
+        features = NK_functional_markers$NK_subtype_markers,
+        log = FALSE,
+        layer = "data",
+        slot = "data")
+```
+
+#### ___ATRX clusters 2&3 only___
+
+```{r fig.height=12, fig.width=10}
+VlnPlot(ATRX_NK_sub,
+        features = NK_functional_markers$NK_subtype_markers,
+        group.by = "predicted_NK_type_de.n350",
+        log = FALSE,
+        layer = "data",
+        slot = "data")
+```
+
+#### ___MNA___
+
+```{r fig.height=12, fig.width=10}
+VlnPlot(MNA_NK,
+        features = NK_functional_markers$NK_subtype_markers,
+        group.by = "predicted_NK_type_de.n350",
+        log = FALSE,
+        layer = "data",
+        slot = "data")
+```
+
+#### ___CTRL___
+
+```{r fig.height=12, fig.width=10}
+VlnPlot(CTRL_NK,
+        features = NK_functional_markers$NK_subtype_markers,
+        group.by = "predicted_NK_type_de.n350",
+        log = FALSE,
+        layer = "data",
+        slot = "data")
+```
+
+#### ___Sporadic___
+
+```{r fig.height=12, fig.width=10}
+VlnPlot(sporadic_NK,
+        features = NK_functional_markers$NK_subtype_markers,
+        group.by = "predicted_NK_type_de.n350",
+        log = FALSE,
+        layer = "data",
+        slot = "data")
+```
+
+# ___Session Info___
+
+```{r}
+sessionInfo()
+```

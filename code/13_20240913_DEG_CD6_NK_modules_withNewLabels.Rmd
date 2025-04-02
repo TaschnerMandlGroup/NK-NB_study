@@ -41,8 +41,8 @@ options(future.globals.maxSize = 8 * 10^9)
 
 print(params)
 
-source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_setup.R")
-source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_utils.R")
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_setup.R")
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_utils.R")
 
 library(EnhancedVolcano)
 ```
@@ -76,7 +76,7 @@ ALL_NK$predicted_NK_type_de.n350 <- factor(ALL_NK$predicted_NK_type_de.n350,
                                     "hNK_Bm4"))
 ```
 
-```{r}
+```{r eval=FALSE, include=FALSE}
 Idents(ALL_NK) <- ALL_NK@meta.data$group.y
 
 # identify cell IDs associated with each cluster
@@ -273,6 +273,12 @@ ALL_NK <- AddModuleScore(object = ALL_NK,
                          features = mature_NK_genes,
                          name = "mature_NK_module",
                          seed = 2805)
+
+
+NK_annotations <- c("mature_NK_module1",
+                    "adaptive_NK_module1",
+                    "conventional_NK_module1",
+                    "NKP_module1")
 ```
 
 ## ___Plot module scores___
@@ -592,6 +598,8 @@ counts_matrix <- GetAssayData(ALL_NK, slot = "counts")
 geneUniverse <- rownames(counts_matrix)[Matrix::rowSums(counts_matrix) > 1]
 length(geneUniverse)
 ```
+
+
 
 ## ___Cluster 2___
 

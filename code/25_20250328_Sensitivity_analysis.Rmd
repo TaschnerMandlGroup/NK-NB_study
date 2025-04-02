@@ -1,7 +1,7 @@
 ---
 title: "NK project: Sensitivity analysis"
 author: "Dr. Sara Wernig-Zorc"
-date: "06.09.2024"
+date: "`r format(Sys.time(), '%B %Y')`"
 output: 
   html_document: 
     toc: yes
@@ -13,10 +13,11 @@ output:
     theme: spacelab
     df_print: paged
 params:
-  input_BM1: "/home/rstudio/mnt_data/BM/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"
-  input_BM2: "/home/rstudio/mnt_data/BM/yang2019/Rds/Human_BM_NK_seurat_v4.Rds"
-  input_BM3: "/home/rstudio/mnt_data/BM/Lee/disco_bone_marrow_v2.0.rds"
-  input_scRNA: "/home/rstudio/mnt_out/scRNA-seq_stage_M/results/published/data/rna_decontaminated.rds"
+  input_BM1: "/home/rstudio/mnt_data/CancReg/BM/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"
+  input_BM2: "/home/rstudio/mnt_data/CancReg/BM/yang2019/Rds/Human_BM_NK_seurat_v4.Rds"
+  input_BM3: "/home/rstudio/mnt_data/CancReg/BM/Lee/disco_bone_marrow_v2.0.rds"
+  input_scRNA: "/home/rstudio/mnt_out/NK_project/Rds/fetahu2023_withNewMetadata.Rds"
+  input_NK: "/home/rstudio/mnt_out/NK_project/Rds/ALL_NK_cluster_withNewMetadata.Rds"
   out: "/home/rstudio/mnt_out/NK_project/"
   GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
   markers: "/home/rstudio/mnt_resources/MES_ADRN/"
@@ -38,40 +39,19 @@ print(params)
 ```
 
 ```{r load project specific R packages and color code}
-source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_setup.R")
-source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_utils.R")
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_setup.R")
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_utils.R")
 ```
 
 # ___Input_data___
 
 ```{r}
-fetahu2023 <- readRDS(file = paste0(params$out,"Rds/fetahu2023_withMetadata.Rds"))
-ALL_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_NK_cluster.Rds"))
-crinier2021 <- readRDS(file = paste0(params$input_BM1))
+#fetahu2023 <- readRDS(file = params$input_scRNA)
+ALL_NK <- readRDS(file = params$input_NK)
+crinier2021 <- readRDS(file = params$input_BM1)
 ```
 
 ```{r}
-Idents(ALL_NK) <- ALL_NK@meta.data$sample
-ALL_NK <- RenameIdents(ALL_NK, 
-                    "2005_1702" = "ATRXmut_01", 
-                    "2006_2684" = "sporadic_01",
-                    "2014_0102" = "ctrl_01",
-                    "2016_1853" = "ctrl_02",
-                    "2016_2950" = "ctrl_03",
-                    "2016_3924" = "ATRXmut_02",
-                    "2016_4503" = "MYCNA_01",
-                    "2018_1404" = "MYCNA_02",
-                    "2018_1625" = "sporadic_02",
-                    "2018_4252" = "ctrl_04",
-                    "2018_6056" = "sporadic_03",
-                    "2019_2495" = "sporadic_04",
-                    "2019_5022" = "MYCNA_03",
-                    "2019_5754" = "MYCNA_04",
-                    "2020_1288" = "ctrl_05",
-                    "2020_1667" = "sporadic_05")
-
-ALL_NK@meta.data$patients <- Idents(ALL_NK)
-
 ALL_NK <- 
   ALL_NK %>% 
   NormalizeData(normalization.method = "LogNormalize",
@@ -82,9 +62,8 @@ crinier2021 <-
   NormalizeData(normalization.method = "LogNormalize",
                 scale.factor = 10000)
 
-
 # Crinier et al., 2021 as reference
-NK_clusters <- crinier2021$cluster2
+NK_clusters <- crinier2021$final_clustering
 original_clusters <- ALL_NK$orig.ident
 
 fetahu2023_NK_mat <- GetAssayData(ALL_NK, 
@@ -97,7 +76,7 @@ crinier2021_mat <- GetAssayData(crinier2021,
 ```
 
 ```{r}
-# Store de.n values [Number of DE genes] from 5 to 500 with a 10 step incrament
+# Store de.n values [Number of DE genes] from 5 to 500 with a 10 step increment
 de_n_values <- seq(5, 500, by=10) 
 
 # store results
@@ -111,7 +90,7 @@ for (de_n in de_n_values) {
                             ref = crinier2021_mat, 
                             labels = NK_clusters, 
                             de.n = de_n,
-                            num.threads = 80)
+                            num.threads = 30)
   
   # Get the number of cells per cluster
   cluster_counts <- table(singleR_result$labels)
@@ -122,14 +101,30 @@ for (de_n in de_n_values) {
                                        num_cells = as.integer(cluster_counts)))
 }
 
+saveRDS(singleR_result, file = paste0(params$out,
+                                      "Rds/Label_transfer_sensitivity_analysis_20250328.Rds"))
+
+write.table(results, file = paste0(params$out,"tables/label_transfer_sensitivity_analysis_20250328.csv"),
+            sep = "\t", quote = FALSE,row.names = FALSE)
+```
+
+```{r}
 # Plot the results using ggplot2
-ggplot(results, aes(x = de_n, y = num_cells, color = cluster)) +
-  geom_line() +
-  geom_point() +
+sensitivity_analysis <- ggplot(results, aes(x = de_n, y = num_cells, color = cluster)) +
+  geom_line(linewidth = 0.5) +
+  geom_point(size = 1) +
   labs(title = "Number of cells per cluster vs. de.n parameter",
        x = "de.n parameter",
        y = "Number of cells per cluster") +
-  theme_minimal()
+  theme_minimal() +  scale_color_manual(values = COLOR_CODE_v2)
+
+sensitivity_analysis
+
+# save as PDF
+pdf(paste0(params$out,"figures/label_transfer_sensitivity_analysis_results_20250328.pdf"),
+    height = 3, width = 5)
+sensitivity_analysis
+dev.off()
 ```
 
 
@@ -176,7 +171,9 @@ results_melted
 results_melted$de_n <- as.numeric(as.character(results_melted$de_n))
 
 # Plot the heatmap
-ggplot(results_melted, aes(x = de_n, y = Cell_ID, fill = Predicted_Type)) +
+params_sensitivity_heatmap_plot <- ggplot(results_melted, aes(x = de_n, 
+                                                              y = Cell_ID, 
+                                                              fill = Predicted_Type)) +
   geom_tile() +
   scale_fill_manual(values = COLOR_CODE_v2) +
   labs(title = "Heatmap of predicted NK sub-types across different de.n values",
@@ -187,6 +184,18 @@ ggplot(results_melted, aes(x = de_n, y = Cell_ID, fill = Predicted_Type)) +
   theme(axis.text.y = element_blank(),  # Optional: Hide y-axis text if there are too many cells
         axis.ticks.y = element_blank(),
         panel.grid = element_blank())
+
+
+write.table(results_df, file = paste0(params$out,"tables/label_transfer_sensitivity_analysis_per_cell_ID_20250328.csv"),
+            sep = "\t")
+```
+
+```{r}
+params_sensitivity_heatmap_plot
+
+pdf(params$out,"figures/label_transfer_heatmap_plot_20250328.pdf")
+params_sensitivity_heatmap_plot
+dev.off()
 ```
 
 ```{r subsampled}
@@ -221,7 +230,9 @@ df_subsampled_melted
 df_subsampled_melted$de_n <- as.numeric(as.character(df_subsampled_melted$de_n))
 
 # Plot the heatmap
-ggplot(df_subsampled_melted, aes(x = de_n, y = Cell_ID, fill = Predicted_Type)) +
+
+params_sensitivity_plot <- ggplot(df_subsampled_melted, 
+                                  aes(x = de_n, y = Cell_ID, fill = Predicted_Type)) +
   geom_tile() +
   scale_fill_manual(values = COLOR_CODE_v2) +
   labs(title = "Heatmap of predicted NK sub-types across different de.n values",
@@ -232,6 +243,14 @@ ggplot(df_subsampled_melted, aes(x = de_n, y = Cell_ID, fill = Predicted_Type)) 
   theme(axis.text.y = element_blank(),  # Optional: Hide y-axis text if there are too many cells
         axis.ticks.y = element_blank(),
         panel.grid = element_blank())
-
 ```
+
+```{r}
+params_sensitivity_plot
+
+pdf(params$out,"figures/label_transfer_sensitivity_analysis_v2_20250328.pdf")
+params_sensitivity_plot
+dev.off()
+```
+
 

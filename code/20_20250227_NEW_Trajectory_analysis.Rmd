@@ -1,0 +1,919 @@
+---
+title: "NK project: Trajectory analysis"
+author: "Dr. Sara Wernig-Zorc"
+date: "`r format(Sys.time(), '%B %Y')`"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  input_BM1: "/home/rstudio/mnt_data/BM/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"
+  input_BM2: "/home/rstudio/mnt_data/BM/yang2019/Rds/Human_BM_NK_seurat_v4.Rds"
+  input_BM3: "/home/rstudio/mnt_data/BM/Lee/disco_bone_marrow_v2.0.rds"
+  input_scRNA: "/home/rstudio/mnt_out/scRNA-seq_stage_M/results/published/data/rna_decontaminated.rds"
+  out: "/home/rstudio/mnt_out/NK_project/"
+  GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
+  markers: "/home/rstudio/mnt_resources/MES_ADRN/"
+  metadata: "/home/rstudio/scRNA.NB.integration/metadata/"
+---
+
+DESCRIPTION
+<br>
+The idea here is to see the the differentiation trajectory of healthy BM-derived
+<br>
+NK cells in adolescent children vs. adolescents with NB, witha  focus on ATRX mutates NB.
+<br>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 80)
+options(future.globals.maxSize = 80 * 10^9)
+
+print(params)
+```
+
+```{r load project specific R packages and color code}
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_setup.R")
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_utils.R")
+```
+
+```{r eval=FALSE, include=FALSE}
+if (!requireNamespace("remotes", quietly = TRUE)) {
+    install.packages("remotes")
+}
+remotes::install_github("huayc09/SeuratExtend")
+```
+
+# ___Input_data___
+
+```{r}
+adult_BM_NK <- readRDS(file = params$input_BM1)
+```
+
+```{r}
+ALL_NK <-  readRDS(file = paste0(params$out,"Rds/ALL_NK_cluster_withNewMetadata.Rds"))
+CTRL_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_fetal_BM_NK.Rds"))
+ATRX_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_ATRXmut_BM_NK.Rds"))
+sporadic_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_sporadic_BM_NK.Rds"))
+MNA_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_MNA_BM_NK.Rds"))
+```
+
+# ___Diffusion map, pseudotime and temporal gene expression___
+
+```{r include=FALSE}
+library(reticulate)
+library(SeuratExtend)
+```
+
+## ___Whole Fetahu2023 dataset - BM-derived NK cells___
+
+### ___Palantir___
+
+```{r}
+# pre-processing
+ALL_NK <- FindVariableFeatures(ALL_NK)
+ALL_NK <- RunPCA(ALL_NK)
+
+# Difussion map
+ALL_NK <- Palantir.RunDM(ALL_NK)
+
+# check if DM was created
+ALL_NK@reductions
+
+# View the first 2 ms dimensions:
+pdf(paste0(params$out,"figures/", "ALL_NK","_Palantir.pdf"))
+DimPlot2(ALL_NK, 
+         reduction = "ms", 
+         group.by = "predicted_NK_type_de.n350", 
+         label = TRUE)
+dev.off()
+
+# Determining Cell Fates and Calculating Pseudotime
+
+p <- DimPlot(ALL_NK, 
+             reduction = "ms", 
+             group.by = "predicted_NK_type_de.n350")
+cells <- CellSelector(p)
+
+ALL_NK <- Palantir.Pseudotime(ALL_NK, 
+                               start_cell = cells)
+
+ps <- ALL_NK@misc$Palantir$Pseudotime
+head(ps)
+
+# Visualize cell fate on UMAP
+colnames(ps)[3:4] <- c("fate1", "fate2","fate3","fate4","fate5")
+ALL_NK@meta.data[,colnames(ps)] <- ps
+
+pdf(paste0(params$out,"figures/", "ALL_NK","_DM.pdf"))
+DimPlot2(ALL_NK, 
+         features = colnames(ps), 
+         reduction = "ms", 
+         cols = list(Entropy = "D"), 
+         theme = NoAxes())
+dev.off()
+```
+
+<br>
+CD27⁺ITGAM⁻ → Immature NK cells  --> blue --> #3 (hNK_BM3)
+<br>
+CD27⁺ITGAM⁺ → Intermediate   --> red --> #1 (hNK_BM2)
+<br>
+CD27⁻ITGAM⁺ → Fully mature NK cells  --> green --> #2 (hNK_BM4 and hNK_BM1)
+<br>
+[with hNK_BM4 being slightly less mature than hNK_BM1]
+<br>
+
+### ___Slingshot___
+
+```{r}
+ALL_NK <- RunSlingshot(ALL_NK, 
+                        group.by = "predicted_NK_type_de.n350", 
+                        start.clus = "hNK_Bm2")
+
+sling <- ALL_NK@misc$slingshot$PCA$SlingPseudotime
+head(sling)
+
+ALL_NK@meta.data[,colnames(sling)] <- as.data.frame(sling)
+
+pdf(paste0(params$out,"figures/", "ALL_NK","_Slingshot.pdf"))
+DimPlot2(ALL_NK, features = colnames(sling), 
+         cols = "C", 
+         theme = NoAxes())
+dev.off()
+
+genes <-  c("ID2", "EOMES", "TBX21", "TOX", "GATA3", "ZNF683", "NCR1", "KLRG1", 
+          "CD27", "ITGAM", "KLRC1", "KIR2DL1", "KIR2DL3", "KIR3DL1", "KLRD1", 
+          "IL2RB", "IFNGR1","IL15", "IL15RA", "IL18R1", "IL18RAP", "IL12RB2", 
+          "CX3CR1", "CXCR4", "GZMB", "PRF1", "IFNG", "TNF", "LAMP1", "SIRT1", 
+           "EZH2")
+
+pdf(paste0(params$out,"figures/", "ALL_NK","_temporal_geneExpress.pdf"),height = 20, width = 26)
+GeneTrendCurve.Slingshot(ALL_NK, features = genes)
+dev.off()
+
+genes <-  c( "CD27", "ITGAM")
+
+pdf(paste0(params$out,"figures/", "ALL_NK","_tempExp_CD27_ITGAM.pdf"),height = 7, width = 15)
+GeneTrendCurve.Slingshot(ALL_NK, features = genes)
+dev.off()
+```
+
+
+## ___Healthy adolescent BM-derived NK cells___
+
+### ___Palantir___
+
+```{r}
+# pre-processing
+CTRL_NK <- FindVariableFeatures(CTRL_NK)
+CTRL_NK <- RunPCA(CTRL_NK)
+
+# Difussion map
+CTRL_NK <- Palantir.RunDM(CTRL_NK)
+
+# check if DM was created
+CTRL_NK@reductions
+
+# View the first 2 ms dimensions:
+pdf(paste0(params$out,"figures/", "CTRL_NK","_Palantir.pdf"))
+DimPlot2(CTRL_NK, 
+         reduction = "ms", 
+         group.by = "predicted_NK_type_de.n350", 
+         label = TRUE)
+dev.off()
+
+# Determining Cell Fates and Calculating Pseudotime
+
+p <- DimPlot(CTRL_NK, 
+             reduction = "ms", 
+             group.by = "predicted_NK_type_de.n350")
+cells <- CellSelector(p)
+
+CTRL_NK <- Palantir.Pseudotime(CTRL_NK, 
+                               start_cell = cells)
+
+ps <- CTRL_NK@misc$Palantir$Pseudotime
+head(ps)
+
+# Visualize cell fate on UMAP
+colnames(ps)[3:4] <- c("fate1", "fate2","fate3","fate4","fate5")
+CTRL_NK@meta.data[,colnames(ps)] <- ps
+
+pdf(paste0(params$out,"figures/", "CTRL_NK","_DM.pdf"))
+DimPlot2(CTRL_NK, 
+         features = colnames(ps), 
+         reduction = "ms", 
+         cols = list(Entropy = "D"), 
+         theme = NoAxes())
+dev.off()
+```
+
+<br>
+CD27⁺ITGAM⁻ → Immature NK cells  →  blue →  #3 (hNK_BM3)
+<br>
+CD27⁺ITGAM⁺ → Intermediate →  red →  #1 (hNK_BM2)
+<br>
+CD27⁻ITGAM⁺ → Fully mature NK cells →  green →  #2 (hNK_BM4 and hNK_BM1)
+<br>
+[with hNK_BM4 being slightly less mature than hNK_BM1]
+<br>
+
+### ___Slingshot___
+
+```{r}
+CTRL_NK <- RunSlingshot(CTRL_NK, 
+                        group.by = "predicted_NK_type_de.n350", 
+                        start.clus = "hNK_Bm2")
+
+sling <- CTRL_NK@misc$slingshot$PCA$SlingPseudotime
+head(sling)
+
+CTRL_NK@meta.data[,colnames(sling)] <- as.data.frame(sling)
+
+pdf(paste0(params$out,"figures/", "CTRL_NK","_Slingshot.pdf"))
+DimPlot2(CTRL_NK, features = colnames(sling), 
+         cols = "C", 
+         theme = NoAxes())
+dev.off()
+
+genes <-  c("ID2", "EOMES", "TBX21", "TOX", "GATA3", "ZNF683", "NCR1", "KLRG1", 
+          "CD27", "ITGAM", "KLRC1", "KIR2DL1", "KIR2DL3", "KIR3DL1", "KLRD1", 
+          "IL2RB", "IFNGR1","IL15", "IL15RA", "IL18R1", "IL18RAP", "IL12RB2", 
+          "CX3CR1", "CXCR4", "GZMB", "PRF1", "IFNG", "TNF", "LAMP1", "SIRT1", 
+           "EZH2")
+
+pdf(paste0(params$out,"figures/", "CTRL_NK","_temporal_geneExpress.pdf"),height = 20, width = 26)
+GeneTrendCurve.Slingshot(CTRL_NK, features = genes)
+dev.off()
+
+genes <-  c( "CD27", "ITGAM")
+
+pdf(paste0(params$out,"figures/", "CTRL_NK","_tempExp_CD27_ITGAM.pdf"),height = 7, width = 15)
+GeneTrendCurve.Slingshot(CTRL_NK, features = genes)
+dev.off()
+```
+
+
+## ___ATRXm NB patient BM-derived NK cells___
+
+### ___Palantir___
+
+```{r}
+# pre-processing
+ATRX_NK <- FindVariableFeatures(ATRX_NK)
+ATRX_NK <- RunPCA(ATRX_NK)
+
+# Difussion map
+ATRX_NK <- Palantir.RunDM(ATRX_NK)
+
+# check if DM was created
+ATRX_NK@reductions
+
+# View the first 2 ms dimensions:
+pdf(paste0(params$out,"figures/", "ATRX_NK","_Palantir.pdf"))
+DimPlot2(ATRX_NK, 
+         reduction = "ms", 
+         group.by = "predicted_NK_type_de.n350", 
+         label = TRUE)
+dev.off()
+
+# Determining Cell Fates and Calculating Pseudotime
+
+p <- DimPlot(ATRX_NK, 
+             reduction = "ms", 
+             group.by = "predicted_NK_type_de.n350")
+cells <- CellSelector(p)
+
+ATRX_NK <- Palantir.Pseudotime(ATRX_NK, 
+                               start_cell = cells)
+
+ps <- ATRX_NK@misc$Palantir$Pseudotime
+head(ps)
+
+# Visualize cell fate on UMAP
+colnames(ps)[3:4] <- c("fate1", "fate2","fate3","fate4","fate5")
+ATRX_NK@meta.data[,colnames(ps)] <- ps
+
+pdf(paste0(params$out,"figures/", "ATRX_NK","_DM.pdf"))
+DimPlot2(ATRX_NK, 
+         features = colnames(ps), 
+         reduction = "ms", 
+         cols = list(Entropy = "D"), 
+         theme = NoAxes())
+dev.off()
+```
+
+CD27⁻ITGAM⁺ markers indicate → Fully mature NK cells →  
+but actually at the same time they resemble immature NK cells
+
+### ___Slingshot___
+
+```{r}
+Idents(ATRX_NK) <- ATRX_NK$predicted_NK_type_de.n350
+
+clusters_to_keep <- c("hNK_Bm2", "hNK_Bm3")
+ATRX_NK_subset <- subset(ATRX_NK, idents = clusters_to_keep)
+
+ATRX_NK_subset <- RunSlingshot(ATRX_NK_subset, 
+                        group.by = "predicted_NK_type_de.n350", 
+                        start.clus = "hNK_Bm2")
+
+sling <- ATRX_NK_subset@misc$slingshot$PCA$SlingPseudotime
+head(sling)
+
+ATRX_NK_subset@meta.data[,colnames(sling)] <- as.data.frame(sling)
+
+pdf(paste0(params$out,"figures/", "ATRX_NK","_Slingshot.pdf"))
+DimPlot2(ATRX_NK_subset, 
+         features = colnames(sling), 
+         theme = NoAxes(), 
+         pt.size = 3)
+dev.off()
+
+genes <-  c("ID2", "EOMES", "TBX21", "TOX", "GATA3", "ZNF683", "NCR1", "KLRG1", 
+          "CD27", "ITGAM", "KLRC1", "KIR2DL1", "KIR2DL3", "KIR3DL1", "KLRD1", 
+          "IL2RB", "IFNGR1","IL15", "IL15RA", "IL18R1", "IL18RAP", "IL12RB2", 
+          "CX3CR1", "CXCR4", "GZMB", "PRF1", "IFNG", "TNF", "LAMP1", "SIRT1", 
+           "EZH2")
+
+pdf(paste0(params$out,"figures/", "ATRX_NK","_temporal_geneExpress.pdf"),height = 20, width = 26)
+GeneTrendCurve.Slingshot(ATRX_NK_subset, features = genes)
+dev.off()
+
+genes <-  c( "CD27", "ITGAM")
+
+pdf(paste0(params$out,"figures/", "ATRX_NK","_tempExp_CD27_ITGAM.pdf"),height = 7, width = 15)
+GeneTrendCurve.Slingshot(ATRX_NK_subset, features = genes)
+dev.off()
+```
+
+## ___MNA NB patient BM-derived NK cells___
+
+### ___Palantir___
+
+```{r}
+# pre-processing
+MNA_NK <- FindVariableFeatures(MNA_NK)
+MNA_NK <- RunPCA(MNA_NK)
+
+# Difussion map
+MNA_NK <- Palantir.RunDM(MNA_NK)
+
+# check if DM was created
+MNA_NK@reductions
+
+# View the first 2 ms dimensions:
+pdf(paste0(params$out,"figures/", "MNA_NK","_Palantir.pdf"))
+DimPlot2(MNA_NK, 
+         reduction = "ms", 
+         group.by = "predicted_NK_type_de.n350", 
+         label = TRUE)
+dev.off()
+
+# Determining Cell Fates and Calculating Pseudotime
+
+p <- DimPlot(MNA_NK, 
+             reduction = "ms", 
+             group.by = "predicted_NK_type_de.n350")
+cells <- CellSelector(p)
+
+MNA_NK <- Palantir.Pseudotime(MNA_NK, 
+                               start_cell = cells)
+
+ps <- MNA_NK@misc$Palantir$Pseudotime
+head(ps)
+
+# Visualize cell fate on UMAP
+colnames(ps)[3] <- "fate1"
+MNA_NK@meta.data[,colnames(ps)] <- ps
+
+pdf(paste0(params$out,"figures/", "MNA_NK","_DM.pdf"))
+DimPlot2(MNA_NK, 
+         features = colnames(ps), 
+         reduction = "ms", 
+         cols = list(Entropy = "D"), 
+         theme = NoAxes())
+dev.off()
+```
+
+### ___Slingshot___
+
+```{r}
+MNA_NK <- RunSlingshot(MNA_NK, 
+                        group.by = "predicted_NK_type_de.n350", 
+                        start.clus = "hNK_Bm2")
+
+sling <- MNA_NK@misc$slingshot$PCA$SlingPseudotime
+head(sling)
+
+MNA_NK@meta.data[,colnames(sling)] <- as.data.frame(sling)
+
+pdf(paste0(params$out,"figures/", "MNA_NK","_Slingshot.pdf"))
+DimPlot2(MNA_NK, features = colnames(sling), 
+         cols = "C", 
+         theme = NoAxes())
+dev.off()
+
+genes <-  c("ID2", "EOMES", "TBX21", "TOX", "GATA3", "ZNF683", "NCR1", "KLRG1", 
+          "CD27", "ITGAM", "KLRC1", "KIR2DL1", "KIR2DL3", "KIR3DL1", "KLRD1", 
+          "IL2RB", "IFNGR1","IL15", "IL15RA", "IL18R1", "IL18RAP", "IL12RB2", 
+          "CX3CR1", "CXCR4", "GZMB", "PRF1", "IFNG", "TNF", "LAMP1", "SIRT1", 
+           "EZH2")
+
+pdf(paste0(params$out,"figures/", "MNA_NK","_temporal_geneExpress.pdf"),height = 20, width = 26)
+GeneTrendCurve.Slingshot(MNA_NK, features = genes)
+dev.off()
+
+genes <-  c( "CD27", "ITGAM")
+
+pdf(paste0(params$out,"figures/", "MNA_NK","_tempExp_CD27_ITGAM.pdf"),height = 7, width = 15)
+GeneTrendCurve.Slingshot(MNA_NK, features = genes)
+dev.off()
+```
+
+
+## ___sporadic NB patient BM-derived NK cells___
+
+### ___Palantir___
+
+```{r}
+# pre-processing
+sporadic_NK <- FindVariableFeatures(sporadic_NK)
+sporadic_NK <- RunPCA(sporadic_NK)
+
+# Difussion map
+sporadic_NK <- Palantir.RunDM(sporadic_NK)
+
+# check if DM was created
+sporadic_NK@reductions
+
+# View the first 2 ms dimensions:
+pdf(paste0(params$out,"figures/", "sporadic_NK","_Palantir.pdf"))
+DimPlot2(sporadic_NK, 
+         reduction = "ms", 
+         group.by = "predicted_NK_type_de.n350", 
+         label = TRUE)
+dev.off()
+
+# Determining Cell Fates and Calculating Pseudotime
+
+p <- DimPlot(sporadic_NK, 
+             reduction = "ms", 
+             group.by = "predicted_NK_type_de.n350")
+cells <- CellSelector(p)
+
+sporadic_NK <- Palantir.Pseudotime(sporadic_NK, 
+                               start_cell = cells)
+
+ps <- sporadic_NK@misc$Palantir$Pseudotime
+head(ps)
+
+# Visualize cell fate on UMAP
+colnames(ps)[3:4] <- c("fate1", "fate2","fate3","fate4","fate5")
+sporadic_NK@meta.data[,colnames(ps)] <- ps
+
+pdf(paste0(params$out,"figures/", "sporadic_NK","_DM.pdf"))
+DimPlot2(sporadic_NK, 
+         features = colnames(ps), 
+         reduction = "ms", 
+         cols = list(Entropy = "D"), 
+         theme = NoAxes())
+dev.off()
+```
+
+### ___Slingshot___
+
+```{r}
+sporadic_NK <- RunSlingshot(sporadic_NK, 
+                        group.by = "predicted_NK_type_de.n350", 
+                        start.clus = "hNK_Bm2")
+
+sling <- sporadic_NK@misc$slingshot$PCA$SlingPseudotime
+head(sling)
+
+sporadic_NK@meta.data[,colnames(sling)] <- as.data.frame(sling)
+
+pdf(paste0(params$out,"figures/", "sporadic_NK","_Slingshot.pdf"))
+DimPlot2(sporadic_NK, features = colnames(sling), 
+         cols = "C", 
+         theme = NoAxes())
+dev.off()
+
+genes <-  c("ID2", "EOMES", "TBX21", "TOX", "GATA3", "ZNF683", "NCR1", "KLRG1", 
+          "CD27", "ITGAM", "KLRC1", "KIR2DL1", "KIR2DL3", "KIR3DL1", "KLRD1", 
+          "IL2RB", "IFNGR1","IL15", "IL15RA", "IL18R1", "IL18RAP", "IL12RB2", 
+          "CX3CR1", "CXCR4", "GZMB", "PRF1", "IFNG", "TNF", "LAMP1", "SIRT1", 
+           "EZH2")
+
+pdf(paste0(params$out,"figures/", "sporadic_NK","_temporal_geneExpress.pdf"),height = 20, width = 26)
+GeneTrendCurve.Slingshot(sporadic_NK, features = genes)
+dev.off()
+
+genes <-  c( "CD27", "ITGAM")
+
+pdf(paste0(params$out,"figures/", "sporadic_NK","_tempExp_CD27_ITGAM.pdf"),height = 7, width = 15)
+GeneTrendCurve.Slingshot(sporadic_NK, features = genes)
+dev.off()
+```
+
+## ___Healthy ADULT BM-derived NK cells___
+
+### ___Palantir___
+
+```{r}
+# pre-processing
+adult_BM_NK <- FindVariableFeatures(adult_BM_NK)
+adult_BM_NK <- RunPCA(adult_BM_NK)
+
+# Difussion map
+adult_BM_NK <- Palantir.RunDM(adult_BM_NK)
+
+# check if DM was created
+adult_BM_NK@reductions
+
+# View the first 2 ms dimensions:
+pdf(paste0(params$out,"figures/", "adult_NK","_Palantir.pdf"))
+DimPlot2(adult_BM_NK, 
+         reduction = "ms", 
+         group.by = "cluster2", 
+         label = TRUE)
+dev.off()
+
+# Determining Cell Fates and Calculating Pseudotime
+
+p <- DimPlot(adult_BM_NK, 
+             reduction = "ms", 
+             group.by = "cluster2")
+cells <- CellSelector(p)
+
+adult_BM_NK <- Palantir.Pseudotime(adult_BM_NK,
+                              start_cell = cells)
+
+ps <- adult_BM_NK@misc$Palantir$Pseudotime
+head(ps)
+
+# Visualize cell fate on UMAP
+colnames(ps)[3:4] <- c("fate1", "fate2","fate3","fate4","fate5")
+adult_BM_NK@meta.data[,colnames(ps)] <- ps
+
+pdf(paste0(params$out,"figures/", "adult_NK","_DM.pdf"))
+DimPlot2(adult_BM_NK, 
+         features = colnames(ps), 
+         reduction = "ms", 
+         cols = list(Entropy = "D"), 
+         theme = NoAxes())
+dev.off()
+```
+
+### ___Slingshot___
+
+```{r}
+adult_BM_NK <- RunSlingshot(adult_BM_NK, 
+                        group.by = "cluster2", 
+                        start.clus = "hNK_Bm2")
+
+sling <- adult_BM_NK@misc$slingshot$PCA$SlingPseudotime
+head(sling)
+
+adult_BM_NK@meta.data[,colnames(sling)] <- as.data.frame(sling)
+
+pdf(paste0(params$out,"figures/", "adult_NK","_Slingshot.pdf"))
+DimPlot2(adult_BM_NK, features = colnames(sling), 
+         cols = "C", 
+         pt.size = 3,
+         theme = NoAxes())
+dev.off()
+
+genes <-  c("ID2", "EOMES", "TBX21", "TOX", "GATA3", "ZNF683", "NCR1", "KLRG1", 
+          "CD27", "ITGAM", "KLRC1", "KIR2DL1", "KIR2DL3", "KIR3DL1", "KLRD1", 
+          "IL2RB", "IFNGR1","IL15", "IL15RA", "IL18R1", "IL18RAP", "IL12RB2", 
+          "CX3CR1", "CXCR4", "GZMB", "PRF1", "IFNG", "TNF", "LAMP1", "SIRT1", 
+           "EZH2")
+
+pdf(paste0(params$out,"figures/", "adult_NK","_temporal_geneExpress.pdf"),height = 20, width = 26)
+GeneTrendCurve.Slingshot(adult_BM_NK, features = genes)
+dev.off()
+
+genes <-  c( "CD27", "ITGAM")
+
+pdf(paste0(params$out,"figures/", "adult_NK","_tempExp_CD27_ITGAM.pdf"),height = 7, width = 15)
+GeneTrendCurve.Slingshot(adult_BM_NK, features = genes)
+dev.off()
+```
+
+
+# ___TSCAN Trajectory analysis___
+
+TSCAN uses the clustering to summarize the data into a smaller set of discrete units, 
+computes cluster centroids by averaging the coordinates of its member cells, 
+and then forms the minimum spanning tree (MST) across those centroids. 
+The MST is simply an undirected acyclic graph that passes through each centroid 
+exactly once and is thus the most parsimonious structure that captures the 
+transitions between clusters. 
+
+```{r}
+library(TSCAN)
+library(scater)
+```
+
+## ___Whole Fetahu2023 dataset - BM-derived NK cells___
+
+```{r eval=FALSE, include=FALSE}
+sce <- as.SingleCellExperiment(ALL_NK)
+colLabels(sce) <- sce$predicted_NK_type_de.n350
+
+geneFilter <- apply(assays(sce)$counts,1,function(x){
+    sum(x >= 5) >= 20
+})
+sce <- sce[geneFilter,]
+sce
+
+# 1.Cluster-based minimum spanning tree
+by.cluster <- aggregateAcrossCells(sce, ids = sce$predicted_NK_type_de.n350)
+centroids <- reducedDim(by.cluster, "UMAP")
+
+# Set clusters=NULL as we have already aggregated above.
+mst <- createClusterMST(centroids, clusters=NULL)
+mst
+
+
+line.data <- reportEdges(by.cluster, 
+                         mst=mst, 
+                         clusters=NULL, 
+                         use.dimred="UMAP")
+
+plotUMAP(sce, colour_by="predicted_NK_type_de.n350") + 
+    geom_line(data=line.data, mapping=aes(x=UMAP_1, y=UMAP_2, group=edge))
+
+#We obtain a pseudotime ordering by projecting the cells onto the MST with mapCellsToEdges(). More specifically, we move each cell onto the closest edge of the MST; the pseudotime is then calculated as the distance along the MST to this new position from a “root node” with orderCells(). For our purposes, we will arbitrarily pick one of the endpoint nodes as the root, though a more careful choice based on the biological annotation of each node may yield more relevant orderings (e.g., picking a node corresponding to a more pluripotent state).
+
+map.UMAP <- mapCellsToEdges(sce, mst=mst, use.dimred="UMAP")
+UMAP.pseudo <- orderCells(map.UMAP, mst, start = "hNK_Bm2")
+head(UMAP.pseudo)
+
+common.pseudo <- averagePseudotime(UMAP.pseudo) 
+plotUMAP(sce, colour_by=I(common.pseudo), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=line.data, mapping=aes(x=UMAP_1, y=UMAP_2, group=edge))
+```
+
+```{r}
+sce <- as.SingleCellExperiment(ALL_NK)
+colLabels(sce) <- sce$predicted_NK_type_de.n350
+
+#same as above but in one command
+pseudo.all <- quickPseudotime(sce, 
+                              use.dimred="UMAP",
+                              start = "hNK_Bm2")
+
+all <- averagePseudotime(pseudo.all$ordering)
+
+pdf(paste0(params$out,"figures/", "ALL_NK","_TSCAN","_TSNE.pdf"))
+plotTSNE(sce, colour_by=I(all), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.all$connected$TSNE, mapping=aes(x=tSNE_1, y=tSNE_2, 
+                                                          group=edge))
+dev.off()
+
+pdf(paste0(params$out,"figures/", "ALL_NK","_TSCAN","_UMAP.pdf"))
+plotUMAP(sce, colour_by=I(all), 
+         text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.all$connected$UMAP, 
+              mapping=aes(x=UMAP_1, y=UMAP_2, group=edge))
+dev.off()
+
+pdf(paste0(params$out,"figures/", "ALL_NK","_TSCAN","_PCA.pdf"))
+plotPCA(sce, colour_by=I(all), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.all$connected$PCA, 
+              mapping=aes(x=pca_1, y=pca_2, group=edge))
+dev.off()
+```
+
+## ___Healthy adolescent BM-derived NK cells___
+
+```{r}
+control <- as.SingleCellExperiment(CTRL_NK)
+colLabels(control) <- control$predicted_NK_type_de.n350
+
+pseudo.mnn <- quickPseudotime(control, 
+                              use.dimred="UMAP", 
+                              start = "hNK_Bm2")
+
+mnn.pseudo <- averagePseudotime(pseudo.mnn$ordering)
+
+pdf(paste0(params$out,"figures/", "control_NK","_TSCAN","_TSNE.pdf"))
+plotTSNE(control, colour_by=I(mnn.pseudo), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$TSNE, mapping=aes(x=tSNE_1, y=tSNE_2, 
+                                                          group=edge))
+dev.off()
+
+pdf(paste0(params$out,"figures/", "control_NK","_TSCAN","_UMAP.pdf"))
+plotUMAP(control, colour_by=I(mnn.pseudo), 
+         text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$UMAP, 
+              mapping=aes(x=UMAP_1, y=UMAP_2, group=edge))
+dev.off()
+
+pdf(paste0(params$out,"figures/", "control_NK","_TSCAN","_PCA.pdf"))
+plotPCA(control, colour_by=I(mnn.pseudo), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$PCA, 
+              mapping=aes(x=pca_1, y=pca_2, group=edge))
+dev.off()
+```
+
+## ___ATRXm NB patient BM-derived NK cells___
+
+```{r}
+ATRX <- as.SingleCellExperiment(ATRX_NK)
+colLabels(ATRX) <- ATRX$predicted_NK_type_de.n350
+
+pseudo.mnn <- quickPseudotime(ATRX, 
+                              use.dimred="UMAP", 
+                              start = "hNK_Bm2")
+mnn.pseudo <- averagePseudotime(pseudo.mnn$ordering)
+
+pdf(paste0(params$out,"figures/", "ATRX_NK","_TSCAN","_TSNE.pdf"))
+plotTSNE(ATRX, colour_by=I(mnn.pseudo), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$TSNE, mapping=aes(x=tSNE_1, y=tSNE_2, 
+                                                          group=edge))
+dev.off()
+
+pdf(paste0(params$out,"figures/", "ATRX_NK","_TSCAN","_UMAP.pdf"))
+plotUMAP(ATRX, colour_by=I(mnn.pseudo), 
+         text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$UMAP, 
+              mapping=aes(x=UMAP_1, y=UMAP_2, group=edge))
+dev.off()
+
+pdf(paste0(params$out,"figures/", "ATRX_NK","_TSCAN","_PCA.pdf"))
+plotPCA(ATRX, colour_by=I(mnn.pseudo), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$PCA, 
+              mapping=aes(x=pca_1, y=pca_2, group=edge))
+dev.off()
+```
+
+## ___MNA NB patient BM-derived NK cells___
+
+```{r}
+MNA <- as.SingleCellExperiment(MNA_NK)
+colLabels(MNA) <- MNA$predicted_NK_type_de.n350
+
+pseudo.mnn <- quickPseudotime(MNA, 
+                              use.dimred="UMAP", 
+                              start = "hNK_Bm2")
+
+mnn.pseudo <- averagePseudotime(pseudo.mnn$ordering)
+
+pdf(paste0(params$out,"figures/", "MNA_NK","_TSCAN","_TSNE.pdf"))
+plotTSNE(MNA, colour_by=I(mnn.pseudo), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$TSNE, mapping=aes(x=tSNE_1, y=tSNE_2, 
+                                                          group=edge))
+dev.off()
+
+pdf(paste0(params$out,"figures/", "MNA_NK","_TSCAN","_UMAP.pdf"))
+plotUMAP(MNA, colour_by=I(mnn.pseudo), 
+         text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$UMAP, 
+              mapping=aes(x=UMAP_1, y=UMAP_2, group=edge))
+dev.off()
+
+pdf(paste0(params$out,"figures/", "MNA_NK","_TSCAN","_PCA.pdf"))
+plotPCA(MNA, colour_by=I(mnn.pseudo), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$PCA, 
+              mapping=aes(x=pca_1, y=pca_2, group=edge))
+dev.off()
+```
+
+## ___sporadic NB patient BM-derived NK cells___
+
+```{r}
+sporadic <- as.SingleCellExperiment(sporadic_NK)
+colLabels(sporadic) <- sporadic$predicted_NK_type_de.n350
+
+pseudo.mnn <- quickPseudotime(sporadic, 
+                              use.dimred="UMAP", 
+                              start = "hNK_Bm2")
+
+mnn.pseudo <- averagePseudotime(pseudo.mnn$ordering)
+
+pdf(paste0(params$out,"figures/", "sporadic_NK","_TSCAN","_TSNE.pdf"))
+plotTSNE(sporadic, colour_by=I(mnn.pseudo), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$TSNE, mapping=aes(x=tSNE_1, y=tSNE_2, 
+                                                          group=edge))
+dev.off()
+
+pdf(paste0(params$out,"figures/", "sporadic_NK","_TSCAN","_UMAP.pdf"))
+plotUMAP(sporadic, colour_by=I(mnn.pseudo), 
+         text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$UMAP, 
+              mapping=aes(x=UMAP_1, y=UMAP_2, group=edge))
+dev.off()
+
+pdf(paste0(params$out,"figures/", "sporadic_NK","_TSCAN","_PCA.pdf"))
+plotPCA(sporadic, colour_by=I(mnn.pseudo), 
+        text_by="predicted_NK_type_de.n350", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$PCA, 
+              mapping=aes(x=pca_1, y=pca_2, group=edge))
+dev.off()
+```
+
+## ___Healthy ADULT BM-derived NK cells___
+
+Crinier at al., 2021 adult BM-derived-NK cells from 8 healthy donors
+
+### ___hNK_Bm2 cluster as START___
+
+```{r}
+adult_sce <- as.SingleCellExperiment(adult_BM_NK)
+colLabels(adult_sce) <- adult_sce$cluster2
+
+pseudo.mnn <- quickPseudotime(adult_sce, 
+                              use.dimred="UMAP", 
+                              start = "hNK_Bm2")
+
+mnn.pseudo <- averagePseudotime(pseudo.mnn$ordering)
+
+pdf(paste0(params$out,"figures/", "adult_NK","_TSCAN_hNK_Bm2","_TSNE.pdf"))
+plotTSNE(adult_sce, colour_by=I(mnn.pseudo), 
+        text_by="cluster2", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$TSNE, mapping=aes(x=tSNE_1, y=tSNE_2, 
+                                                          group=edge))
+dev.off()
+
+pdf(paste0(params$out,"figures/", "adult_NK","_TSCAN_hNK_Bm2","_UMAP.pdf"))
+plotUMAP(adult_sce, colour_by=I(mnn.pseudo), 
+         text_by="cluster2", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$UMAP, 
+              mapping=aes(x=UMAP_1, y=UMAP_2, group=edge))
+dev.off()
+
+pdf(paste0(params$out,"figures/", "adult_NK","_TSCAN_hNK_Bm2","_PCA.pdf"))
+plotPCA(adult_sce, colour_by=I(mnn.pseudo), 
+        text_by="cluster2", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$PCA, 
+              mapping=aes(x=PC_1, y=PC_2, group=edge))
+dev.off()
+```
+
+### ___hNK_Bm3 cluster as START___
+
+```{r}
+adult_sce <- as.SingleCellExperiment(adult_BM_NK)
+colLabels(adult_sce) <- adult_sce$cluster2
+
+pseudo.mnn <- quickPseudotime(adult_sce, 
+                              use.dimred="UMAP", 
+                              start = "hNK_Bm3")
+
+mnn.pseudo <- averagePseudotime(pseudo.mnn$ordering)
+
+
+pdf(paste0(params$out,"figures/", "adult_NK","_TSCAN_hNK_Bm3","_TSNE.pdf"))
+plotTSNE(adult_sce, colour_by=I(mnn.pseudo), 
+        text_by="cluster2", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$TSNE, mapping=aes(x=tSNE_1, y=tSNE_2, 
+                                                          group=edge))
+dev.off()
+
+pdf(paste0(params$out,"figures/", "adult_NK","_TSCAN_hNK_Bm3","_UMAP.pdf"))
+plotUMAP(adult_sce, colour_by=I(mnn.pseudo), 
+         text_by="cluster2", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$UMAP, 
+              mapping=aes(x=UMAP_1, y=UMAP_2, group=edge))
+dev.off()
+
+pdf(paste0(params$out,"figures/", "adult_NK","_TSCAN_hNK_Bm3","_PCA.pdf"))
+plotPCA(adult_sce, colour_by=I(mnn.pseudo), 
+        text_by="cluster2", text_colour="red") +
+    geom_line(data=pseudo.mnn$connected$PCA, 
+              mapping=aes(x=PC_1, y=PC_2, group=edge))
+dev.off()
+```
+
+
+# ___ENV___
+
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,525 @@
+---
+title: "NK project: snATAC-seq analysis"
+author: "Dr. Sara Wernig-Zorc"
+date: "`r format(Sys.time(), '%B %Y')`"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  input_BM1: "/home/rstudio/mnt_data/CancReg/BM/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"
+  input_BM2: "/home/rstudio/mnt_data/CancReg/BM/yang2019/Rds/Human_BM_NK_seurat_v4.Rds"
+  input_BM3: "/home/rstudio/mnt_data/CancReg/BM/Lee/disco_bone_marrow_v2.0.rds"
+  input_scRNA: "/home/rstudio/mnt_out/CancReg/scRNA-seq_stage_M/results/published/data/rna_decontaminated.rds"
+  out: "/home/rstudio/mnt_out/NK_project/"
+  GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
+  anno: "/home/rstudio/mnt_resources/"
+  metadata: "/home/rstudio/mnt_out/CancReg/scRNA-seq_stage_M/results/metadata/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 80)
+options(future.globals.maxSize = 80 * 10^9)
+options(Seurat.object.assay.version = "v5")
+print(params)
+```
+
+```{r load project specific R packages and color code}
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_setup.R")
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_utils.R")
+```
+
+```{r eval=FALSE, include=FALSE}
+# preprocessed data from Fetahu et al., 2023 publication
+ATAC <- readRDS(file = "/home/rstudio/mnt_out/snATAC-seq_stage_M/results/published/data/nblast_scopen_gene_activity_normalized_motifs_added.rds")
+```
+
+```{r eval=FALSE, include=FALSE}
+DimPlot(ATAC)
+
+Idents(ATAC) <- ATAC$new.ident
+
+ATAC <- RenameIdents(ATAC,
+             "2014_0102" = 'C1', 
+             "2016_1853"	= 'C2', 
+             "MF244_GNB"	= 'C3',
+             "MF244_GNM"	= 'C4',
+             "2018_4252" = 'C4',
+             "2020_1288"	= 'C5', 
+             "16_4503"	= 'M1',
+        "2018_1404"	= 'M2', 
+        "2019_5022"	= 'M3', 
+       "2019_5754"	= 'M4',
+        "2005_1702"	= 'A1', 
+        "2016_3924"	= 'A2', 
+       "2006_2684"	= 'S1',
+        "2018_1625"	= 'S2', 
+       "2018_6056"	= 'S3',
+       "2019_2495"	= 'A3',
+        "2020_1667"	= 'S5')
+
+ATAC$sample <-Idents(ATAC) 
+table(ATAC$sample)
+
+ATAC$group <- NA
+ATAC$group[grepl("A", ATAC$sample)] <- "ATRXmut"
+ATAC$group[grepl("C", ATAC$sample)] <- "control"
+ATAC$group[grepl("M", ATAC$sample)] <- "MYCNamp"
+ATAC$group[grepl("S", ATAC$sample)] <- "ATRXwtMYCNwt"
+ATAC$group <- as.factor(ATAC$group)
+
+table(ATAC$group)
+
+saveRDS(ATAC, file = paste0(params$out, "/Rds/fetahu2023_scATAC_data.Rds"))
+```
+
+```{r}
+ATAC <- readRDS(file = paste0(params$out, "/Rds/fetahu2023_scATAC_data.Rds"))
+```
+
+```{r fig.height=5, fig.width=5}
+SCpubr::do_DimPlot(ATAC,
+                   border.color = NA,
+                   plot_cell_borders = FALSE,
+                                 reduction = "umap_scopen",
+                                 colors.use =  COLOR_CODE_ATAC,
+                                 repel = TRUE,
+                   group.by = "cell_type",
+                                 font.size = 18,
+                                 label.size  = 18,
+                                 plot.axes = FALSE,
+                                 label = FALSE,
+                                 legend.title = "Clusters",
+                                 plot.title = "",
+                                 legend.position = "none")
+```
+
+```{r fig.height=5, fig.width=10}
+DensityScatter(ATAC,
+               x = 'nCount_peaks', 
+               y = 'TSS.enrichment', 
+               log_x = TRUE,
+               quantiles = TRUE)
+
+VlnPlot(
+  object = ATAC,
+  features = c('nCount_peaks', 
+               'TSS.enrichment', 
+               'blacklist_ratio', 
+               'nucleosome_signal', 
+               'pct_reads_in_peaks'),
+  pt.size = 0.3,
+  group.by = "cell_type",
+  split.by = "group",
+  ncol = 5)
+
+ATAC <- subset(
+  x = ATAC,
+  subset = 
+    pct_reads_in_peaks > 40 &
+    blacklist_ratio < 0.005 &
+    nucleosome_signal < 1.5 &
+    TSS.enrichment < 10 &
+    TSS.enrichment > 3)
+
+DensityScatter(ATAC,
+               x = 'nCount_peaks', 
+               y = 'TSS.enrichment', 
+               log_x = TRUE,
+               quantiles = TRUE)
+
+VlnPlot(
+  object = ATAC,
+  features = c('nCount_peaks', 
+               'TSS.enrichment', 
+               'blacklist_ratio', 
+               'nucleosome_signal', 
+               'pct_reads_in_peaks'),
+  pt.size = 0.3,
+  group.by = "cell_type",
+  split.by = "group",
+  ncol = 5)
+```
+```{r fig.height=10, fig.width=10}
+
+UMAP_plot_byGroup <- SCpubr::do_DimPlot(ATAC,
+                   border.color = NA,
+                   plot_cell_borders = FALSE,
+                   reduction = "umap_scopen",
+                   colors.use =  COLOR_CODE_ATAC,
+                   repel = TRUE,
+                   group.by = "cell_type",
+                   font.size = 18,
+                   label.size  = 18,
+                   plot.axes = FALSE,
+                   label = FALSE,
+                   legend.title = "Clusters",
+                   plot.title = "",
+                   legend.position = "none",
+                   pt.size = 2,
+                   split.by = "group")
+
+
+UMAP_plot_byGroup
+
+pdf(paste0(params$out,"/figures/snATAC_UMAP_splitByGroup.pdf"),
+    height = 10, width = 15)
+UMAP_plot_byGroup
+dev.off()
+
+
+png(paste0(params$out,"/figures/snATAC_UMAP_splitByGroup.png"))
+UMAP_plot_byGroup
+dev.off()
+```
+
+```{r}
+library(reshape2)
+percent_group <- table(ATAC$cell_type,ATAC$group)
+
+# remove NB cells
+percent_group <- percent_group[-6,]
+
+# Transform this data in %
+data_percentage <- apply(percent_group, 2, 
+                         function(x){x*100/sum(x,na.rm=T)})
+
+percent_group_trans <- melt(data_percentage) 
+
+barplot_groups <- ggplot(percent_group_trans, aes(x = Var2, 
+                                                      y = value, 
+                                                      fill = Var1)) + 
+  geom_bar(stat = "identity", position = "stack") +
+  theme_void() + 
+  labs(x = "", y = "Percentage of cells assigned to each cluster", 
+       fill = "Clusters") +  
+  ggtitle("snATAC-seq: Stacked barplot of cell types") +
+  theme_minimal() +
+  scale_fill_manual(values = COLOR_CODE_ATAC)
+
+barplot_groups
+
+pdf(paste0(params$out,"figures/barplot_ATACseq_all_clusters_per_group.pdf"))
+barplot_groups
+dev.off()
+```
+
+```{r}
+percent_sample <- table(ATAC$cell_type,ATAC$sample)
+
+# remove NB cells
+percent_sample <- percent_sample[-6,]
+
+# Transform this data in %
+data_percentage <- apply(percent_sample, 2, 
+                         function(x){x*100/sum(x,na.rm=T)})
+
+percent_sample_trans <- melt(data_percentage) 
+
+barplot_samples <- ggplot(percent_sample_trans, aes(x = Var2, 
+                                                      y = value, 
+                                                      fill = Var1)) + 
+  geom_bar(stat = "identity", position = "stack") +
+  theme_void() + 
+  labs(x = "", y = "Percentage of cells assigned to each cluster", 
+       fill = "Clusters") +  
+  ggtitle("snATAC-seq: Stacked barplot of cell types") +
+  theme_minimal() +
+  scale_fill_manual(values = COLOR_CODE_ATAC)
+
+barplot_samples
+
+pdf(paste0(params$out,"figures/barplot_ATACseq_all_clusters_per_sample.pdf"))
+barplot_samples
+dev.off()
+```
+
+```{r eval=FALSE, include=FALSE}
+Idents(ATAC) <- ATAC$cell_type
+
+NK_ATAC <- subset(ATAC, 
+                  idents = "NKT", 
+                  invert = FALSE)
+
+saveRDS(NK_ATAC, file = paste0(params$out, "/Rds/fetahu2023_scATAC_NK.Rds"))
+```
+
+```{r eval=FALSE, include=FALSE}
+NK_ATAC <- readRDS(file = paste0(params$out, "/Rds/fetahu2023_scATAC_NK.Rds"))
+```
+
+```{r eval=FALSE, include=FALSE}
+Idents(NK_ATAC) <- NK_ATAC$sample
+DimPlot(NK_ATAC,
+        group.by = "group")
+```
+
+```{r eval=FALSE, include=FALSE}
+set.seed(2805)
+
+DensityScatter(NK_ATAC,
+               x = 'nCount_peaks', 
+               y = 'TSS.enrichment', 
+               log_x = TRUE, 
+               quantiles = TRUE)
+
+VlnPlot(
+  object = NK_ATAC,
+  features = c('nCount_peaks', 
+               'TSS.enrichment', 
+               'blacklist_ratio', 
+               'nucleosome_signal', 
+               'pct_reads_in_peaks'),
+  pt.size = 0.3,
+  ncol = 5)
+
+NK_ATAC <- subset(
+  x = NK_ATAC,
+  subset = nCount_peaks > 1500 &
+    nCount_peaks < 30000 &
+    pct_reads_in_peaks > 50 &
+    blacklist_ratio < 0.002 &
+    nucleosome_signal < 1.5 &
+    TSS.enrichment > 2)
+
+
+NK_ATAC <- RunTFIDF(NK_ATAC)
+NK_ATAC <- FindTopFeatures(NK_ATAC, 
+                          min.cutoff = '10')
+NK_ATAC <- RunSVD(NK_ATAC)
+DepthCor(NK_ATAC)
+
+NK_ATAC <- RunUMAP(object = NK_ATAC, reduction = 'lsi', dims = 2:30)
+NK_ATAC <- FindNeighbors(object = NK_ATAC, 
+                         reduction = 'scOpen', 
+                         dims = 2:30)
+NK_ATAC <- FindClusters(object = NK_ATAC, 
+                        verbose = FALSE, 
+                        resolution = 0.2,
+                        algorithm = 3)
+DimPlot(object = NK_ATAC, 
+        label = TRUE) + NoLegend()
+
+table(NK_ATAC$seurat_clusters)
+Idents(NK_ATAC) <- NK_ATAC$seurat_clusters
+
+NK_ATAC <- subset(NK_ATAC, 
+                  idents = c("0","1","2"))
+
+DimPlot(object = NK_ATAC, 
+        label = TRUE) + NoLegend()
+
+NK_ATAC$seurat_clusters <- droplevels(NK_ATAC$seurat_clusters)
+```
+
+```{r eval=FALSE, include=FALSE}
+saveRDS(NK_ATAC, file = paste0(params$out, "/Rds/fetahu2023_scATAC_NK_processed.Rds"))
+```
+
+```{r}
+NK_ATAC <- readRDS(file = paste0(params$out, "/Rds/fetahu2023_scATAC_NK_processed.Rds"))
+```
+
+```{r}
+library(reshape2)
+
+Idents(NK_ATAC) <- NK_ATAC$seurat_clusters
+
+NK_ATAC$group <- as.factor(NK_ATAC$group)
+NK_ATAC$seurat_clusters <- as.factor(NK_ATAC$seurat_clusters)
+percent_group <- table(NK_ATAC$seurat_clusters, NK_ATAC$group)
+
+# Transform this data in %
+data_percentage <- apply(percent_group, 2, 
+                         function(x){x*100/sum(x,na.rm=T)})
+
+percent_group_trans <- melt(data_percentage) 
+
+COLOR_CODE_BAR_PLOT <- c("0" = "#0A369D",
+                         "1" = "#8AB17D",
+                         "2" = "#E05263")
+
+ggplot(percent_group_trans, aes(x = Var2, y = value, fill = Var1)) + 
+  geom_bar(stat = "identity", position = "stack") +
+  theme_void() + 
+  labs(x = "", y = "Percentage of NK cells assigned to each sub-cluster", 
+       fill = "NK clusters") +  
+  ggtitle("Clustered Stacked Bar Plot of NK Groups") +
+  theme(axis.text.x = element_text(angle = 0, 
+                                   color = "black",
+                                   size = 16),
+        axis.text.y = element_text(angle = 0, 
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 16),
+        legend.text = element_text(angle = 0, 
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 18),
+        axis.title.x = element_text(size = 16,
+                                    color = "black",),                        
+        axis.title.y = element_text(size = 16,
+                                    color = "black",angle = 90),                 
+        legend.title = element_text(size = 16,
+                                    color = "black"),
+        title = element_text(size = 20,
+                                    color = "black")) 
+```
+
+```{r}
+library(epiAneufinder)
+epiAneufinder(input = "/home/rstudio/mnt_out/CancReg/snATAC-seq_stage_M/results/published/data/AGGR_ALL_ATAC/fragments.tsv", 
+              outdir = paste0(params$out), 
+              blacklist = paste0("/home/rstudio/mnt_resources/",
+                                 "hg38-blacklist.v2.bed"),
+              windowSize = 1e5, 
+              genome = "BSgenome.Hsapiens.UCSC.hg38", 
+              exclude = c('chrX','chrY','chrM'), 
+              reuse.existing = FALSE,
+              title_karyo = "Karyogram", 
+              ncores = 32,
+              minFrags = 50, # 20154 cells remain with 50
+              threshold_cells_nbins = 0.01,
+              minsizeCNV = 0,
+              k = 2,
+              plotKaryo = TRUE)
+```
+
+
+```{r eval=FALSE, include=FALSE}
+# there was an issue with the index of the fragment file
+# so i loaded the original file and subset it to the NK cells only
+# than loaded the subset file to the seurat object
+
+library(data.table)
+
+frag_file <-"/home/rstudio/mnt_out/snATAC-seq_stage_M/results/published/data/AGGR_ALL_ATAC/fragments.tsv.gz"
+output_frag_file <- paste0(params$out,"Rds/feathu2023_ATAC_NKcells_fragments.tsv")
+
+# Get the cell barcodes from the subsetted Seurat object
+subset_barcodes <- colnames(NK_ATAC)
+
+# Read the original fragment file, filter it, and write a new one
+fragments <- fread(cmd = paste("zcat", frag_file), sep = "\t", header = FALSE)
+
+# Ensure correct format: Fragment files should have 5 columns (chromosome, start, end, barcode, count)
+colnames(fragments) <- c("chr", "start", "end", "barcode", "count")
+
+# Filter for barcodes in the subsetted Seurat object
+subset_fragments <- fragments[fragments$barcode %in% subset_barcodes]
+
+# Write to a new gzipped fragment file
+fwrite(subset_fragments, file = output_frag_file, sep = "\t", col.names = FALSE)
+```
+
+```{bash eval=FALSE, include=FALSE}
+# Compress the file using bgzip
+bgzip output_frag_file
+
+# index file
+tabix -p bed feathu2023_ATAC_NKcells_fragments.tsv.gz
+```
+
+```{r}
+output_frag_file <- paste0(params$out,"Rds/feathu2023_ATAC_NKcells_fragments.tsv.gz")
+
+fragments <- CreateFragmentObject(
+  path = output_frag_file,
+  cells = colnames(NK_ATAC))
+
+NK_ATAC[['peaks']]@fragments <- list(fragments)
+```
+
+```{r}
+# extrapolating RNA activity based on chromatin accessibility of the corresponding promoter regions
+gene.activities <- GeneActivity(NK_ATAC)
+
+# add the gene activity matrix to the Seurat object as a new assay and normalize it
+NK_ATAC[['RNA']] <- CreateAssayObject(counts = gene.activities)
+NK_ATAC <- NormalizeData(
+  object = NK_ATAC,
+  assay = 'RNA',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(NK_ATAC$nCount_RNA)
+)
+```
+
+```{r}
+DefaultAssay(NK_ATAC) <- 'RNA'
+
+FeaturePlot(
+  object = NK_ATAC,
+  features = c("ZEB2","KLF2"),
+  pt.size = 0.3,
+  max.cutoff = 'q25',
+  ncol = 2)
+```
+
+```{r fig.height=20, fig.width=20}
+FeaturePlot(
+  object = NK_ATAC,
+  features = TFs,
+  pt.size = 0.3,
+  max.cutoff = 'q75',
+  ncol = 4)
+```
+
+# ___Differentially accessible peaks between NK sub-types___
+
+```{r}
+# change back to working with peaks instead of gene activities
+DefaultAssay(NK_ATAC) <- 'peaks'
+
+# wilcox is the default option for test.use
+da_peaks_0vs1 <- FindMarkers(
+  object = NK_ATAC,
+  ident.1 = "0",
+  ident.2 = "1",
+  test.use = 'wilcox',
+  min.pct = 0.1
+)
+
+head(da_peaks_0vs1)
+```
+
+```{r}
+da_peaks_1vs2 <- FindMarkers(
+  object = NK_ATAC,
+  ident.1 = "1",
+  ident.2 = "2",
+  test.use = 'wilcox',
+  min.pct = 0.1
+)
+
+head(da_peaks_1vs2)
+```
+
+```{r}
+da_peaks_0vs2 <- FindMarkers(
+  object = NK_ATAC,
+  ident.1 = "0",
+  ident.2 = "2",
+  test.use = 'wilcox',
+  min.pct = 0.1
+)
+
+head(da_peaks_0vs2)
+```
+
+```{r}
+saveRDS(NK_ATAC, file = paste0(params$out, "/Rds/fetahu2023_scATAC_NK_processed.Rds"))
+```
+

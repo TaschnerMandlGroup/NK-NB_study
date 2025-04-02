@@ -1,0 +1,573 @@
+---
+title: "NK project: DA analysis for TME cell types"
+author: "Dr. Sara Wernig-Zorc"
+date: "`r format(Sys.time(), '%B %Y')`"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  input_BM1: "/home/rstudio/mnt_data/CancReg/BM/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"
+  input_BM2: "/home/rstudio/mnt_data/CancReg/BM/yang2019/Rds/Human_BM_NK_seurat_v4.Rds"
+  input_BM3: "/home/rstudio/mnt_data/CancReg/BM/Lee/disco_bone_marrow_v2.0.rds"
+  input_scRNA: "/home/rstudio/mnt_out/NK_project/Rds/fetahu2023_withNewMetadata.Rds"
+  out: "/home/rstudio/mnt_out/NK_project/"
+  GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
+  markers: "/home/rstudio/mnt_resources/MES_ADRN/"
+  metadata: "/home/rstudio/mnt_out/CancReg/scRNA-seq_stage_M/results/metadata/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 80)
+options(future.globals.maxSize = 80 * 10^9)
+options(Seurat.object.assay.version = "v5")
+print(params)
+```
+
+```{r load project specific R packages and color code}
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_setup.R")
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_utils.R")
+```
+
+```{r}
+library(reshape2)
+```
+
+Supplemental Figure 1 of the manuscript Rados et al., 2025
+
+Since clinical groups have been misannotated, we wanted to show DA of TME cell
+type with the new clinical annotations. 
+
+We show that cluster 6 of T-cells, NK cells and cluster 1 of Monocytes, as well
+as cluster 3 of B-cells are present in higher abundance in ATRXdel NB bone marrow
+samples. 
+
+```{r}
+fetahu2023 <- readRDS(params$input_scRNA)
+```
+
+```{r}
+fetahu2023$cell_type <- fetahu2023$orig.ident
+table(fetahu2023$cell_type, fetahu2023$group)
+```
+
+# ___DA testing___
+
+If comparing more than two sample / groups, use DA testing with contrasts
+MiloR doesn't use the "original" clusters but rather creates neighborhoods
+based on similar logFC (note the fold change here is the number of cells
+per cell type)
+
+
+```{r}
+Idents(fetahu2023) <- fetahu2023$orig.ident
+# remove TU cells for DA analysis
+TME_cells <- subset(fetahu2023, 
+       idents = "NB (8)", 
+       invert = TRUE)
+
+TME_cells$celltype <- TME_cells$orig.ident
+```
+
+
+```{r}
+# Create meta-clusters
+TME_cells$celltype_meta <- as.character(Idents(TME_cells))
+
+# Annotate all T-cell subsets as 'T-cells'
+TME_cells$celltype_meta[grepl("^T \\(", TME_cells$celltype_meta)] <- "T-cells"
+TME_cells$celltype_meta[grepl("^B \\(", TME_cells$celltype_meta)] <- "B-cells"
+TME_cells$celltype_meta[grepl("^NK \\(", TME_cells$celltype_meta)] <- "NK-cells"
+TME_cells$celltype_meta[grepl("^M \\(", TME_cells$celltype_meta)] <- "Myeloid cells"
+TME_cells$celltype_meta[grepl("^pDC \\(", TME_cells$celltype_meta)] <- "Dendritic cells"
+TME_cells$celltype_meta[grepl("^SC \\(", TME_cells$celltype_meta)] <- "Progenitor cells"
+TME_cells$celltype_meta[grepl("^E \\(", TME_cells$celltype_meta)] <- "Erythroid cells"
+TME_cells$celltype_meta[grepl("^other \\(", TME_cells$celltype_meta)] <- "Unknown"
+
+# If needed, convert back to factor with proper ordering
+TME_cells$celltype_meta <- factor(TME_cells$celltype_meta, 
+                                      levels = unique(TME_cells$celltype_meta))
+
+Idents(TME_cells) <- TME_cells$celltype_meta
+```
+
+
+```{r fig.height=10, fig.width=10}
+percent_cell_type_group <- table(TME_cells$cell_type,
+                          TME_cells$group)
+
+# Transform this data in %
+data_percentage <- apply(percent_cell_type_group, 2, 
+                         function(x){x*100/sum(x,na.rm=T)})
+
+percent_cell_type_group_trans <- melt(data_percentage) 
+
+barplots_cell_types <- ggplot(percent_cell_type_group_trans, 
+                             aes(x = Var2, y = value, fill = Var1)) + 
+  geom_bar(stat = "identity", position = "stack") +
+  theme_void() + 
+  labs(x = "", y = "Percentage of cells assigned to each cluster", 
+       fill = "Clusters") +  
+  ggtitle("") +
+  theme_minimal(base_size = 22) + 
+  theme(axis.text.x = element_text(angle = 45,
+
+                                   hjust = 1)) +
+  scale_fill_manual(values = COLOR_CODE_FETAHU2023)
+
+barplots_cell_types
+
+pdf(paste0(params$out,"figures/barplot_ALL_cell_types_per_NB_group.pdf"),
+    height = 10, width = 10)
+barplots_cell_types
+dev.off()
+
+
+```
+
+
+```{r fig.height=10, fig.width=10}
+percent_cell_type_group <- table(TME_cells$celltype_meta,
+                          TME_cells$group)
+
+# Transform this data in %
+data_percentage <- apply(percent_cell_type_group, 2, 
+                         function(x){x*100/sum(x,na.rm=T)})
+
+percent_cell_type_group_trans <- melt(data_percentage) 
+
+barplots_cell_types <- ggplot(percent_cell_type_group_trans, 
+                             aes(x = Var2, y = value, fill = Var1)) + 
+  geom_bar(stat = "identity", position = "stack") +
+  theme_void() + 
+  labs(x = "", y = "Percentage of cells assigned to each cluster", 
+       fill = "Clusters") +  
+  ggtitle("") +
+  theme_minimal(base_size = 22) + 
+  theme(axis.text.x = element_text(angle = 45,
+
+                                   hjust = 1)) +
+  scale_fill_manual(values = COLOR_CODE_FETAHU2023_META)
+
+barplots_cell_types
+
+pdf(paste0(params$out,"figures/barplot_ALL_meta_cell_types_per_NB_group.pdf"),
+    height = 10, width = 10)
+barplots_cell_types
+dev.off()
+
+
+```
+
+
+```{r}
+TME_cells@meta.data$rados_et_al_2025.x <- factor(TME_cells@meta.data$rados_et_al_2025.x)
+TME_cells@meta.data$cell_type <- factor(TME_cells@meta.data$cell_type)
+table(TME_cells$cell_type, TME_cells$group)
+```
+
+
+```{r}
+TME_cells@meta.data$rados_et_al_2025.x <- factor(TME_cells@meta.data$rados_et_al_2025.x)
+TME_cells@meta.data$celltype_meta <- factor(TME_cells@meta.data$celltype_meta)
+table(TME_cells$celltype_meta, TME_cells$group)
+```
+
+
+```{r miloR prepare data}
+library("statmod")
+library("miloR")
+library("SingleCellExperiment")
+library("scater")
+library("scran")
+library("dplyr")
+library("patchwork")
+
+rna_milo <- Milo(as.SingleCellExperiment(TME_cells))
+rna_milo
+
+reducedDim(rna_milo, "UMAP") <- reducedDim(as.SingleCellExperiment(TME_cells), 
+                                           "UMAP")
+plotUMAP(rna_milo, 
+         colour_by="group") + 
+  plotUMAP(rna_milo, 
+           colour_by="rados_et_al_2025.x")
+
+# Define cell neighbourhoods
+rna_milo <- buildGraph(rna_milo, 
+                       k = 100)
+
+## Constructing kNN graph with k = 100
+rna_milo <- makeNhoods(rna_milo,
+                       prop = 0.1, 
+                       k = 100, # 100 nearest neighbors for clustering
+                       d = 50, 
+                       refined = TRUE, 
+                       refinement_scheme = "graph") # make nhoods using graph-only as this is faster
+
+# metadata
+colData(rna_milo)$patients <- paste(colData(rna_milo)$group, 
+                                    colData(rna_milo)$rados_et_al_2025.x, sep="_")
+
+# Counting cells in neighborhoods
+rna_milo <- countCells(rna_milo, meta.data = data.frame(colData(rna_milo)), 
+                       samples = "patients") # make the nhood X sample counts matrix
+
+
+# Defining experimental design
+rna_design <- data.frame(colData(rna_milo))[,c("patients", "group")]
+rna_design <- distinct(rna_design)
+rownames(rna_design) <- rna_design$patients
+rna_design
+
+# Computing neighborhood connectivity
+rna_milo <- calcNhoodDistance(rna_milo, 
+                              d = 50, 
+                              reduced.dim = "PCA")
+
+# DA testing
+da_results <- testNhoods(rna_milo, 
+                         design = ~ 0 + group,
+                         design.df = rna_design, 
+                         reduced.dim = "PCA")
+head(da_results)
+
+da_results %>%
+  arrange(SpatialFDR) %>%
+  head() 
+
+rna_milo <- buildNhoodGraph(rna_milo)
+
+
+# QUALITY CHECK OF THE DIFFERENTIAL ABUNDANCE TESTING
+# Plot single-cell UMAP
+umap_pl <- plotReducedDim(rna_milo, 
+                          dimred = "UMAP", 
+                          colour_by = "group", 
+                          text_by = "celltype", 
+                          text_size = 3, point_size = 0.5,) +
+  guides(fill = "none")
+
+rna_milo <- buildNhoodGraph(rna_milo)
+
+# Plot neighbourhood graph
+nh_graph_pl <- plotNhoodGraphDA(rna_milo, 
+                                da_results, 
+                                layout = "UMAP", 
+                                alpha = 0.05) 
+
+umap_pl + nh_graph_pl +
+  plot_layout(guides = "collect")
+
+# Differential abundance testing with contrasts
+rna_design <- data.frame(colData(rna_milo))[,c("patients", "group")]
+rna_design <- distinct(rna_design)
+rownames(rna_design) <- rna_design$patients
+
+# Reorder rownames to match columns of nhoodCounts(milo)
+rna_design <- rna_design[colnames(nhoodCounts(rna_milo)), , drop=FALSE]
+table(rna_design$group)
+
+saveRDS(rna_milo, file = paste0(params$out,"Rds/miloR_TME_cells.Rds"))
+```
+
+## ___A. ATRXdel vs. ATRXwt [MYCNamp + ATRXwtMYCNwt]___
+
+```{r fig.height=6, fig.width=10}
+model <- model.matrix(~ 0 + group, data = rna_design)
+ave.contrast <- c("groupATRXdel - ((groupMYCNamp + groupATRXwtMYCNwt) / 2)")
+mod.constrast <- makeContrasts(contrasts = ave.contrast, levels = model)
+mod.constrast
+
+da_results_ATRXdelvsWT <- testNhoods(rna_milo, 
+                                      design = ~ 0 + group, 
+                         design.df = rna_design, 
+                         model.contrasts = ave.contrast, 
+                         fdr.weighting = "graph-overlap")
+
+table(da_results_ATRXdelvsWT$SpatialFDR < 0.1)
+table(da_results_ATRXdelvsWT$SpatialFDR < 0.05)
+table(da_results_ATRXdelvsWT$SpatialFDR < 0.01)
+
+# annotate hood with original cell type annotation
+da_results_ATRXdelvsWT <- annotateNhoods(rna_milo, 
+                                          da_results_ATRXdelvsWT, 
+                                          coldata_col = "celltype")
+
+# remove hoods that contained mixed cell type populations
+da_results_ATRXdelvsWT$celltype <- 
+  ifelse(da_results_ATRXdelvsWT$celltype_fraction < 0.7, 
+         "Mixed", da_results_ATRXdelvsWT$celltype)
+
+# filter only significant populations (less than 10% false discovery rate and 
+# fold change bigger than 0.5)
+results <- da_results_ATRXdelvsWT %>% 
+  arrange(FDR) %>% filter(FDR < 0.1 & abs(logFC) >= 0.5)
+results
+
+da_results_ATRXdelvsWT$cell_type <- as.factor(da_results_ATRXdelvsWT$celltype)
+
+DA_plot_ATRTXdel_vs_ATRXwt <- plotDAbeeswarm(da_results_ATRXdelvsWT, 
+               group.by = "celltype", 
+               alpha = 0.1) # cut-off for spatial FDR
+
+DA_plot_ATRTXdel_vs_ATRXwt
+
+pdf(paste0(params$out,"figures/DA_plot_all_clusters_ATRTXdel_vs_ATRXwt.pdf"),
+    width = 10, height = 6)
+DA_plot_ATRTXdel_vs_ATRXwt
+dev.off()
+```
+
+```{r fig.height=6, fig.width=10}
+model <- model.matrix(~ 0 + group, data = rna_design)
+ave.contrast <- c("groupATRXdel - ((groupMYCNamp + groupATRXwtMYCNwt) / 2)")
+mod.constrast <- makeContrasts(contrasts = ave.contrast, levels = model)
+mod.constrast
+
+da_results_ATRXdelvsWT <- testNhoods(rna_milo, 
+                                      design = ~ 0 + group, 
+                         design.df = rna_design, 
+                         model.contrasts = ave.contrast, 
+                         fdr.weighting = "graph-overlap")
+
+table(da_results_ATRXdelvsWT$SpatialFDR < 0.1)
+table(da_results_ATRXdelvsWT$SpatialFDR < 0.05)
+table(da_results_ATRXdelvsWT$SpatialFDR < 0.01)
+
+# annotate hood with original cell type annotation
+da_results_ATRXdelvsWT <- annotateNhoods(rna_milo, 
+                                          da_results_ATRXdelvsWT, 
+                                          coldata_col = "celltype_meta")
+
+# remove hoods that contained mixed cell type populations
+da_results_ATRXdelvsWT$celltype_anno <- 
+  ifelse(da_results_ATRXdelvsWT$celltype_meta_fraction < 0.7, 
+         "Mixed", da_results_ATRXdelvsWT$celltype_meta)
+
+# filter only significant populations (less than 10% false discovery rate and 
+# fold change bigger than 0.5)
+results <- da_results_ATRXdelvsWT %>% 
+  arrange(FDR) %>% filter(FDR < 0.1 & abs(logFC) >= 0.5)
+results
+
+da_results_ATRXdelvsWT$celltype_anno <- as.factor(da_results_ATRXdelvsWT$celltype_anno)
+
+DA_plot_ATRTXdel_vs_ATRXwt <- plotDAbeeswarm(da_results_ATRXdelvsWT, 
+               group.by = "celltype_anno", 
+               alpha = 0.1) # cut-off for spatial FDR
+
+DA_plot_ATRTXdel_vs_ATRXwt
+
+pdf(paste0(params$out,"figures/DA_plot_all_meta-clusters_ATRTXdel_vs_ATRXwt.pdf"),
+    width = 10, height = 6)
+DA_plot_ATRTXdel_vs_ATRXwt
+dev.off()
+```
+
+
+## ___B. ATRXdel vs. ALL (MYCNamp and ATRXwtMYCNwt and controls)___
+
+```{r fig.height=7, fig.width=11}
+model <- model.matrix(~ 0 + group, data = rna_design)
+ave.contrast <- c("groupATRXdel - ((groupMYCNamp + groupATRXwtMYCNwt + groupcontrol) / 3)")
+mod.constrast <- makeContrasts(contrasts = ave.contrast, levels = model)
+mod.constrast
+
+da_results_ATRXdelvsALL <- testNhoods(rna_milo, 
+                                      design = ~ 0 + group, 
+                         design.df = rna_design, 
+                         model.contrasts = ave.contrast, 
+                         fdr.weighting = "graph-overlap")
+
+table(da_results_ATRXdelvsALL$SpatialFDR < 0.1)
+table(da_results_ATRXdelvsALL$SpatialFDR < 0.05)
+table(da_results_ATRXdelvsALL$SpatialFDR < 0.01)
+
+# annotate hood with original cell type annotation
+da_results_ATRXdelvsALL <- annotateNhoods(rna_milo, 
+                                          da_results_ATRXdelvsALL, 
+                                          coldata_col = "celltype")
+
+# remove hoods that contained mixed cell type populations
+da_results_ATRXdelvsALL$celltype <- 
+  ifelse(da_results_ATRXdelvsALL$celltype_fraction < 0.7, 
+         "Mixed", da_results_ATRXdelvsALL$celltype)
+
+# filter only significant populations (less than 10% false discovery rate and 
+# fold change bigger than 0.5)
+results <- da_results_ATRXdelvsALL %>% 
+  arrange(FDR) %>% filter(FDR < 0.1 & abs(logFC) >= 0.5)
+results
+
+da_results_ATRXdelvsALL$celltype <- as.factor(da_results_ATRXdelvsALL$celltype)
+
+
+DA_plot_ATRXdelvsALL <- plotDAbeeswarm(da_results_ATRXdelvsALL, 
+               group.by = "celltype", 
+               alpha = 0.01) # cut-off for spatial FDR
+
+DA_plot_ATRXdelvsALL
+
+pdf(paste0(params$out,"figures/DA_plot_all_clusters_ATRTXdel_vs_ALL.pdf"),
+    width = 10, height = 6)
+DA_plot_ATRXdelvsALL
+dev.off()
+```
+
+
+```{r fig.height=6, fig.width=10}
+model <- model.matrix(~ 0 + group, data = rna_design)
+ave.contrast <- c("groupATRXdel - ((groupMYCNamp + groupATRXwtMYCNwt + groupcontrol) / 3)")
+mod.constrast <- makeContrasts(contrasts = ave.contrast, levels = model)
+mod.constrast
+
+da_results_ATRXdelvsALL <- testNhoods(rna_milo, 
+                                      design = ~ 0 + group, 
+                         design.df = rna_design, 
+                         model.contrasts = ave.contrast, 
+                         fdr.weighting = "graph-overlap")
+
+table(da_results_ATRXdelvsALL$SpatialFDR < 0.1)
+table(da_results_ATRXdelvsALL$SpatialFDR < 0.05)
+table(da_results_ATRXdelvsALL$SpatialFDR < 0.01)
+
+# annotate hood with original cell type annotation
+da_results_ATRXdelvsALL <- annotateNhoods(rna_milo, 
+                                          da_results_ATRXdelvsALL, 
+                                          coldata_col = "celltype_meta")
+
+# remove hoods that contained mixed cell type populations
+da_results_ATRXdelvsALL$celltype_anno <- 
+  ifelse(da_results_ATRXdelvsALL$celltype_meta_fraction < 0.7, 
+         "Mixed", da_results_ATRXdelvsALL$celltype_meta)
+
+da_results_ATRXdelvsALL$celltype_anno <- as.factor(da_results_ATRXdelvsALL$celltype_anno)
+
+DA_plot_ATRXdelvsALL <- plotDAbeeswarm(da_results_ATRXdelvsALL, 
+               group.by = "celltype_anno", 
+               alpha = 0.01) # cut-off for spatial FDR
+
+DA_plot_ATRXdelvsALL
+
+pdf(paste0(params$out,"figures/DA_plot_all_meta-clusters_ATRTXdel_vs_ALL.pdf"),
+    width = 10, height = 6)
+DA_plot_ATRXdelvsALL
+dev.off()
+```
+
+```{r}
+
+# filter only significant populations (less than 10% false discovery rate and 
+# fold change bigger than 0.5)
+results <- da_results_ATRXdelvsALL %>% 
+  arrange(FDR) %>% filter(FDR < 0.1 & abs(logFC) >= 0.5)
+results
+
+results_table <- data.frame(da_results_ATRXdelvsALL$celltype_anno,
+                            da_results_ATRXdelvsALL$logFC)
+
+# Ensure your data frame has proper column names
+colnames(results_table) <- c("celltype_anno", "logFC")
+
+# Plot
+ggplot(results_table, aes(x = logFC, fill = celltype_anno)) +
+  geom_density(alpha = 0.5, color = NA) +  # No outline to avoid clutter
+  scale_fill_manual(values = COLOR_CODE_FETAHU2023_META) +
+  theme_minimal() +
+  labs(
+    title = "DA of cell types",
+    x = "logFC",
+    y = "Density"
+  ) +
+  theme(
+    text = element_text(size = 14),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+
+# ___dotplots___
+
+
+```{r fig.height=10, fig.width=10}
+
+genes_of_interest <- c("CD6","CD8A","FCGR3A","ID2","ZEB2","STAT5A","STAT4","NCR1")
+
+do_DotPlot(ALL_NK, 
+           group.by = "NK_subtype_per_group",
+           features = genes_of_interest,
+           scale = TRUE,
+           use_viridis = TRUE,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+
+do_DotPlot(ALL_NK, 
+           group.by = "group_per_NK_subtype",
+           features = genes_of_interest,
+           scale = TRUE,
+           use_viridis = TRUE,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+```
+
+```{r fig.height=10, fig.width=10}
+
+genes_of_interest <- c("IL18","IL2", "IL15")
+
+do_DotPlot(ALL_NK, 
+           group.by = "NK_subtype_per_group",
+           features = genes_of_interest,
+           scale = TRUE,
+           use_viridis = TRUE,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+
+do_DotPlot(ALL_NK, 
+           group.by = "group_per_NK_subtype",
+           features = genes_of_interest,
+           scale = TRUE,
+           use_viridis = TRUE,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+```
+
+
+
+```{r}
+sessionInfo()
+```
+

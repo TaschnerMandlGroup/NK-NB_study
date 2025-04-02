@@ -1,0 +1,241 @@
+---
+title: "NK project: Desensetized NK cells & NK-MO-DC regulation axis "
+author: "Dr. Sara Wernig-Zorc"
+date: "`r format(Sys.time(), '%B %Y')`"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  input_BM1: "/home/rstudio/mnt_data/BM/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"
+  input_BM2: "/home/rstudio/mnt_data/BM/yang2019/Rds/Human_BM_NK_seurat_v4.Rds"
+  input_BM3: "/home/rstudio/mnt_data/BM/Lee/disco_bone_marrow_v2.0.rds"
+  input_scRNA: "/home/rstudio/mnt_out/scRNA-seq_stage_M/results/published/data/rna_decontaminated.rds"
+  out: "/home/rstudio/mnt_out/NK_project/"
+  GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
+  markers: "/home/rstudio/mnt_resources/MES_ADRN/"
+---
+
+PROJECT DESCRIPTION
+
+Identify NK sub-populations in tumor-infiltrated bone marrow samples from
+Neuroblastoma patients.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 20)
+options(future.globals.maxSize = 8 * 10^9)
+
+print(params)
+```
+
+```{r load project specific R packages and color code}
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_setup.R")
+source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_utils.R")
+```
+
+# ___Load data___
+
+```{r}
+fetahu2023 <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_withNewMetadata.Rds"))
+predicted_labels <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_predicted_NKclusters_from_Crinier2021_de.n=350.Rds"))
+ALL_NK <- readRDS(file = paste0(params$out,"/Rds/ALL_NK_cluster_withNewMetadata.Rds"))
+```
+
+```{r eval=FALSE, include=FALSE}
+group <- "genetic_subtype" 
+NK_subtype <- "predicted_NK_type_de.n350"  
+
+# Create a new metadata column that concatenates values from both columns
+ALL_NK$group_per_NK_subtype <- paste(ALL_NK@meta.data[[group]], 
+                                      ALL_NK@meta.data[[NK_subtype]], 
+                                      sep = "_")
+
+# Check if the new column is added
+ALL_NK@meta.data$group_per_NK_subtype <- as.factor(ALL_NK@meta.data$group_per_NK_subtype)
+table(ALL_NK@meta.data$group_per_NK_subtype)
+```
+
+```{r eval=FALSE, include=FALSE}
+saveRDS(ALL_NK, file = paste0(params$out,"/Rds/ALL_NK_cluster_withNewMetadata.Rds"))
+```
+
+
+# ___Desensitized/exhausted NK cells___
+
+List of genes from NK Cell Exhaustion review paper from 2017 
+DOI: 10.3389/fimmu.2017.00760
+
+2B4 protein = CD244 gene
+NKG2A protein = KLRC1 gene
+NKG2D protein = KLRK1 gene
+NRC proteins = NCOA1, NCOA2, NCOA3
+CD16 protein = FCGR3A Gene gene
+TIM3 protein = HAVCR2 gene
+
+
+```{r fig.height=8.36, fig.width=8.20}
+exhausted_NK_genes <- list(up = c("PDCD1", "HAVCR2", "KLRC1"),
+                           down = c("KLRK1","FCGR3A","NCOA1", "NCOA2", 
+                                    "NCOA3","CD226","CD244","IFNG")) 
+
+do_DotPlot(ALL_NK, 
+           features = exhausted_NK_genes, 
+           group.by = "group_per_NK_subtype", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1
+           )
+```
+
+# ___CCC analysis___
+
+The degree to which NK cells are active against tumour cells is highly dependent 
+on the activation state of the NK cells, which is regulated in large part by 
+cytokines derived from dendritic cells (DCs) and monocytes
+
+## ___NK cells: L-R expression per cluster per group___
+
+```{r fig.height=8.36, fig.width=15}
+# based on The cancer–natural killer cell immunity cycle review paper
+# high or low expression of  these genes is associated with a good prognosis 
+# in a pan-cancer analysis
+
+NK_receptors <- c("ADORA2A","CD2","CD226", "CD244", "TIGIT","TMIGD2", 
+                  "NCR1","NCR2","NCR3","NT5E", "ITGAL", "ITGB2","PDCD1",
+                  "KLRC1","KLRC2", "KLRC3", "KLRC4", "KLRD1", "KLRF1",
+                  "KLRG1", "KLRG2","KLRK1", "KIR2DL1", "KIR2DL3", "KIR2DL4", 
+                  "KIR2DS4","KIR3DL1", "KIR3DL2", "KIR3DL3")
+
+NK_secreted_cytokines <- c("CCL5","FLT3LG", "XCL1", "XCL2")
+
+NK_prognosis_markers <- list("NK receptors" = c("ADORA2A","CD2","CD226", "CD244", 
+                                              "TIGIT","TMIGD2", "NCR1","NCR2",
+                                              "NCR3","NT5E", "ITGAL", "ITGB2",
+                                              "PDCD1","KLRC1","KLRC2", "KLRC3", 
+                                              "KLRC4", "KLRD1","KLRF1","KLRG1", 
+                                              "KLRG2","KLRK1","KIR2DL1","KIR2DL3", 
+                                              "KIR2DL4", "KIR3DL1", "KIR3DL2", 
+                                              "KIR3DL3","KIR2DS4"),
+                             "NK secreted 
+                             cytokines" = c("CCL5","FLT3LG", "XCL1", "XCL2"))
+
+do_DotPlot(ALL_NK, 
+           features = NK_prognosis_markers, 
+           group.by = "group_per_NK_subtype", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1
+           )
+```
+
+
+## ___NK - MO - DC axis___
+
+```{r}
+cell_types_of_interest_v2 <- c("NK (4)",
+                               "pDC (12)",
+                               "M (1)","M (2)", "M (10)","M (15)")
+
+fetahu2023.NK.DC.M <- subset(fetahu2023,
+                             idents = cell_types_of_interest_v2)
+
+do_DotPlot(fetahu2023.NK.DC.M, 
+           features = NK_activating_cytokines, 
+           group.by = "orig.ident", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           plot.title = "NK-cell activating cytokines",
+           plot.subtitle = "Monocytes",
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1
+           )
+
+do_ViolinPlot(fetahu2023.NK.DC.M, 
+           features = c("IL2", "IL15", "IL12A", "IL12B","IL18"), 
+           group.by = "orig.ident", 
+           split.by = "genetic_subtype",
+           plot_boxplot = FALSE,
+           slot = "data")
+```
+
+```{r eval=FALSE, include=FALSE}
+saveRDS(fetahu2023.NK.DC.M, 
+        file = paste0(params$out,"Rds/fetahu2023_NK_DC_MO.Rds"))
+```
+
+
+### ___Immunosupresive Monocytes (M10)___
+
+```{r}
+cell_types_of_interest_v3 <- c("M (10)")
+
+fetahu2023.M10 <- subset(fetahu2023,
+                         idents = cell_types_of_interest_v3)
+
+do_DotPlot(fetahu2023.M10, 
+           features = NK_activating_cytokines, 
+           plot.title = "NK-cell activating cytokines",
+           plot.subtitle = "Immunosupresive Monocytes (M10)",
+           group.by = "genetic_subtype", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1
+           )
+```
+
+### ___NK cells___
+
+Chemokines secreated by NK cells and associated with recruiting type 1 
+conventional dendritic cells
+
+```{r fig.height=8.34, fig.width=5}
+do_DotPlot(ALL_NK, 
+           features = c("CCL5","XCL1","FLT3LG"), 
+           group.by = "group_per_NK_subtype", 
+           scale = TRUE,
+           legend.length = 10,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1
+           )
+```
+
+-------------------------------------------------------------------------------
+
+# ___Session Info___
+
+```{r}
+sessionInfo()
+```

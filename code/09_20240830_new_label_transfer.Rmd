@@ -13,10 +13,11 @@ output:
     theme: spacelab
     df_print: paged
 params:
-  input_BM1: "/home/rstudio/mnt_data/BM/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"
-  input_BM2: "/home/rstudio/mnt_data/BM/yang2019/Rds/Human_BM_NK_seurat_v4.Rds"
-  input_BM3: "/home/rstudio/mnt_data/BM/Lee/disco_bone_marrow_v2.0.rds"
-  input_scRNA: "/home/rstudio/mnt_out/scRNA-seq_stage_M/results/published/data/rna_decontaminated.rds"
+  input_BM1: "/home/rstudio/mnt_data/CancReg/BM/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"
+  input_BM2: "/home/rstudio/mnt_data/CancReg/BM/yang2019/Rds/Human_BM_NK_seurat_v4.Rds"
+  input_BM3: "/home/rstudio/mnt_data/CancReg/BM/Lee/disco_bone_marrow_v2.0.rds"
+  input_scRNA: "/home/rstudio/mnt_out/NK_project/Rds/fetahu2023_withNewMetadata.Rds"
+  input_NK: "/home/rstudio/mnt_out/NK_project/Rds/ALL_NK_cluster_withNewMetadata.Rds"
   out: "/home/rstudio/mnt_out/NK_project/"
   GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
   markers: "/home/rstudio/mnt_resources/MES_ADRN/"
@@ -38,17 +39,37 @@ print(params)
 ```
 
 ```{r load project specific R packages and color code}
-source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_setup.R")
-source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_utils.R")
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_setup.R")
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_utils.R")
 ```
 
 # ___Input_data___
 
 ```{r}
 fetahu2023 <- readRDS(file = paste0(params$out,"Rds/fetahu2023_withMetadata.Rds"))
-ALL_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_NK_cluster.Rds"))
+ALL_NK <- readRDS(file = params$input_NK)
 crinier2021 <- readRDS(file = paste0(params$input_BM1))
 ```
+
+```{r fig.height=5, fig.width=6}
+SCpubr::do_DimPlot(crinier2021,
+                                 border.color = NA,
+                                 plot_cell_borders = FALSE,
+                                 reduction = "umap",
+                                 colors.use =  COLOR_CODE_v2,
+                                group.by = "final_clustering",
+                                 repel = TRUE,
+                                 font.size = 18,
+                                 label.size  = 18,
+                                 plot.axes = FALSE,
+                                 label = FALSE,
+                                 legend.title = "Clusters",
+                                 plot.title = "Crinier et al., 2021",
+                                 legend.position = "bottom")
+
+```
+
+
 
 ```{r}
 Idents(ALL_NK) <- ALL_NK@meta.data$sample
@@ -84,7 +105,7 @@ crinier2021 <-
 
 
 # Crinier et al., 2021 as reference
-NK_clusters <- crinier2021$cluster2
+NK_clusters <- crinier2021$final_clustering # !!!
 original_clusters <- ALL_NK$orig.ident
 
 ALL_NK_mat <- GetAssayData(ALL_NK, 
@@ -112,11 +133,21 @@ predicted_labels <- SingleR(test = ALL_NK_mat,
 predicted_label <- predicted_labels$labels
 predicted_label2 <- predicted_labels$pruned.labels
 
+pdf(paste0(params$out,"figures/lablel_transfer_QC.pdf"),
+    height = 5,width = 7)
 plotScoreHeatmap(predicted_labels, 
                  normalize = TRUE,
                  show.labels = TRUE,
-                 annotation_col = as.data.frame(ALL_NK@meta.data[,"sample",
+                 annotation_col = as.data.frame(ALL_NK@meta.data[,"rados_et_al_2025.x",
                                                          drop = FALSE]))
+dev.off()
+
+plotScoreHeatmap(predicted_labels, 
+                 normalize = TRUE,
+                 show.labels = TRUE,
+                 annotation_col = as.data.frame(ALL_NK@meta.data[,"rados_et_al_2025.x",
+                                                         drop = FALSE]))
+
 plotDeltaDistribution(predicted_labels, 
                       ncol = 2
                       )
@@ -153,22 +184,22 @@ cluster_anno <- c("hNK_Bm1","hNK_Bm2","hNK_Bm3","hNK_Bm4")
 
 DimPlot(ALL_NK,
         group.by = "predicted_NK_type",
-        cols = COLOR_CODE_v2)
+        cols = COLOR_CODE_GROUP)
 
 DimPlot(ALL_NK,
         group.by = "predicted_NK_type",
-        split.by = "group.y",
-        cols = COLOR_CODE_v2)
+        split.by = "group",
+        cols = COLOR_CODE_GROUP)
 
 percent_NK_group <- table(ALL_NK$predicted_NK_type,
-                          ALL_NK$group.y)
+                          ALL_NK$group)
 percent_NK_group
 
 percent_NK_sample <- table(ALL_NK$predicted_NK_type,
-                          ALL_NK$patients)
+                          ALL_NK$rados_et_al_2025.x)
 
 barplot(percent_NK_group,
-        col = COLOR_CODE_v2, 
+        col = COLOR_CODE_GROUP, 
         border = "white", 
         xlab = "Group",
         legend.text = cluster_anno)
@@ -331,393 +362,6 @@ saveRDS(predicted_labels,
 
 saveRDS(ALL_NK, 
         file = paste0(params$out,"/Rds/ALL_NK_subclusters_from_Crinier2021_de.n=350.Rds"))
-```
-
-
-```{r}
-# CLUSTER 1
-hNK_Bm1 <- filter(table_NK_per_sample, Var1 == "hNK_Bm1")
-
-# Perform ANOVA testing
-hNK_Bm1_anova <- aov(Freq ~ group, data = hNK_Bm1)
-summary(hNK_Bm1_anova)
-
-# Extract p-value
-p_value <- summary(hNK_Bm1_anova)[[1]][["Pr(>F)"]][1]
-
-# perform wilcox testing
-p_value1 <- wilcox.test(Freq ~ group, 
-                        data = subset(hNK_Bm1, 
-                                      group %in% c("ATRXmut", "sporadic")))$p.value
-p_value2 <- wilcox.test(Freq ~ group, 
-                        data = subset(hNK_Bm1, 
-                                      group %in% c("ATRXmut", "ctrl")))$p.value
-p_value3 <- wilcox.test(Freq ~ group, 
-                        data = subset(hNK_Bm1, 
-                                      group %in% c("ATRXmut", "MYCNA")))$p.value
-
-# Create boxplot and add p-value annotation
-boxplot1 <- hNK_Bm1 %>%
-  ggplot( aes(x = group , y = Freq, fill = group)) +
-    geom_boxplot() +
-    scale_fill_viridis(discrete = TRUE, alpha = 0.6) +
-    theme(legend.position="none",
-          axis.text = element_text(size = 18),
-          axis.title.y = element_text(size = 18),
-          plot.title = element_text(size = 18)) +
-    ggtitle("NK cluster per NB genetic group: hNK_Bm1") +
-    xlab("") + ylab("Number of cells per group") +
-  geom_signif(comparisons = list(c("ATRXmut", "ctrl"),
-                                 c("ATRXmut", "MYCNA"),
-                                 c("ATRXmut", "sporadic")),
-              map_signif_level = FALSE, 
-              y_position = c(max(hNK_Bm1$Freq) + 50, 
-                             max(hNK_Bm1$Freq) + 65, 
-                             max(hNK_Bm1$Freq) + 80))
-
-
-# CLUSTER 2
-hNK_Bm2 <- filter(table_NK_per_sample, Var1 == "hNK_Bm2")
-
-# Perform ANOVA
-hNK_Bm2_anova <- aov(Freq ~ group, data = hNK_Bm2)
-summary(hNK_Bm2_anova)
-
-# Extract p-value
-p_value <- summary(hNK_Bm2_anova)[[1]][["Pr(>F)"]][1]
-
-# perform wilcox testing
-p_value1 <- wilcox.test(Freq ~ group, 
-                        data = subset(hNK_Bm2, 
-                                      group %in% c("ATRXmut", "sporadic")))$p.value
-p_value2 <- wilcox.test(Freq ~ group, 
-                        data = subset(hNK_Bm2, 
-                                      group %in% c("ATRXmut", "ctrl")))$p.value
-p_value3 <- wilcox.test(Freq ~ group, 
-                        data = subset(hNK_Bm2, 
-                                      group %in% c("ATRXmut", "MYCNA")))$p.value
-
-# plot boxplot
-boxplot2 <- hNK_Bm2 %>%
-  ggplot( aes(x = group , y = Freq, fill = group)) +
-    geom_boxplot() +
-    scale_fill_viridis(discrete = TRUE, alpha = 0.6) +
-    theme(legend.position="none",
-          axis.text = element_text(size = 18),
-          axis.title.y = element_text(size = 18),
-          plot.title = element_text(size = 18)) +
-    ggtitle("NK cluster per NB genetic group: hNK_Bm2") +
-    xlab("") + ylab("Number of cells per group") +
-  geom_signif(comparisons = list(c("ATRXmut", "ctrl"),
-                                 c("ATRXmut", "MYCNA"),
-                                 c("ATRXmut", "sporadic")),
-              map_signif_level = FALSE, 
-              y_position = c(max(hNK_Bm2$Freq) + 50, 
-                             max(hNK_Bm2$Freq) + 80, 
-                             max(hNK_Bm2$Freq) + 110)) 
-
-
-# CLUSTER 3
-hNK_Bm3 <- filter(table_NK_per_sample, Var1 == "hNK_Bm3")
-
-# Perform ANOVA
-hNK_Bm3_anova <- aov(Freq ~ group, data = hNK_Bm3)
-summary(hNK_Bm3_anova)
-
-# Extract p-value
-p_value <- summary(hNK_Bm3_anova)[[1]][["Pr(>F)"]][1]
-
-# perform wilcox testing
-p_value1 <- wilcox.test(Freq ~ group, 
-                        data = subset(hNK_Bm3, 
-                                      group %in% c("ATRXmut", "sporadic")))$p.value
-p_value2 <- wilcox.test(Freq ~ group, 
-                        data = subset(hNK_Bm3, 
-                                      group %in% c("ATRXmut", "ctrl")))$p.value
-p_value3 <- wilcox.test(Freq ~ group, 
-                        data = subset(hNK_Bm3, 
-                                      group %in% c("ATRXmut", "MYCNA")))$p.value
-
-# plot boxplot
-boxplot3 <- hNK_Bm3 %>%
-  ggplot( aes(x = group , y = Freq, fill = group)) +
-    geom_boxplot() +
-    scale_fill_viridis(discrete = TRUE, alpha = 0.6) +
-    theme(legend.position="none",
-          axis.text = element_text(size = 18),
-          axis.title.y = element_text(size = 18),
-          plot.title = element_text(size = 18)) +
-    ggtitle("NK cluster per NB genetic group: hNK_Bm3") +
-    xlab("") + ylab("Number of cells per group")  +
-  geom_signif(comparisons = list(c("ATRXmut", "ctrl"),
-                                 c("ATRXmut", "MYCNA"),
-                                 c("ATRXmut", "sporadic")),
-              map_signif_level = FALSE, 
-              y_position = c(max(hNK_Bm3$Freq) + 50, 
-                             max(hNK_Bm3$Freq) + 80, 
-                             max(hNK_Bm3$Freq) + 110))
-
-# CLUSTER 4
-hNK_Bm4 <- filter(table_NK_per_sample, Var1 == "hNK_Bm4")
-
-# Perform ANOVA
-hNK_Bm4_anova <- aov(Freq ~ group, data = hNK_Bm4)
-summary(hNK_Bm4_anova)
-
-# Extract p-value
-p_value <- summary(hNK_Bm4_anova)[[1]][["Pr(>F)"]][1]
-
-# perform wilcox testing
-p_value1 <- wilcox.test(Freq ~ group, 
-                        data = subset(hNK_Bm4, 
-                                      group %in% c("ATRXmut", "sporadic")))$p.value
-p_value2 <- wilcox.test(Freq ~ group, 
-                        data = subset(hNK_Bm4, 
-                                      group %in% c("ATRXmut", "ctrl")))$p.value
-p_value3 <- wilcox.test(Freq ~ group, 
-                        data = subset(hNK_Bm4, 
-                                      group %in% c("ATRXmut", "MYCNA")))$p.value
-
-# plot boxplot
-boxplot4 <- hNK_Bm4 %>%
-  ggplot( aes(x = group , y = Freq, fill = group)) +
-    geom_boxplot() +
-    scale_fill_viridis(discrete = TRUE, alpha = 0.6) +
-    theme(legend.position="none",
-          axis.text = element_text(size = 18),
-          axis.title.y = element_text(size = 18),
-          plot.title = element_text(size = 18)) +
-    ggtitle("NK cluster per NB genetic group: hNK_Bm4") +
-    xlab("") + ylab("Number of cells per group")  +
-  geom_signif(comparisons = list(c("ATRXmut", "ctrl"),
-                                 c("ATRXmut", "MYCNA"),
-                                 c("ATRXmut", "sporadic")),
-              map_signif_level = FALSE,
-              y_position = c(max(hNK_Bm4$Freq) + 5, 
-                             max(hNK_Bm4$Freq) + 8, 
-                             max(hNK_Bm4$Freq) + 11)) 
-
-# adding ANOVA test p-values
-boxplot1
-boxplot2
-boxplot3
-boxplot4
-
-```
-
-
-
-
-# ___DA testing___
-
-```{r}
-ALL_NK@meta.data$patients<- factor(ALL_NK@meta.data$patients)
-ALL_NK@meta.data$predicted_NK_type <- factor(ALL_NK@meta.data$predicted_NK_type)
-```
-
-If comparing more than two sample / groups, use DA testing with contrasts
-MiloR doesn't use the "original" clusters but rather creates neighborhoods
-based on similar logFC (note the fold change here is the number of cells
-per cell type)
-
-```{r miloR - many groups}
-library("statmod")
-library("miloR")
-library("SingleCellExperiment")
-library("scater")
-library("scran")
-library("dplyr")
-library("patchwork")
-
-#2. If comparing more than two sample / groups, use DA testing with contrasts
-
-# For differential abundance analysis on graph neighborhoods we first construct a Milo object. 
-# This extends the SingleCellExperiment class to store information about neighbourhoods on the KNN graph.
-
-rna_milo <- Milo(as.SingleCellExperiment(ALL_NK))
-rna_milo
-
-reducedDim(rna_milo, "UMAP") <- reducedDim(as.SingleCellExperiment(ALL_NK), 
-                                           "UMAP")
-plotUMAP(rna_milo, 
-         colour_by="group.x") + 
-  plotUMAP(rna_milo, 
-           colour_by="patients")
-
-# Define cell neighbourhoods
-rna_milo <- buildGraph(rna_milo, 
-                       k = 10, 
-                       d = 30)
-
-## Constructing kNN graph with k = 10
-rna_milo <- makeNhoods(rna_milo, 
-                       prop = 0.1, 
-                       k = 10, 
-                       d = 30, 
-                       refined = TRUE, 
-                       refinement_scheme = "graph") # make nhoods using graph-only as this is faster
-
-# metadata
-colData(rna_milo)$patients <- paste(colData(rna_milo)$group, 
-                                    colData(rna_milo)$patients, sep="_")
-
-# Counting cells in neighbourhoods
-rna_milo <- countCells(rna_milo, meta.data = data.frame(colData(rna_milo)), 
-                       samples="patients") # make the nhood X sample counts matrix
-
-
-# Defining experimental design
-rna_design <- data.frame(colData(rna_milo))[,c("patients", "group.x")]
-rna_design <- distinct(rna_design)
-rownames(rna_design) <- rna_design$patients
-rna_design
-
-# Computing neighborhood connectivity
-rna_milo <- calcNhoodDistance(rna_milo, 
-                              d = 30, 
-                              reduced.dim = "PCA")
-
-# DA testing
-da_results <- testNhoods(rna_milo, 
-                         design = ~ 0 + group.x,
-                         design.df = rna_design, 
-                         reduced.dim="PCA")
-head(da_results)
-
-da_results %>%
-  arrange(SpatialFDR) %>%
-  head() 
-
-rna_milo <- buildNhoodGraph(rna_milo)
-
-
-# QUALITY CHECK OF THE DIFFERENTIAL ABUNDANCE TESTING
-
-# Plot single-cell UMAP
-umap_pl <- plotReducedDim(rna_milo, 
-                          dimred = "UMAP", 
-                          colour_by = "group.x", 
-                          text_by = "predicted_NK_type", 
-                          text_size = 3, point_size = 0.5,) +
-  guides(fill = "none")
-
-rna_milo <- buildNhoodGraph(rna_milo)
-
-# Plot neighbourhood graph
-nh_graph_pl <- plotNhoodGraphDA(rna_milo, 
-                                da_results, 
-                                layout="UMAP", 
-                                alpha=0.05) 
-
-umap_pl + nh_graph_pl +
-  plot_layout(guides = "collect")
-
-# Differential abundance testing with contrasts
-rna_design <- data.frame(colData(rna_milo))[,c("patients", "group.x")]
-rna_design <- distinct(rna_design)
-rownames(rna_design) <- rna_design$patients
-
-# Reorder rownames to match columns of nhoodCounts(milo)
-rna_design <- rna_design[colnames(nhoodCounts(rna_milo)), , drop=FALSE]
-table(rna_design$group)
-
-####### Comparisons #######
-
-# A. ATRXmut vs. ( MYCNA and sporadic )
-
-model <- model.matrix(~ 0 + group.x, data = rna_design)
-ave.contrast <- c("group.xIII - (group.xII + group.xIV) / 2")
-mod.constrast <- makeContrasts(contrasts = ave.contrast, levels = model)
-mod.constrast
-
-da_results_ATRXmutvsAll <- testNhoods(rna_milo, design = ~ 0 + group.x, 
-                         design.df = rna_design, 
-                         model.contrasts = ave.contrast, 
-                         fdr.weighting = "graph-overlap")
-
-table(da_results_ATRXmutvsAll$SpatialFDR < 0.1)
-
-# annotate hood with original cell type annotation
-da_results_ATRXmutvsAll <- annotateNhoods(rna_milo, 
-                                          da_results_ATRXmutvsAll, 
-                                          coldata_col = "predicted_NK_type")
-
-# remove hoods that contained mixed cell type populations
-da_results_ATRXmutvsAll$predicted_NK_type <- 
-  ifelse(da_results_ATRXmutvsAll$predicted_NK_type_fraction < 0.7, 
-         "Mixed", da_results_ATRXmutvsAll$predicted_NK_type)
-
-# filter only significant populations (less than 10% false discovery rate and 
-# fold change bigger than 0.5)
-results <- da_results_ATRXmutvsAll %>% 
-  arrange(FDR) %>% filter(FDR < 0.1 & abs(logFC) >= 0.5)
-results
-
-plotDAbeeswarm(da_results_ATRXmutvsAll, 
-               group.by = "predicted_NK_type")
-
-
-# B. ATRXmut vs. ( MYCNA and sporadic and control )
-
-model <- model.matrix(~ 0 + group.x, data = rna_design)
-ave.contrast <- c("group.xIII - (group.xII + group.xIV + group.xI) / 3")
-mod.constrast <- makeContrasts(contrasts = ave.contrast, levels = model)
-mod.constrast
-
-da_results_ATRXmutvsAll <- testNhoods(rna_milo, design = ~ 0 + group.x, 
-                         design.df = rna_design, 
-                         model.contrasts = ave.contrast, 
-                         fdr.weighting = "graph-overlap")
-
-table(da_results_ATRXmutvsAll$SpatialFDR < 0.1)
-
-# annotate hood with original cell type annotation
-da_results_ATRXmutvsAll <- annotateNhoods(rna_milo, da_results_ATRXmutvsAll, 
-                             coldata_col = "predicted_NK_type")
-
-# remove hoods that contained mixed cell type populations
-da_results_ATRXmutvsAll$predicted_NK_type <- 
-  ifelse(da_results_ATRXmutvsAll$predicted_NK_type_fraction < 0.7, 
-         "Mixed", da_results_ATRXmutvsAll$predicted_NK_type)
-
-# filter only significant populations (less than 10% false discovery rate and 
-# fold change bigger than 0.5)
-results <- da_results_ATRXmutvsAll %>% 
-  arrange(FDR) %>% filter(FDR < 0.1 & abs(logFC) >= 0.5)
-results
-
-plotDAbeeswarm(da_results_ATRXmutvsAll, group.by = "predicted_NK_type")
-
-# D.  ( MYCNA and sporadic and control ) vs. ATRXmut 
-
-model <- model.matrix(~ 0 + group.x, data = rna_design)
-ave.contrast <- c("((group.xII + group.xIV + group.xI) / 3) - group.xIII")
-mod.constrast <- makeContrasts(contrasts = ave.contrast, levels = model)
-mod.constrast
-
-da_results_AllvsATRXmut <- testNhoods(rna_milo, design = ~ 0 + group.x, 
-                         design.df = rna_design, 
-                         model.contrasts = ave.contrast, 
-                         fdr.weighting = "graph-overlap")
-
-table(da_results_AllvsATRXmut$SpatialFDR < 0.1)
-
-# annotate hood with original cell type annotation
-da_results_AllvsATRXmut <- annotateNhoods(rna_milo, da_results_AllvsATRXmut, 
-                             coldata_col = "predicted_NK_type")
-
-# remove hoods that contained mixed cell type populations
-da_results_AllvsATRXmut$predicted_NK_type <- 
-  ifelse(da_results_AllvsATRXmut$predicted_NK_type_fraction < 0.7, 
-         "Mixed", da_results_AllvsATRXmut$predicted_NK_type)
-
-# filter only significant populations (less than 10% false discovery rate and 
-# fold change bigger than 0.5)
-results <- da_results_AllvsATRXmut %>% 
-  arrange(FDR) %>% filter(FDR < 0.1 & abs(logFC) >= 0.5)
-results
-
-plotDAbeeswarm(da_results_AllvsATRXmut, group.by = "predicted_NK_type")
 ```
 
 
