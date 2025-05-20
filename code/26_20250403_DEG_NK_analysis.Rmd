@@ -1,0 +1,2067 @@
+---
+title: "NK project: DEG analysis"
+author: "Dr. Sara Wernig-Zorc"
+date: "`r format(Sys.time(), '%B %Y')`"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  input_BM1: "/home/rstudio/mnt_data/CancReg/BM/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"
+  input_BM2: "/home/rstudio/mnt_data/CancReg/BM/yang2019/Rds/Human_BM_NK_seurat_v4.Rds"
+  input_scRNA: "/home/rstudio/mnt_out/NK_project/Rds/fetahu2023_withNewMetadata.Rds"
+  input_NK: "/home/rstudio/mnt_out/NK_project/Rds/ALL_NK_cluster_withNewMetadata.Rds"
+  out: "/home/rstudio/mnt_out/NK_project/"
+  GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
+  markers: "/home/rstudio/mnt_resources/MES_ADRN/"
+  metadata: "/home/rstudio/NK_project/metadata/"
+---
+
+PROJECT DESCRIPTION
+
+Identify NK sub-populations in tumor-infiltrated bone marrow rados_et_al_2025 from
+Neuroblastoma patients.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 20)
+options(future.globals.maxSize = 8 * 10^9)
+
+print(params)
+```
+
+```{r echo=FALSE}
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_setup.R")
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_utils.R")
+```
+
+# ___Load data___
+
+```{r eval=FALSE, include=FALSE}
+install.packages('pheatmap')
+install.packages("DOSE")
+remotes::install_github("GuangchuangYu/enrichplot")
+install.packages("ggupset")
+```
+
+```{r}
+suppressPackageStartupMessages(library('pheatmap'))
+suppressPackageStartupMessages(library("DOSE"))
+suppressPackageStartupMessages(library("enrichplot"))
+suppressPackageStartupMessages(library("ggupset"))
+suppressPackageStartupMessages(library("EnhancedVolcano"))
+suppressPackageStartupMessages(library("ggVennDiagram"))
+```
+
+## ___NB BM-derived NK cells___
+
+```{r}
+#fetahu2023 <-  readRDS(file = params$input_NK)
+ALL_NK <-  readRDS(file = params$input_NK)
+```
+
+```{r}
+ALL_NK$group <- factor(ALL_NK$group)
+
+Idents(ALL_NK) <- ALL_NK@meta.data$group
+
+# identify cell IDs associated with each cluster
+M <- WhichCells(ALL_NK, ident = "MYCNamp")
+S <- WhichCells(ALL_NK, ident = "ATRXwtMYCNwt")
+C <- WhichCells(ALL_NK, ident = "control")
+A <- WhichCells(ALL_NK, ident = "ATRXdel")
+
+# re-label the NK cells to the corresponding predicted sub-clusters 
+Idents(object = ALL_NK, cells = M) <- "ATRXwt"
+Idents(object = ALL_NK, cells = S) <- "ATRXwt"
+Idents(object = ALL_NK, cells = A) <- "ATRXdel"
+Idents(object = ALL_NK, cells = C) <- "ATRXwt"
+
+# Add active identities to metadata column comparison_group
+ALL_NK$ATRXdel_vs_rest <- ALL_NK@active.ident
+```
+
+# ___DEG analysis___
+
+Replicates set to biological replicates with the rados_et_al_2025 slot in the metadata
+<br>
+ATRXdel, n = 3
+<br>
+MYCNamp, n = 4
+<br>
+ATRXwtMYCNwt, n = 4
+
+
+```{r}
+# Access the counts matrix
+counts_matrix <- GetAssayData(ALL_NK, slot = "counts")
+
+# set a meaningful cutoff for expressed genes 
+hist(Matrix::rowSums(counts_matrix),breaks = 1000000,xlim = (c(0,100)))
+abline(v=2)
+
+hist(log(Matrix::rowSums(counts_matrix)),breaks = 500)
+
+# Filter genes with at least 11 reads over all samples (rados_et_al_2025)
+# these will be used as background genes for pathways enrichment analysis
+geneUniverse <- rownames(counts_matrix)[Matrix::rowSums(counts_matrix) > 10]
+length(geneUniverse) # 12382 expressed genes
+
+# justify chosen cut-off of expressed genes
+hist(log(Matrix::rowSums(counts_matrix)),breaks = 500) 
+abline(v=0.7)
+abline(v=3)
+
+# remap to ENTREZ IDs
+geneUniverse_entrezIDs <- map_gene_to_entrez(geneUniverse)
+```
+
+## ___Cluster 2___
+
+```{r}
+# Change idents to cluster annotations
+Idents(ALL_NK) <- ALL_NK@meta.data$predicted_NK_type_de.n350
+
+# subset to cluster 2
+cluster_of_interest <- "hNK_Bm2"
+
+# subset scRNA-seq data to NK and NB cells 
+hNK_Bm2 <- subset(ALL_NK, 
+                  idents = cluster_of_interest, 
+                  invert = FALSE)
+hNK_Bm2 # 2586 cells
+```
+
+#### ___1. Control vs. ATRXdel___
+
+```{r}
+# DE analysis for the hNK_Bm2 NK cluster
+DEG_hNK_Bm2_DEG <- DElegate::findDE(hNK_Bm2,
+                           group_column = "group",
+                           order_results = TRUE,
+                           compare_is_ref = TRUE,
+                           replicate_column = "rados_et_al_2025",
+                           compare = "control")
+
+control_vs_ATRXdel <- subset(DEG_hNK_Bm2_DEG, 
+                        DEG_hNK_Bm2_DEG$group1 == "ATRXdel")
+
+control_vs_ATRXdel_signif <- subset(control_vs_ATRXdel, 
+                                control_vs_ATRXdel$padj < 0.1)
+
+write.table(control_vs_ATRXdel, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNK-Bm2_control_vs_ATRXdel_2025-04-24.csv"))
+```
+
+#### ___2. ATRX wild-type [MYCNamp + ATRXwtMYCNwt] vs. ATRXdel___
+
+```{r}
+# DE analysis for the hNK_Bm2 NK cluster
+DEG_hNK_Bm2_ref <- DElegate::findDE(hNK_Bm2,
+                           group_column = "comparison_group",
+                           order_results = TRUE,
+                           compare_is_ref = TRUE,
+                           replicate_column = "rados_et_al_2025",
+                           compare = "ATRXwt")
+
+ATRXwt_vs_ATRXdel <- subset(DEG_hNK_Bm2_ref, 
+                          DEG_hNK_Bm2_ref$group1 == "ATRXdel")
+
+ATRXwt_vs_ATRXdel_signif <- subset(ATRXwt_vs_ATRXdel, 
+                                   ATRXwt_vs_ATRXdel$padj < 0.10)
+
+ATRXwt_vs_ATRXdel_signif
+
+write.table(ATRXwt_vs_ATRXdel, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNK-Bm2_ATRXdel-vs-ATRXwt_2025-04-24.csv"))
+
+```
+
+#### ___3. ALL vs. ATRXdel___
+
+```{r}
+DEG_hNK_Bm2_ref <- DElegate::findDE(hNK_Bm2,
+                           group_column = "ATRXdel_vs_rest",
+                           order_results = TRUE,
+                           compare_is_ref = TRUE,
+                           replicate_column = "rados_et_al_2025",
+                           compare = "ATRXwt")
+
+ALL_vs_ATRXdel <- subset(DEG_hNK_Bm2_ref, 
+                          DEG_hNK_Bm2_ref$group1 == "ATRXdel")
+
+ALL_vs_ATRXdel_signif <- subset(ALL_vs_ATRXdel, 
+                                ALL_vs_ATRXdel$padj < 0.10)
+
+ALL_vs_ATRXdel_signif
+
+write.table(ALL_vs_ATRXdel, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNK-Bm2_ATRXdel-vs-ALL_2025-04-24.csv"))
+```
+
+### ___Vulcano plot___
+
+#### ___1. control vs. ATRXdel___
+
+```{r fig.height=7, fig.width=7}
+control_vs_ATRXdel
+rownames(control_vs_ATRXdel) <- control_vs_ATRXdel$feature
+
+library(EnhancedVolcano)
+
+pdf(paste0(params$out,"figures/DEGs_NK_cluster2_control_vs_ATRXdel_vulcano_plot_wGenes.pdf"),
+    height = 5,width = 7)
+EnhancedVolcano(control_vs_ATRXdel, 
+                lab = rownames(control_vs_ATRXdel),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2",
+                selectLab = c('CD6','TGFB1', 'ZEB2'),
+                subtitle = "control vs. ATRXdel",
+                pCutoff = 0.05,
+                FCcutoff = 1,
+                ylim = c(0,4),
+                pointSize = 2,
+                labSize = 6,
+                col=c('darkgray', '#28428D', '#28428D', '#61E786'),
+                boxedLabels = TRUE,
+                colAlpha = 4/5,
+                legendPosition = 'right',
+                legendLabSize = 14,
+                legendIconSize = 4.0,
+                drawConnectors = TRUE,
+                widthConnectors = 1.0,
+                colConnectors = 'black'
+                )
+dev.off()
+
+pdf(paste0(params$out,"figures/DEGs_NK_cluster2_control_vs_ATRXdel_vulcano_plot.pdf"),
+    height = 5,width = 7)
+EnhancedVolcano(control_vs_ATRXdel, 
+                lab = rownames(control_vs_ATRXdel),
+                selectLab = NULL, # does this remove all gene names?
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2",
+                subtitle = "control vs. ATRXdel",
+                pCutoff = 0.05,
+                ylim = c(0,4),
+                FCcutoff = 1,
+                pointSize = 2,
+                labSize = 6,
+                col = c('darkgray', '#28428D', '#28428D', '#61E786'),
+                boxedLabels = TRUE,
+                colAlpha = 4/5,
+                legendPosition = 'right',
+                legendLabSize = 14,
+                legendIconSize = 4.0,
+                drawConnectors = TRUE,
+                widthConnectors = 1.0,
+                colConnectors = 'black'
+                )
+dev.off()
+```
+
+#### ___2. ATRXwt vs. ATRXdel___
+
+```{r fig.height=7, fig.width=7}
+ATRXwt_vs_ATRXdel
+rownames(ATRXwt_vs_ATRXdel) <- ATRXwt_vs_ATRXdel$feature
+
+pdf(paste0(params$out,"figures/DEGs_NK_cluster2_ATRXwt_vs_ATRXdel_vulcano_plot_wGenes.pdf"),
+    height = 5,width = 7)
+EnhancedVolcano(ATRXwt_vs_ATRXdel, 
+                lab = rownames(ATRXwt_vs_ATRXdel),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2",
+                selectLab = c('CD6','TGFB1', 'ZEB2'),
+                subtitle = "ATRXwt vs. ATRXdel",
+                pCutoff = 0.05,
+                FCcutoff = 1,
+                pointSize = 2,
+                ylim = c(0,4),
+                labSize = 6,
+                col=c('darkgray', '#28428D', '#28428D', '#61E786'),
+                boxedLabels = TRUE,
+                colAlpha = 4/5,
+                legendPosition = 'right',
+                legendLabSize = 14,
+                legendIconSize = 4.0,
+                drawConnectors = TRUE,
+                widthConnectors = 1.0,
+                colConnectors = 'black'
+                )
+dev.off()
+
+pdf(paste0(params$out,"figures/DEGs_NK_cluster2_ATRXwt_vs_ATRXdel_vulcano_plot.pdf"),
+    height = 5,width = 7)
+EnhancedVolcano(ATRXwt_vs_ATRXdel, 
+                lab = rownames(ATRXwt_vs_ATRXdel),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2",
+                subtitle = "ATRXwt vs. ATRXdel",
+                pCutoff = 0.05,
+                FCcutoff = 1,
+                ylim = c(0,4),
+                pointSize = 2,
+                labSize = 6,
+                col=c('darkgray', '#28428D', '#28428D', '#61E786'),
+                boxedLabels = TRUE,
+                colAlpha = 4/5,
+                legendPosition = 'right',
+                legendLabSize = 14,
+                legendIconSize = 4.0,
+                drawConnectors = TRUE,
+                widthConnectors = 1.0,
+                colConnectors = 'black'
+                )
+dev.off()
+```
+
+#### ___3. ALL vs. ATRXdel___
+
+```{r fig.height=7, fig.width=7}
+rownames(ALL_vs_ATRXdel) <- ALL_vs_ATRXdel$feature
+
+pdf(paste0(params$out,"figures/DEGs_NK_cluster2_ALL_vs_ATRXdel_vulcano_plot_wGenes.pdf"),
+    height = 5,width = 7)
+EnhancedVolcano(ALL_vs_ATRXdel, 
+                lab = rownames(ALL_vs_ATRXdel),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2",
+                selectLab = c('CD6','TGFB1', 'ZEB2'),
+                subtitle = "(ATRXwt + control) vs. ATRXdel",
+                pCutoff = 0.05,
+                FCcutoff = 1,
+                ylim = c(0,6),
+                pointSize = 2,
+                labSize = 6,
+                col=c('darkgray', '#28428D', '#28428D', '#61E786'),
+                boxedLabels = TRUE,
+                colAlpha = 4/5,
+                legendPosition = 'right',
+                legendLabSize = 14,
+                legendIconSize = 4.0,
+                drawConnectors = TRUE,
+                widthConnectors = 1.0,
+                colConnectors = 'black'
+                )
+dev.off()
+
+
+pdf(paste0(params$out,"figures/DEGs_NK_cluster2_ALL_vs_ATRXdel_vulcano_plot.pdf"),
+    height = 5,width = 7)
+EnhancedVolcano(ALL_vs_ATRXdel, 
+                lab = rownames(ALL_vs_ATRXdel),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 2",
+                subtitle = "(ATRXwt + control) vs. ATRXdel",
+                pCutoff = 0.05,
+                FCcutoff = 1,
+                ylim = c(0,6),
+                pointSize = 2,
+                labSize = 6,
+                col=c('darkgray', '#28428D', '#28428D', '#61E786'),
+                boxedLabels = TRUE,
+                colAlpha = 4/5,
+                legendPosition = 'right',
+                legendLabSize = 14,
+                legendIconSize = 4.0,
+                drawConnectors = TRUE,
+                widthConnectors = 1.0,
+                colConnectors = 'black'
+                )
+dev.off()
+```
+
+### ___Pathways enrichment analysis___
+
+```{r}
+control_vs_ATRXdel_signif <- control_vs_ATRXdel_signif %>%
+  arrange(log_fc)
+
+control_vs_ATRXdel_NK2_up <- control_vs_ATRXdel_signif %>% subset(log_fc > 1) %>% subset(padj < 0.1) 
+control_vs_ATRXdel_NK2_down <- control_vs_ATRXdel_signif %>% subset(log_fc < -1) %>% subset(padj < 0.1) 
+
+ATRXwt_vs_ATRXdel_signif <- ATRXwt_vs_ATRXdel %>%
+  arrange(log_fc)
+
+ATRXwt_vs_ATRXdel_NK2_up <- ATRXwt_vs_ATRXdel %>%  subset(log_fc > 0) %>% subset(padj < 0.1) 
+ATRXwt_vs_ATRXdel_NK2_down <- ATRXwt_vs_ATRXdel %>%  subset(log_fc < -0.1) %>% subset(padj < 0.1) 
+
+ALL_vs_ATRXdel_signif <- ALL_vs_ATRXdel_signif %>%
+  arrange(log_fc)
+
+ALL_vs_ATRXdel_NK2_up <- ALL_vs_ATRXdel_signif %>% subset(log_fc > 0) # up-regulated in ATRXdeleted rados_et_al_2025s 
+ALL_vs_ATRXdel_NK2_down <- ALL_vs_ATRXdel_signif %>%  subset(log_fc < -0.1)  #down-regulated in ATRXdeleted rados_et_al_2025s
+
+```
+
+#### ___control vs. ATRXdel___
+
+```{r}
+# the background genes here should be all expressed (and detected) in all NK cells
+genes <- control_vs_ATRXdel_NK2_up$feature
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              pvalueCutoff = 0.1)
+
+go_BP
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXdel: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+               ont = "MF",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.20, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_MF
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXdel: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.20, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXdel: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              pvalueCutoff = 0.1,
+                              qvalueCutoff = 0.20,
+                              universe = geneUniverse,
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(kegg_enrichment@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXdel: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+
+# HALLMARK GENE SET
+hallmark_gene_enrich <- enricher(entrez_ids, 
+                             TERM2GENE = hallmark_genes,
+                             pvalueCutoff = 0.1,
+                             qvalueCutoff = 0.20,
+                             pAdjustMethod = "fdr",
+                             universe = geneUniverse,
+                             minGSSize = 2,
+                             maxGSSize = 5000)
+
+head(hallmark_gene_enrich)
+```
+
+
+___Gene Set Enrichment Analysis (GSEA)___
+
+```{r fgsea}
+genes <- control_vs_ATRXdel$feature
+
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+control_vs_ATRXdel$entrez_ids <- entrez_ids
+genes <- control_vs_ATRXdel$log_fc
+names(genes) <- control_vs_ATRXdel$entrez_ids
+genes = sort(genes, decreasing = TRUE)
+genes <- genes[!is.na(names(genes))]
+length(genes)
+
+# filter by expressed in NK cells
+overlapping_genes <- intersect(entrez_ids, geneUniverse_entrezIDs)
+length(overlapping_genes) #12119
+
+# Filter the logFC vector based on the gene list
+filtered_genes <- genes[names(genes) %in% overlapping_genes]
+length(filtered_genes)
+
+# H gene set
+hallmark_genes <- msigdbr(species = "human",category = "H") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes)
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+
+gseaplot(hallmark_gene_gsea, 
+         by = "all", 
+         title = hallmark_gene_gsea$Description[1], 
+         geneSetID = 1)
+
+# C5 gene set
+hallmark_genes <- msigdbr(species = "human",category = "C5") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes, 
+                           pAdjustMethod = "fdr")
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+
+# C7 gene set (immune cells)
+hallmark_genes <- msigdbr(species = "human",category = "C7", 
+                          subcategory = "IMMUNESIGDB") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes,
+                           pAdjustMethod = "fdr")
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+
+# C2:CP gene set (KEGG and REACTOME)
+hallmark_genes <- msigdbr(species = "human",category = "C2",
+                          subcategory = "CP") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes, 
+                           pAdjustMethod = "fdr")
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+```
+
+#### ___ATRXwt vs. ATRXdel___
+
+```{r}
+# the background genes here should be all expressed (and detected) in all NK cells
+genes <- ATRXwt_vs_ATRXdel_NK2_up$feature
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              pvalueCutoff = 0.1)
+
+go_BP
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXdel: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+               ont = "MF",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.20, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_MF
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXdel: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.20, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXdel: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              pvalueCutoff = 0.1,
+                              qvalueCutoff = 0.20, 
+                              universe = geneUniverse,
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(kegg_enrichment@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXdel: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+
+# HALLMARK GENE SET
+hallmark_gene_enrich <- enricher(entrez_ids, 
+                             TERM2GENE = hallmark_genes,
+                             pvalueCutoff = 0.1,
+                             qvalueCutoff = 0.20,
+                             pAdjustMethod = "fdr",
+                             universe = geneUniverse,
+                             minGSSize = 2,
+                             maxGSSize = 5000)
+
+head(hallmark_gene_enrich)
+```
+
+```{r fgsea}
+genes <- ATRXwt_vs_ATRXdel$feature
+
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+control_vs_ATRXdel$entrez_ids <- entrez_ids
+genes <- control_vs_ATRXdel$log_fc
+names(genes) <- control_vs_ATRXdel$entrez_ids
+genes = sort(genes, decreasing = TRUE)
+genes <- genes[!is.na(names(genes))]
+length(genes)
+
+# filter by expressed in NK cells
+overlapping_genes <- intersect(entrez_ids, geneUniverse_entrezIDs)
+length(overlapping_genes) #12119
+
+# Filter the logFC vector based on the gene list
+filtered_genes <- genes[names(genes) %in% overlapping_genes]
+length(filtered_genes)
+
+# H gene set
+hallmark_genes <- msigdbr(species = "human",category = "H") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes)
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+
+gseaplot(hallmark_gene_gsea, 
+         by = "all", 
+         title = hallmark_gene_gsea$Description[1], 
+         geneSetID = 1)
+
+# C5 gene set
+hallmark_genes <- msigdbr(species = "human",category = "C5") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes, 
+                           pAdjustMethod = "fdr")
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+
+# C7 gene set (immune cells)
+hallmark_genes <- msigdbr(species = "human",category = "C7", 
+                          subcategory = "IMMUNESIGDB") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes,
+                           pAdjustMethod = "fdr")
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+
+# C2:CP gene set (KEGG and REACTOME)
+hallmark_genes <- msigdbr(species = "human",category = "C2",
+                          subcategory = "CP") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes, 
+                           pAdjustMethod = "fdr")
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+```
+
+
+```{r eval=FALSE, include=FALSE}
+library("enrichplot")
+
+# calculate pairwise similarities of the enriched terms using Jaccard’s similarity index
+enrichres2 <- pairwise_termsim(kegg_enrichment) 
+# treeplot
+treeplot(enrichres2)
+```
+
+#### ___ALL vs. ATRXdel___
+
+```{r}
+# the background genes here should be all expressed (and detected) in all NK cells
+genes <- ALL_vs_ATRXdel_NK2_up$feature
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              pvalueCutoff = 0.1)
+
+go_BP
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXdel: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+               ont = "MF",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.20, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_MF
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXdel: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.20, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXdel: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              pvalueCutoff = 0.1,
+                              qvalueCutoff = 0.20, 
+                              universe = geneUniverse,
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(kegg_enrichment@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2 in ATRXdel: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+
+# HALLMARK GENE SET
+hallmark_gene_enrich <- enricher(entrez_ids, 
+                             TERM2GENE = hallmark_genes,
+                             pvalueCutoff = 0.1,
+                             qvalueCutoff = 0.20,
+                             pAdjustMethod = "fdr",
+                             universe = geneUniverse,
+                             minGSSize = 2,
+                             maxGSSize = 5000)
+
+head(hallmark_gene_enrich)
+
+```
+
+```{r fgsea}
+genes <- ALL_vs_ATRXdel$feature
+
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+control_vs_ATRXdel$entrez_ids <- entrez_ids
+genes <- control_vs_ATRXdel$log_fc
+names(genes) <- control_vs_ATRXdel$entrez_ids
+genes = sort(genes, decreasing = TRUE)
+genes <- genes[!is.na(names(genes))]
+length(genes)
+
+# filter by expressed in NK cells
+overlapping_genes <- intersect(entrez_ids, geneUniverse_entrezIDs)
+length(overlapping_genes) #12119
+
+# Filter the logFC vector based on the gene list
+filtered_genes <- genes[names(genes) %in% overlapping_genes]
+length(filtered_genes)
+
+# H gene set
+hallmark_genes <- msigdbr(species = "human",category = "H") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes)
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+
+gseaplot(hallmark_gene_gsea, 
+         by = "all", 
+         title = hallmark_gene_gsea$Description[1], 
+         geneSetID = 1)
+
+# C5 gene set
+hallmark_genes <- msigdbr(species = "human",category = "C5") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes, 
+                           pAdjustMethod = "fdr")
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+
+# C7 gene set (immune cells)
+hallmark_genes <- msigdbr(species = "human",category = "C7", 
+                          subcategory = "IMMUNESIGDB") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes,
+                           pAdjustMethod = "fdr")
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+
+# C2:CP gene set (KEGG and REACTOME)
+hallmark_genes <- msigdbr(species = "human",category = "C2",
+                          subcategory = "CP") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes, 
+                           pAdjustMethod = "fdr")
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+```
+
+
+## ___Cluster 3___
+
+```{r}
+# Change idents to cluster annotations
+Idents(ALL_NK) <- ALL_NK@meta.data$predicted_NK_type_de.n350
+
+# subset to cluster 3
+cluster_of_interest <- "hNK_Bm3"
+
+# subset scRNA-seq data to NK and NB cells 
+hNK_Bm3 <- subset(ALL_NK, 
+                  idents = cluster_of_interest, 
+                  invert = FALSE)
+hNK_Bm3 # 3732 cells
+```
+
+#### ___1. Control vs. ATRXdel___
+
+```{r}
+# DE analysis for the hNK_Bm3 NK cluster
+DEG_hNK_Bm3_DEG <- DElegate::findDE(hNK_Bm3,
+                           group_column = "group",
+                           order_results = TRUE,
+                           compare_is_ref = TRUE,
+                           replicate_column = "rados_et_al_2025",
+                           compare = "control")
+
+control_vs_ATRXdel <- subset(DEG_hNK_Bm3_DEG, 
+                        DEG_hNK_Bm3_DEG$group1 == "ATRXdel")
+
+control_vs_ATRXdel_signif <- subset(control_vs_ATRXdel, 
+                                control_vs_ATRXdel$padj < 0.1)
+
+write.table(control_vs_ATRXdel, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNK-Bm3_control_vs_ATRXdel_2025-04-24.csv"))
+```
+
+#### ___2. ATRX wild-type [MYCNamp + ATRXwtMYCNwt] vs. ATRXdel___
+
+```{r}
+# DE analysis for the hNK_Bm3 NK cluster
+DEG_hNK_Bm3_ref <- DElegate::findDE(hNK_Bm3,
+                           group_column = "comparison_group",
+                           order_results = TRUE,
+                           compare_is_ref = TRUE,
+                           replicate_column = "rados_et_al_2025",
+                           compare = "ATRXwt")
+
+ATRXwt_vs_ATRXdel <- subset(DEG_hNK_Bm3_ref, 
+                          DEG_hNK_Bm3_ref$group1 == "ATRXdel")
+
+ATRXwt_vs_ATRXdel_signif <- subset(ATRXwt_vs_ATRXdel, ATRXwt_vs_ATRXdel$padj < 0.10)
+
+ATRXwt_vs_ATRXdel_signif
+
+write.table(ATRXwt_vs_ATRXdel, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNK-Bm3_ATRXdel-vs-ATRXwt_2025-04-24.csv"))
+
+```
+
+#### ___3. ALL vs. ATRXdel___
+
+```{r}
+DEG_hNK_Bm3_ref <- DElegate::findDE(hNK_Bm3,
+                           group_column = "ATRXdel_vs_rest",
+                           order_results = TRUE,
+                           compare_is_ref = TRUE,
+                           replicate_column = "rados_et_al_2025",
+                           compare = "ATRXwt")
+
+ALL_vs_ATRXdel <- subset(DEG_hNK_Bm3_ref, 
+                          DEG_hNK_Bm3_ref$group1 == "ATRXdel")
+
+ALL_vs_ATRXdel_signif <- subset(ALL_vs_ATRXdel, ALL_vs_ATRXdel$padj < 0.10)
+
+ALL_vs_ATRXdel_signif
+
+write.table(ALL_vs_ATRXdel, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNK-Bm3_ATRXdel-vs-ALL_2025-04-24.csv"))
+```
+
+### ___Vulcano plot___
+
+#### ___1. control vs. ATRXdel___
+
+```{r fig.height=7, fig.width=7}
+control_vs_ATRXdel
+rownames(control_vs_ATRXdel) <- control_vs_ATRXdel$feature
+
+library(EnhancedVolcano)
+
+pdf(paste0(params$out,"figures/DEGs_NK_cluster3_control_vs_ATRXdel_vulcano_plot_wGenes.pdf"),
+    height = 5,width = 7)
+EnhancedVolcano(control_vs_ATRXdel, 
+                lab = rownames(control_vs_ATRXdel),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 3",
+                selectLab = c('CD6','TGFB1', 'ZEB2'),
+                subtitle = "control vs. ATRXdel",
+                pCutoff = 0.05,
+                FCcutoff = 1,
+                ylim = c(0,3),
+                pointSize = 2,
+                labSize = 6,
+                col=c('darkgray', '#28428D', '#28428D', '#61E786'),
+                boxedLabels = TRUE,
+                colAlpha = 4/5,
+                legendPosition = 'right',
+                legendLabSize = 14,
+                legendIconSize = 4.0,
+                drawConnectors = TRUE,
+                widthConnectors = 1.0,
+                colConnectors = 'black'
+                )
+dev.off()
+
+pdf(paste0(params$out,"figures/DEGs_NK_cluster3_control_vs_ATRXdel_vulcano_plot.pdf"),
+    height = 5,width = 7)
+EnhancedVolcano(control_vs_ATRXdel, 
+                lab = rownames(control_vs_ATRXdel),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 3",
+                subtitle = "control vs. ATRXdel",
+                pCutoff = 0.05,
+                ylim = c(0,3),
+                FCcutoff = 1,
+                pointSize = 2,
+                labSize = 6,
+                col=c('darkgray', '#28428D', '#28428D', '#61E786'),
+                boxedLabels = TRUE,
+                colAlpha = 4/5,
+                legendPosition = 'right',
+                legendLabSize = 14,
+                legendIconSize = 4.0,
+                drawConnectors = TRUE,
+                widthConnectors = 1.0,
+                colConnectors = 'black'
+                )
+dev.off()
+
+```
+
+#### ___2. ATRXwt vs. ATRXdel___
+
+```{r fig.height=7, fig.width=7}
+ATRXwt_vs_ATRXdel
+rownames(ATRXwt_vs_ATRXdel) <- ATRXwt_vs_ATRXdel$feature
+
+pdf(paste0(params$out,"figures/DEGs_NK_cluster3_ATRXwt_vs_ATRXdel_vulcano_plot_wGenes.pdf"),
+    height = 5,width = 7)
+EnhancedVolcano(ATRXwt_vs_ATRXdel, 
+                lab = rownames(ATRXwt_vs_ATRXdel),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 3",
+                selectLab = c('CD6','TGFB1', 'ZEB2'),
+                subtitle = "ATRXwt vs. ATRXdel",
+                pCutoff = 0.05,
+                FCcutoff = 1,
+                ylim = c(0,4),
+                pointSize = 2,
+                labSize = 6,
+                col=c('darkgray', '#28428D', '#28428D', '#61E786'),
+                boxedLabels = TRUE,
+                colAlpha = 4/5,
+                legendPosition = 'right',
+                legendLabSize = 14,
+                legendIconSize = 4.0,
+                drawConnectors = TRUE,
+                widthConnectors = 1.0,
+                colConnectors = 'black'
+                )
+dev.off()
+
+pdf(paste0(params$out,"figures/DEGs_NK_cluster3_ATRXwt_vs_ATRXdel_vulcano_plot.pdf"),
+    height = 5,width = 7)
+EnhancedVolcano(ATRXwt_vs_ATRXdel, 
+                lab = rownames(ATRXwt_vs_ATRXdel),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 3",
+                subtitle = "ATRXwt vs. ATRXdel",
+                pCutoff = 0.05,
+                ylim = c(0,4),
+                FCcutoff = 1,
+                pointSize = 2,
+                labSize = 6,
+                col=c('darkgray', '#28428D', '#28428D', '#61E786'),
+                boxedLabels = TRUE,
+                colAlpha = 4/5,
+                legendPosition = 'right',
+                legendLabSize = 14,
+                legendIconSize = 4.0,
+                drawConnectors = TRUE,
+                widthConnectors = 1.0,
+                colConnectors = 'black'
+                )
+dev.off()
+
+```
+
+#### ___3. ALL vs. ATRXdel___
+
+```{r fig.height=7, fig.width=7}
+rownames(ALL_vs_ATRXdel) <- ALL_vs_ATRXdel$feature
+
+pdf(paste0(params$out,"figures/DEGs_NK_cluster3_ALL_vs_ATRXdel_vulcano_plot_wGenes.pdf"),
+    height = 5,width = 7)
+EnhancedVolcano(ALL_vs_ATRXdel, 
+                lab = rownames(ALL_vs_ATRXdel),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 3",
+                selectLab = c('CD6','TGFB1', 'ZEB2'),
+                subtitle = "(ATRXwt + control) vs. ATRXdel",
+                pCutoff = 0.05,
+                FCcutoff = 1,
+                pointSize = 2,
+                ylim = c(0,6),
+                labSize = 6,
+                col=c('darkgray', '#28428D', '#28428D', '#61E786'),
+                boxedLabels = TRUE,
+                colAlpha = 4/5,
+                legendPosition = 'right',
+                legendLabSize = 14,
+                legendIconSize = 4.0,
+                drawConnectors = TRUE,
+                widthConnectors = 1.0,
+                colConnectors = 'black'
+                )
+dev.off()
+
+pdf(paste0(params$out,"figures/DEGs_NK_cluster3_ALL_vs_ATRXdel_vulcano_plot.pdf"),
+    height = 5,width = 7)
+EnhancedVolcano(ALL_vs_ATRXdel, 
+                lab = rownames(ALL_vs_ATRXdel),
+                x = 'log_fc',
+                y = 'padj',
+                title = "DEGs in cluster 3",
+                subtitle = "(ATRXwt + control) vs. ATRXdel",
+                pCutoff = 0.05,
+                FCcutoff = 1,
+                ylim = c(0,6),
+                pointSize = 2,
+                labSize = 6,
+                col=c('darkgray', '#28428D', '#28428D', '#61E786'),
+                boxedLabels = TRUE,
+                colAlpha = 4/5,
+                legendPosition = 'right',
+                legendLabSize = 14,
+                legendIconSize = 4.0,
+                drawConnectors = TRUE,
+                widthConnectors = 1.0,
+                colConnectors = 'black'
+                )
+dev.off()
+
+```
+
+### ___Pathways enrichment analysis___
+
+```{r}
+control_vs_ATRXdel_signif <- control_vs_ATRXdel_signif %>%
+  arrange(log_fc)
+
+control_vs_ATRXdel_NK3_up <- control_vs_ATRXdel_signif %>% subset(log_fc > 0) # up-regulated in ATRXdeleted rados_et_al_2025s 
+control_vs_ATRXdel_NK3_down <- control_vs_ATRXdel_signif %>% subset(log_fc < -0.1) #down-regulated in ATRXdeleted rados_et_al_2025s
+
+ATRXwt_vs_ATRXdel_signif <- ATRXwt_vs_ATRXdel_signif %>%
+  arrange(log_fc)
+
+ATRXwt_vs_ATRXdel_NK3_up <- ATRXwt_vs_ATRXdel_signif %>% subset(log_fc > 0)# up-regulated in ATRXdeleted rados_et_al_2025s 
+ATRXwt_vs_ATRXdel_NK3_down <- ATRXwt_vs_ATRXdel_signif %>% subset(log_fc < -0.1) #down-regulated in ATRXdeleted rados_et_al_2025s
+
+ALL_vs_ATRXdel_signif <- ALL_vs_ATRXdel_signif %>%
+  arrange(log_fc)
+
+ALL_vs_ATRXdel_NK3_up <- ALL_vs_ATRXdel_signif %>%  subset(log_fc > 0) # up-regulated in ATRXdeleted rados_et_al_2025s 
+ALL_vs_ATRXdel_NK3_down <- ALL_vs_ATRXdel_signif %>% subset(log_fc < -0.1) #down-regulated in ATRXdeleted rados_et_al_2025s
+
+```
+
+#### ___control vs. ATRXdel___
+
+```{r}
+# the background genes here should be all expressed (and detected) in all NK cells
+genes <- control_vs_ATRXdel_NK3_up$feature
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              pvalueCutoff = 0.1)
+
+go_BP
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXdel: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+               ont = "MF",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.20, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_MF
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXdel: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.20, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXdel: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              pvalueCutoff = 0.1,
+                              qvalueCutoff = 0.20, 
+                              universe = geneUniverse,
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(kegg_enrichment@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXdel: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+
+# HALLMARK GENE SET
+hallmark_gene_enrich <- enricher(entrez_ids, 
+                             TERM2GENE = hallmark_genes,
+                             pvalueCutoff = 0.1,
+                             qvalueCutoff = 0.20,
+                             pAdjustMethod = "fdr",
+                             universe = geneUniverse,
+                             minGSSize = 2,
+                             maxGSSize = 5000)
+
+head(hallmark_gene_enrich)
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched HALLMARK terms")
+} else if (any(hallmark_gene_enrich@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(hallmark_gene_enrich, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXdel: HALLMARK enrichment"))
+} else {
+  print("0 significantly enriched HALLMARK terms")
+}
+
+```
+
+```{r fgsea}
+genes <- control_vs_ATRXdel$feature
+
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+control_vs_ATRXdel$entrez_ids <- entrez_ids
+genes <- control_vs_ATRXdel$log_fc
+names(genes) <- control_vs_ATRXdel$entrez_ids
+genes = sort(genes, decreasing = TRUE)
+genes <- genes[!is.na(names(genes))]
+length(genes)
+
+# filter by expressed in NK cells
+overlapping_genes <- intersect(entrez_ids, geneUniverse_entrezIDs)
+length(overlapping_genes) #12119
+
+# Filter the logFC vector based on the gene list
+filtered_genes <- genes[names(genes) %in% overlapping_genes]
+length(filtered_genes)
+
+# H gene set
+hallmark_genes <- msigdbr(species = "human",category = "H") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes)
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+
+gseaplot(hallmark_gene_gsea, 
+         by = "all", 
+         title = hallmark_gene_gsea$Description[1], 
+         geneSetID = 1)
+
+# C5 gene set
+hallmark_genes <- msigdbr(species = "human",category = "C5") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes, 
+                           pAdjustMethod = "fdr")
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+
+# C7 gene set (immune cells)
+hallmark_genes <- msigdbr(species = "human",category = "C7", 
+                          subcategory = "IMMUNESIGDB") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes,
+                           pAdjustMethod = "fdr")
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+
+# C2:CP gene set (KEGG and REACTOME)
+hallmark_genes <- msigdbr(species = "human",category = "C2",
+                          subcategory = "CP") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes, 
+                           pAdjustMethod = "fdr")
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+```
+
+
+#### ___ATRXwt vs. ATRXdel___
+
+```{r}
+# the background genes here should be all expressed (and detected) in all NK cells
+genes <- ATRXwt_vs_ATRXdel_NK3_up$feature
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              pvalueCutoff = 0.1)
+
+go_BP
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXdel: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+               ont = "MF",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.20, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_MF
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXdel: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.20, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXdel: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              pvalueCutoff = 0.1,
+                              qvalueCutoff = 0.20, 
+                              universe = geneUniverse,
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(kegg_enrichment@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXdel: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+
+# HALLMARK GENE SET
+hallmark_gene_enrich <- enricher(entrez_ids, 
+                             TERM2GENE = hallmark_genes,
+                             pvalueCutoff = 0.1,
+                             qvalueCutoff = 0.20,
+                             pAdjustMethod = "fdr",
+                             universe = geneUniverse,
+                             minGSSize = 2,
+                             maxGSSize = 5000)
+
+head(hallmark_gene_enrich)
+
+```
+
+```{r fgsea}
+genes <- ATRXwt_vs_ATRXdel$feature
+
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+control_vs_ATRXdel$entrez_ids <- entrez_ids
+genes <- control_vs_ATRXdel$log_fc
+names(genes) <- control_vs_ATRXdel$entrez_ids
+genes = sort(genes, decreasing = TRUE)
+genes <- genes[!is.na(names(genes))]
+length(genes)
+
+# filter by expressed in NK cells
+overlapping_genes <- intersect(entrez_ids, geneUniverse_entrezIDs)
+length(overlapping_genes) #12119
+
+# Filter the logFC vector based on the gene list
+filtered_genes <- genes[names(genes) %in% overlapping_genes]
+length(filtered_genes)
+
+# H gene set
+hallmark_genes <- msigdbr(species = "human",category = "H") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes)
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+
+gseaplot(hallmark_gene_gsea, 
+         by = "all", 
+         title = hallmark_gene_gsea$Description[1], 
+         geneSetID = 1)
+
+# C5 gene set
+hallmark_genes <- msigdbr(species = "human",category = "C5") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes, 
+                           pAdjustMethod = "fdr")
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+
+# C7 gene set (immune cells)
+hallmark_genes <- msigdbr(species = "human",category = "C7", 
+                          subcategory = "IMMUNESIGDB") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes,
+                           pAdjustMethod = "fdr")
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+
+# C2:CP gene set (KEGG and REACTOME)
+hallmark_genes <- msigdbr(species = "human",category = "C2",
+                          subcategory = "CP") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes, 
+                           pAdjustMethod = "fdr")
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+```
+
+```{r eval=FALSE, include=FALSE}
+library("enrichplot")
+# calculate pairwise similarities of the enriched terms using Jaccard’s similarity index
+enrichres2 <- pairwise_termsim(kegg_enrichment) 
+# treeplot
+treeplot(enrichres2)
+```
+
+#### ___ALL vs. ATRXdel___
+
+```{r}
+# the background genes here should be all expressed (and detected) in all NK cells
+genes <- ALL_vs_ATRXdel_NK3_up$feature
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              pvalueCutoff = 0.1)
+
+go_BP
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXdel: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+               ont = "MF",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.20, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_MF
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXdel: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.20, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXdel: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              pvalueCutoff = 0.1,
+                              qvalueCutoff = 0.20, 
+                              universe = geneUniverse,
+                              minGSSize = 2,
+                              maxGSSize = 5000)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(kegg_enrichment@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("up- in Bm_hNK3 in ATRXdel: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+
+# HALLMARK GENE SET
+hallmark_gene_enrich <- enricher(entrez_ids, 
+                             TERM2GENE = hallmark_genes,
+                             pvalueCutoff = 0.1,
+                             qvalueCutoff = 0.20,
+                             pAdjustMethod = "fdr",
+                             universe = geneUniverse,
+                             minGSSize = 2,
+                             maxGSSize = 5000)
+
+head(hallmark_gene_enrich)
+```
+
+```{r fgsea}
+genes <- ALL_vs_ATRXdel$feature
+
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+control_vs_ATRXdel$entrez_ids <- entrez_ids
+genes <- control_vs_ATRXdel$log_fc
+names(genes) <- control_vs_ATRXdel$entrez_ids
+genes = sort(genes, decreasing = TRUE)
+genes <- genes[!is.na(names(genes))]
+length(genes)
+
+# filter by expressed in NK cells
+overlapping_genes <- intersect(entrez_ids, geneUniverse_entrezIDs)
+length(overlapping_genes) #12119
+
+# Filter the logFC vector based on the gene list
+filtered_genes <- genes[names(genes) %in% overlapping_genes]
+length(filtered_genes)
+
+# H gene set
+hallmark_genes <- msigdbr(species = "human",category = "H") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes)
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+
+gseaplot(hallmark_gene_gsea, 
+         by = "all", 
+         title = hallmark_gene_gsea$Description[1], 
+         geneSetID = 1)
+
+# C5 gene set
+hallmark_genes <- msigdbr(species = "human",category = "C5") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes, 
+                           pAdjustMethod = "fdr")
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+
+# C7 gene set (immune cells)
+hallmark_genes <- msigdbr(species = "human",category = "C7", 
+                          subcategory = "IMMUNESIGDB") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes,
+                           pAdjustMethod = "fdr")
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+
+# C2:CP gene set (KEGG and REACTOME)
+hallmark_genes <- msigdbr(species = "human",category = "C2",
+                          subcategory = "CP") %>% 
+  dplyr::select(gs_name, entrez_gene)
+
+hallmark_gene_gsea <- GSEA(filtered_genes, 
+                             TERM2GENE = hallmark_genes, 
+                           pAdjustMethod = "fdr")
+
+head(hallmark_gene_gsea)
+dotplot(hallmark_gene_gsea, showCategory = 20)
+```
+
+
+## ___Justify CD6 selection___
+
+### ___Cluster 2 DEGs___
+
+```{r}
+cluster2_gene_lists <- list(vs_control = control_vs_ATRXdel_NK2_up$feature,
+                       vs_ATRXwt = ATRXwt_vs_ATRXdel_NK2_up$feature,
+                       vs_all = ALL_vs_ATRXdel_NK2_up$feature)
+
+ggVennDiagram(cluster2_gene_lists, set_size = 6, label_alpha = 0,label_size = 6,
+  category.names = c("vs_control","vs_ATRXwt","vs_all"),
+  edge_size = 1, label_percent_digit = 1,label_color = "white") +
+  ggplot2::scale_fill_gradient(low="#B59410",high = "darkblue") +
+  labs(title = "Overlap") + 
+  theme(title = element_text(size = 16),legend.text = element_text(size = 14)) +
+  scale_x_continuous(expand = expansion(mult = .2))
+
+# Find common genes in all three lists
+common_genes <- Reduce(intersect, cluster2_gene_lists)
+
+# Print result
+print(common_genes)
+```
+
+### ___Cluster 3 DEGs___
+
+```{r}
+cluster3_gene_lists <- list(vs_control = control_vs_ATRXdel_NK3_up$feature,
+                       vs_ATRXwt = ATRXwt_vs_ATRXdel_NK3_up$feature,
+                       vs_all = ALL_vs_ATRXdel_NK3_up$feature)
+
+ggVennDiagram(cluster3_gene_lists, set_size = 6, label_alpha = 0,label_size = 6,
+  category.names = c("vs_control","vs_ATRXwt","vs_all"),
+  edge_size = 1, label_percent_digit = 1,label_color = "white") +
+  ggplot2::scale_fill_gradient(low="#B59410",high = "darkblue") +
+  labs(title = "Overlap") + 
+  theme(title = element_text(size = 16),legend.text = element_text(size = 14)) +
+  scale_x_continuous(expand = expansion(mult = .2))
+
+# Find common genes in all three lists
+common_genes <- Reduce(intersect, cluster3_gene_lists)
+
+# Print result
+print(common_genes)
+```
+
+### ___Cluster 2 and cluster 3 DEGs___
+
+#### ___Up-regulated genes___
+
+```{r}
+cluster2_and_3_gene_lists <- list(NK2 = ALL_vs_ATRXdel_NK2_up$feature,
+                            NK3 = ALL_vs_ATRXdel_NK3_up$feature)
+
+ggVennDiagram(cluster2_and_3_gene_lists, set_size = 6, label_alpha = 0,label_size = 6,
+  category.names = c("NK2","NK3"),
+  edge_size = 1, label_percent_digit = 1,label_color = "white") +
+  ggplot2::scale_fill_gradient(low="#B59410",high = "darkblue") +
+  labs(title = "Overlap") + 
+  theme(title = element_text(size = 16),legend.text = element_text(size = 14)) +
+  scale_x_continuous(expand = expansion(mult = .2))
+
+common_genes <- Reduce(intersect,cluster2_and_3_gene_lists)
+common_genes
+```
+
+Up-regulated genes associated with cell adhesion:
+ABLIM1, BTBD11, AC058791.1, CD6, ARHGEF5
+
+```{r}
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(common_genes)
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              pvalueCutoff = 0.1,
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_BP
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("common genes: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+               ont = "MF",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.20, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_MF
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("common genes: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.20, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("common genes: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              pvalueCutoff = 0.1,
+                              qvalueCutoff = 0.20, 
+                              universe = geneUniverse,
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(kegg_enrichment@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("common genes: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+
+# HALLMARK GENE SET
+hallmark_gene_enrich <- enricher(entrez_ids, 
+                             TERM2GENE = hallmark_genes,
+                             qvalueCutoff = 0.20,
+                             pAdjustMethod = "fdr",
+                             universe = geneUniverse,
+                             minGSSize = 2,
+                             maxGSSize = 5000)
+
+head(hallmark_gene_enrich)
+```
+ 
+```{r eval=FALSE, include=FALSE}
+hallmark_gene_gsea <- GSEA(entrez_ids, 
+                             TERM2GENE = hallmark_genes,
+                             pvalueCutoff = 0.1,
+                             qvalueCutoff = 0.2,
+                             pAdjustMethod = "fdr",
+                             universe = geneUniverse,
+                             minGSSize = 2,
+                             maxGSSize = 5000)
+
+head(hallmark_gene_gsea)
+```
+
+#### ___Down-regulated genes___
+
+```{r}
+cluster2_and_3_gene_lists <- list(NK2 = ALL_vs_ATRXdel_NK2_down$feature,
+                            NK3 = ALL_vs_ATRXdel_NK3_down$feature)
+
+ggVennDiagram(cluster2_and_3_gene_lists, set_size = 6, label_alpha = 0,label_size = 6,
+  category.names = c("NK2","NK3"),
+  edge_size = 1, label_percent_digit = 1,label_color = "white") +
+  ggplot2::scale_fill_gradient(low="#B59410",high = "darkblue") +
+  labs(title = "Overlap") + 
+  theme(title = element_text(size = 16),legend.text = element_text(size = 14)) +
+  scale_x_continuous(expand = expansion(mult = .2))
+
+common_genes <- Reduce(intersect,cluster2_and_3_gene_lists)
+common_genes
+```
+
+
+# ___The End___
+
+```{r}
+sessionInfo()
+```
+

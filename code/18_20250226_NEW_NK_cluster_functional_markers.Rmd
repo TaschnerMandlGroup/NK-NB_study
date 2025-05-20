@@ -46,7 +46,6 @@ source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_utils.R")
 
 ```{r}
 fetahu2023 <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_withNewMetadata.Rds"))
-predicted_labels <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_predicted_NKclusters_from_Crinier2021_de.n=350.Rds"))
 ALL_NK <- readRDS(file = paste0(params$out,"/Rds/ALL_NK_cluster_withNewMetadata.Rds"))
 ```
 
@@ -54,13 +53,13 @@ ALL_NK <- readRDS(file = paste0(params$out,"/Rds/ALL_NK_cluster_withNewMetadata.
 ## ___some processing___
 
 ```{r eval=FALSE, include=FALSE}
-Idents(ALL_NK) <- ALL_NK$genetic_subtype
+Idents(ALL_NK) <- ALL_NK$group
 levels(Idents(ALL_NK))
 
 # subset scRNA-seq data 
 ## ATRX
 ATRX_NK <- subset(ALL_NK, 
-                   idents = "ATRXm", 
+                   idents = "ATRXdel", 
                    invert = FALSE)
 
 ## MNA
@@ -94,7 +93,9 @@ sporadic_NK <- sporadic_NK %>% NormalizeData(normalization.method = "LogNormaliz
 
 ```{r eval=FALSE, include=FALSE}
 saveRDS(ATRX_NK, 
-        file = paste0(params$out,"/Rds/fetahu2023_ATRXmut_BM_NK.Rds"))
+        file = paste0(params$out,"/Rds/fetahu2023_ATRXdel_BM_NK.Rds"))
+saveRDS(ATRX_NK_sub, 
+        file = paste0(params$out,"/Rds/fetahu2023_ATRXdel-sub_BM_NK.Rds"))
 saveRDS(sporadic_NK, 
         file = paste0(params$out,"/Rds/fetahu2023_sporadic_BM_NK.Rds"))
 saveRDS(CTRL_NK, 
@@ -108,7 +109,7 @@ saveRDS(MNA_NK,
 ```{r}
 CTRL_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_fetal_BM_NK.Rds"))
 MNA_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_MNA_BM_NK.Rds"))
-ATRX_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_ATRXmut_BM_NK.Rds"))
+ATRX_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_ATRXdelut_BM_NK.Rds"))
 sporadic_NK <- readRDS(file = paste0(params$out,"Rds/fetahu2023_sporadic_BM_NK.Rds"))
 ```
 
@@ -129,12 +130,12 @@ ATRX_NK_sub <- ATRX_NK_sub %>% NormalizeData(normalization.method = "LogNormaliz
 
 ```{r eval=FALSE, include=FALSE}
 saveRDS(ATRX_NK_sub, 
-        file = paste0(params$out,"/Rds/fetahu2023_ATRXmut_BM_NK_subset_hNK_Bm2_3.Rds"))
+        file = paste0(params$out,"/Rds/fetahu2023_ATRXdelut_BM_NK_subset_hNK_Bm2_3.Rds"))
 ```
 
 
 ```{r}
-ATRX_NK_sub <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_ATRXmut_BM_NK_subset_hNK_Bm2_3.Rds"))
+ATRX_NK_sub <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_ATRXdelut_BM_NK_subset_hNK_Bm2_3.Rds"))
 ```
 
 
@@ -143,11 +144,11 @@ ATRX_NK_sub <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_ATRXmut_BM_NK_s
 ```{r cluster markers: CTRL}
 de_results <- DElegate::findDE(object = CTRL_NK,
                                group_column = "predicted_NK_type_de.n350",
-                               replicate_column = "sample")
+                               replicate_column = "rados_et_al_2025")
 
 marker_results <- DElegate::FindAllMarkers2(object = CTRL_NK,
                                             group_column = "predicted_NK_type_de.n350",
-                                            replicate_column = "sample")
+                                            replicate_column = "rados_et_al_2025")
 
 marker_results %>%
     group_by(group1) %>%
@@ -156,7 +157,8 @@ marker_results %>%
 signif_DEGs <- top10 %>% filter(padj < 0.05)
 
 # TOP 10 markers per cluster 
-DEG_tumor <- DoHeatmap(CTRL_NK, group.by = "predicted_NK_type_de.n350",
+DEG_tumor <- DoHeatmap(CTRL_NK, 
+                       group.by = "predicted_NK_type_de.n350",
                        features = signif_DEGs$feature) + NoLegend()
 DEG_tumor
 
@@ -180,22 +182,21 @@ signif_DEGs_hNK_Bm4 <- top10 %>% filter(group1 == "hNK_Bm4")
 ```
 
 hNK_Bm1: SPON2+, CX3CR1+, CXCR2+ NK cells = Cytotoxic, inflammatory, tissue-resident NK cells	- typically found in peripheral tissues or inflamed sites - Function: High cytotoxicity, tissue adaptation
-hNK_Bm2: TOX2+, CXCR6+, XCL1+ NK cells = Activated, effector, and exhausted-like NK cells - typically fopund in tumor microenvironment, chronic infections - Function: Effector function, but signs of exhaustion
+hNK_Bm2: TOX2+, CXCR6+, XCL1+ NK cells = Activated, effector, and exhausted-like NK cells - typically found in tumor microenvironment, chronic infections - Function: Effector function, but signs of exhaustion
 hNK_Bm3: SELL+, CCR7+, IFIT3+ NK cells = Circulating, naïve/memory-like, and antiviral NK cells - typically found in blood, lymphoid tissues - Function: Naïve or memory-like, migratory, antiviral response
 hNK_Bm4: B3GAT1+, GPR27+, SLC1A7+ NK cells =	Metabolically adapted, tissue-resident, suppressive NK cells - typically found in specialized tissues (brain, tumor niches) - Function:	Long-lived, stress-adapted, immune regulation
 
-
-Now let's look at ATRXm samples and how do those differ (we have mainly hNK_Bm2
+Now let's look at ATRXdel samples and how do those differ (we have mainly hNK_Bm2
 and hNK_Bm3 NK cells here so i will focus on those):
 
 ```{r cluster markers: ATRX}
 de_results <- DElegate::findDE(object = ATRX_NK,
                                group_column = "predicted_NK_type_de.n350",
-                               replicate_column = "sample")
+                               replicate_column = "rados_et_al_2025")
 
 marker_results <- DElegate::FindAllMarkers2(object = ATRX_NK,
                                             group_column = "predicted_NK_type_de.n350",
-                                            replicate_column = "sample")
+                                            replicate_column = "rados_et_al_2025")
 
 marker_results %>%
     group_by(group1) %>%
@@ -218,9 +219,9 @@ do_DotPlot(ATRX_NK,
            use_viridis = TRUE,
            viridis.palette = "A",
            viridis.direction = -1, 
-           plot.title = "ATRXm"
+           plot.title = "ATRXdel"
            )
-# should we remove cluster 1 and 4 when plotting dotplots of ATRXm samples?
+# should we remove cluster 1 and 4 when plotting dotplots of ATRXdel samples?
 # since we have only few cells mapping to clusters 1 and 4, they tend to
 # give a wrong impression
 
@@ -236,7 +237,7 @@ In Rebuffet et al., 2024 (Eric Vivier lab), they defined these genes as markers 
 NK cytotoxicity: GZMB and PRF1, and markers of NK cell maturity: CD160, CD247, 
 ADGRG1, NKG7, FCER1G, LAIR2, SPON2, CLIC3 and CHST2 
 
-If we look at the genes that are differentially expressed in NK cluster 2 and 3,
+If we look at the genes that are differentialy expressed in NK cluster 2 and 3,
 compared to all other clusters:
 
 hNK_Bm3: FGFBP2+, GZMB+, FCGR3A+ NK cells = tumor-infiltrating cytotoxic NK cells;
@@ -247,9 +248,51 @@ hNK_Bm2: ID3+, LTB+, CD28+ NK cells = resident, adaptive-like NK cells involved 
 Their expression of ID3, CD28, and TNFSF8 suggests they could be long-lived, 
 adaptive-like NK cells that respond to persistent stimuli, such as chronic inflammation 
 or tumor microenvironment. They might be quiescent, metabolically flexible NK population 
-capable of responding to chronic immune challenges rather than acting as immediate cytotoxic effectors,
-as as hNK_Bm3 NK cluster.
+capable of responding to chronic immune challenges rather than acting as immediate cytotoxic effectors, as hNK_Bm3 NK cluster.
 
+```{r cluster markers: ATRXsub}
+de_results <- DElegate::findDE(object = ATRX_NK_sub,
+                               group_column = "predicted_NK_type_de.n350",
+                               replicate_column = "rados_et_al_2025")
+
+marker_results <- DElegate::FindAllMarkers2(object = ATRX_NK_sub,
+                                            group_column = "predicted_NK_type_de.n350",
+                                            replicate_column = "rados_et_al_2025")
+
+marker_results %>%
+    group_by(group1) %>%
+    top_n(n = 10, wt = log_fc) -> top10
+
+signif_DEGs <- top10 %>% filter(padj < 0.05)
+
+# TOP 10 markers per cluster 
+DEG_tumor <- DoHeatmap(ATRX_NK_sub, group.by = "predicted_NK_type_de.n350",
+                       features = signif_DEGs$feature) + NoLegend()
+DEG_tumor
+
+do_DotPlot(ATRX_NK_sub,
+           features = signif_DEGs$feature, 
+           group.by = "predicted_NK_type_de.n350", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1, 
+           plot.title = "ATRXdel"
+           )
+# should we remove cluster 1 and 4 when plotting dotplots of ATRXdel samples?
+# since we have only few cells mapping to clusters 1 and 4, they tend to
+# give a wrong impression
+
+signif_DEGs_hNK_Bm2 <- signif_DEGs %>% filter(group1  == "hNK_Bm2")
+signif_DEGs_hNK_Bm3 <- signif_DEGs %>% filter(group1  == "hNK_Bm3")
+
+print(signif_DEGs_hNK_Bm2$feature)
+print(signif_DEGs_hNK_Bm3$feature)
+
+```
 
 # ___Exploration of age and sex dependence in the data___
 
@@ -298,7 +341,7 @@ ggplot(input, aes(x=group,y=value,fill=sex)) +
 
 ```
 
-Since in ATRXm samples, only 30 cells map to the NK clusters 1 or 4, 
+Since in ATRXdel samples, only 30 cells map to the NK clusters 1 or 4, 
 i removed those from downstream analysis (below)
 
 # ___NK functional markers___

@@ -22,14 +22,14 @@ suppressPackageStartupMessages(library("ggpubr"))
 suppressPackageStartupMessages(library("stats"))
 suppressPackageStartupMessages(library("viridis"))
 suppressPackageStartupMessages(library("DElegate"))
-#suppressPackageStartupMessages(library("clusterProfiler"))
-#suppressPackageStartupMessages(library("org.Hs.eg.db"))
-#suppressPackageStartupMessages(library("enrichplot"))
-#suppressPackageStartupMessages(library("AnnotationDbi"))
-#suppressPackageStartupMessages(library("pathview"))
+suppressPackageStartupMessages(library("clusterProfiler"))
+suppressPackageStartupMessages(library("org.Hs.eg.db"))
+suppressPackageStartupMessages(library("enrichplot"))
+suppressPackageStartupMessages(library("AnnotationDbi"))
+suppressPackageStartupMessages(library("pathview"))
 suppressPackageStartupMessages(library("knitr"))
 suppressPackageStartupMessages(library("pathview"))
-#suppressPackageStartupMessages(library("aggregateBioVar"))
+suppressPackageStartupMessages(library("aggregateBioVar"))
 suppressPackageStartupMessages(library("SummarizedExperiment"))
 suppressPackageStartupMessages(library("DESeq2"))
 suppressPackageStartupMessages(library("magrittr"))
@@ -39,6 +39,8 @@ suppressPackageStartupMessages(library("ggbeeswarm"))
 suppressPackageStartupMessages(library("ggthemes"))
 suppressPackageStartupMessages(library("slingshot"))
 suppressPackageStartupMessages(library("reshape2"))
+suppressPackageStartupMessages(library("EnhancedVolcano"))
+suppressPackageStartupMessages(library("msigdbr"))
 
 # ___NK sub-set markers___
 
@@ -61,6 +63,55 @@ mature_NK_genes <- read.csv("/home/rstudio/mnt_resources/NK_cells_gene_sets/matu
 mature_NK_genes <- mature_NK_genes$V1
 NKP_genes <- read.csv("/home/rstudio/mnt_resources/NK_cells_gene_sets/NKP_marker_genes.txt", header = FALSE)
 NKP_genes <- NKP_genes$V1
+
+crinier_et_al_genes <- list(adaptive_NK = adaptive_NK_genes,
+                            conventional_NK = conventional_NK_genes,
+                            mature_NK = mature_NK_genes,
+                            progenitor_NK = NKP_genes)
+
+
+## ____NK functional markers from: Hannah et al., 2004____
+
+library(readr)
+CD56bright_CD16neg_NK_vs_CD56dim_CD16pos_NK_genes <- 
+  read_delim("~/mnt_resources/NK_cells_gene_sets/CD56bright_CD16neg_NK_vs_CD56dim_CD16pos_NK_genes.csv",
+             delim = "\t", escape_double = FALSE, 
+             col_names = FALSE, trim_ws = TRUE, skip = 2)
+
+
+activated_CD16pos_NK_vs_CD56dim_CD16pos_NK_genes <- 
+  read_delim("~/mnt_resources/NK_cells_gene_sets/activated_CD16pos_NK_vs_CD56dim_CD16pos_NK_genes.csv",
+             delim = "\t", escape_double = FALSE,
+             col_names = FALSE, trim_ws = TRUE, skip = 2)
+
+activated_CD16pos_NK_vs_CD56bright_CD16neg_NK_genes <- 
+  read_delim("~/mnt_resources/NK_cells_gene_sets/activated_CD16pos_NK_vs_CD56bright_CD16neg_NK_genes.csv",
+             delim = "\t", escape_double = FALSE,
+             col_names = FALSE, trim_ws = TRUE, skip = 2)
+
+
+# !he following features were not be found: 
+# STK12, KIAA0101, E2-EPF, CDW52, TSC, CHC1L, CDC2, HSPC150, DAF, FLJ10517, FLJ10461, HN1, SC1, MGC14833, MGC861, TUBB2, KIAA0042
+# these are the correct ones:
+# AURKB, PCLAF, UBE2S, CD52, TSC1,TSC2, RCBTB2, CDK1, UBE2T, CD55, ASPM, ECT2, JPT1, SPARCL1, UQCC2, CENPM, TUBB2B, KIF14
+
+activated_CD16pos_NK_vs_CD56dim_CD16pos_NK_genes <- rbind(activated_CD16pos_NK_vs_CD56dim_CD16pos_NK_genes, 
+                                                          "AURKB", "PCLAF", "UBE2S", "CD52", "TSC1","TSC2", 
+                                                          "RCBTB2", "CDK1", "UBE2T", "CD55", "ASPM", "ECT2", 
+                                                          "JPT1", "SPARCL1", "UQCC2", "CENPM", "TUBB2B", "KIF14")
+
+## ____NK functional markers from: Blanquart et al., 2024___
+
+inflammed_NK_genes <- read_delim("~/mnt_resources/NK_cells_gene_sets/inflammed_NK_genes.csv",
+                                 delim = "\t", escape_double = FALSE,
+                                 col_names = FALSE, trim_ws = TRUE, skip = 2)
+
+# The following features were not be found:
+# LINC-PINT, LINC01578
+# these are the correct ones:
+# PINT, CHASERR <- still not found!
+
+inflammed_NK_genes <- rbind(inflammed_NK_genes, "PINT", "CHASERR")
 
 
 ## ____NK other markers____
@@ -97,6 +148,27 @@ activated_NK_cells <- c("LTB","GZMK","CTSW","AURKB","ANXA2","UBE2C","TK1","CKS2"
                         "CENPM","RANBP1","TUBB4B","SDF2L1","PSMD1","KIF14", 
                         "HTATSF1")
 
+
+# Mei et al., 2024
+# CD56dim-2 represented a terminally differentiated cell state 
+# CD56dim-2 also show high expression of KLRK1, which is one of the main NK cell 
+# activating receptor involved in anti-tumor activity 
+
+NK_Mei_et_al_markers <- list(CD56bright = c("SELL", "TCF7", "SPTSSB", "CCR7","NCAM1"),
+                             CD56dim_1 = c("GZMB","FCGR3A", "SPON2","PRF1"),
+                             CD56dim_2 = c("PPM1L","AOAH","SYNE2", "ZEB2","PDE4D", "KLRK1","HAVCR2"),
+                             Immature_NK = c("CCL3","XCL1","CXCR6","IL2RB","LY9","CD7","KLRB1"),
+                             NKT_cells = c("GZMH", "CD3D", "CD8A", "CD8B", "NKG7", "NCAM1", "TBX21"),
+                             Active_NK_cells = c("CD7", "CXCR4", "IL2RB", "CD69", "KLRB1"))
+                             
+NK_Mei_et_al_markers_short <- list(CD56bright = c("SELL", "TCF7", "CCR7"),
+                             CD56dim_1 = c("FCGR3A", "SPON2"),
+                             CD56dim_2 = c("ZEB2", "KLRK1","HAVCR2"),
+                             NKT_cells = c("GZMH", "CD8A", "CD8B", "NKG7", "NCAM1", "TBX21"),
+                             Active_NK_cells = c("CD7", "CXCR4", "IL2RB", "CD69", "KLRB1"))
+
+# NK and NB cell secretion genes
+
 secreted_factors_low <- c("C5", "CD40LG", "CSF3","CSF2", "CXCL1", "CCL1",
                           "IL1A", "IL1B", "IL1RN", "IL2","IL4","IL5","IL6",
                            "IL10","IL12B", "IL13", "IL17A","IL25",
@@ -128,8 +200,6 @@ coculture_secreted_factors <- c("CSF2","CCL1","IFNG", "IL1B", "IL2",  "MIF",
                                 "CCL3","CCL5", "CXCL12", "TNF")
 
 ## ___Color pallets___
-
-
 COLOR_CODE_ATAC = c("NB" = "palegreen4",
                     "T_cell" = "#cc0000",   
                     "NKT" = "#0B5394",
@@ -163,15 +233,48 @@ COLOR_CODE_FETAHU2023 = c("NB (8)" = "palegreen4",
                           "SC (20)" = "#573807",  
                           "other (21)" = "#000000")
 
-COLOR_CODE_FETAHU2023_META = c("NB (8)" = "palegreen4",
-                          "T-cells" = "darkred",   
-                          "NK-cells" = "#0B5394",
-                          "Myeloid cells" = "#39BEB1",
-                          "B-cells" = "#fc58a9",   
-                          "Dendritic cells" = "#15acbc",   
-                          "Erythroid cells" = "#113556",   
-                          "Progenitor cells" = "#573807",  
+COLOR_CODE_FETAHU2023_META = c("NB (8)" = "darkgreen",
+                          "T-cells" = "darkblue",   
+                          "NK-cells" = "#b4d1ee",
+                          "Myeloid cells" = "#FF0080",
+                          "B-cells" = "purple",   
+                          "Dendritic cells" = "#FAA21B",   
+                          "Erythroid cells" = "#CDA646",   
+                          "Progenitor cells" = "brown",  
                           "Unknwon" = "#000000")
+
+COLOR_CODE_FETAHU2023_v2  = c("NB (8)" = "#006400",                  # darkgreen
+                                               "T (5)" = "#00008B",                   # darkblue variants
+                                               "T (6)" = "#000099",
+                                               "T (9)" = "#0000B8",
+                                               "T (18)" = "#0011AA",
+                                               "NK (4)" = "#b4d1ee",
+                                               "M (1)" = "#FF0080",                   # hot pink variants
+                                               "M (2)" = "#E60073",
+                                               "M (10)" = "#FF3399",
+                                               "M (15)" = "#CC0066",
+                                               "B (19)" = "#800080",                  # purple variants
+                                               "B (3)" = "#9932CC",
+                                               "B (7)" = "#A020F0",
+                                               "B (11)" = "#BA55D3",
+                                               "B (16)" = "#9400D3",
+                                               "pDC (12)" = "#FAA21B",
+                                               "E (13)" = "#CDA646",
+                                               "SC (14)" = "#A52A2A",                 # brown variants
+                                               "SC (17)" = "#8B4513",
+                                               "SC (20)" = "#5C4033",
+                                               "other (21)" = "#000000")              # unknown
+
+
+COLOR_CODE_FETAHU2023_META_v2 = c("NB (8)" = "palegreen4",
+                               "T-cells" = "darkred",   
+                               "NK-cells" = "#0B5394",
+                               "Myeloid cells" = "#39BEB1",
+                               "B-cells" = "#fc58a9",   
+                               "Dendritic cells" = "#15acbc",   
+                               "Erythroid cells" = "#113556",   
+                               "Progenitor cells" = "#573807",  
+                               "Unknwon" = "#000000")
 
 
 COLOR_CODE <- c("I"   = "#7EA3AC",
@@ -189,6 +292,12 @@ COLOR_CODE_CCC <- c("hNK_Bm1"  = "#6376AE",
                    "hNK_Bm3"  = "#BF4E4E",
                    "hNK_Bm4"  = "#CDA646",
                    "NB (8)"   = "#520c61")
+
+COLOR_CODE_CCC_2 <- c("hNK_Bm1"  = "#6376AE",
+                      "hNK_Bm2"  = "#679F8F",
+                      "hNK_Bm3"  = "#BF4E4E",
+                      "hNK_Bm4"  = "#CDA646",
+                      "NB"   = "#520c61")
 
 COLOR_CODE_v3 <- c("I"   = "#7EA3AC",
                    "III"  = "#4f4e92",
@@ -227,10 +336,10 @@ COLOR_CODE_GROUP_v3 <- c("ATRXdel"   = "#4f4e92",
                          "MYCNamp"       = "#A7563C",
                          "ATRXwtMYCNwt"  = "#FAA21B")
 
-COLOR_CODE_GROUP_v4 <- c("control"   = "#7EA3AC",
-                         "ATRXdel"   = "#4f4e92",
-                         "MYCNamp"       = "#A7563C",
-                         "ATRXwtMYCNwt"  = "#FAA21B")
+COLOR_CODE_GROUP_v4 <- c("C"   = "#7EA3AC",
+                         "A"   = "#4f4e92",
+                         "M"       = "#A7563C",
+                         "S"  = "#FAA21B")
 
 COLOR_CODE_CLUST_v1 <- c("1"   = "#6376AE",
                          "2"  = "#679F8F",
@@ -467,6 +576,7 @@ COLOR_CODE_UMAP_v2 <- c("NB (8)" = "darkgreen",
                      "SC (20)" = "lightgray",  
                      "other (21)" = "black")
 
+
 COLOR_CODE_UMAP_v3 <- c("NB (8)" = "darkgreen",
                         "T (5)" = "darkblue",   
                         "T (6)" = "darkblue", 
@@ -504,11 +614,11 @@ CLUSTER_ORDER <- c("hNK_Bm1",
                    "hNK_Bm3",
                    "hNK_Bm4")
 
-CLUSTER_ORDER_v2 <- c("hNK_Bm1",
-                   "hNK_Bm2",
-                   "hNK_Bm3",
-                   "hNK_Bm4",
-                   "Mixed")
+CLUSTER_ORDER_v2 <- c("Mixed",
+                      "hNK_Bm4",
+                      "hNK_Bm3",
+                      "hNK_Bm2",
+                      "hNK_Bm1")
 
 
 GROUP_CLUSTER_ORDER <- c("hNK_Bm1_control", "hNK_Bm1_ATRXdel", "hNK_Bm1_MYCNamp", "hNK_Bm1_ATRXwtMYCNwt",

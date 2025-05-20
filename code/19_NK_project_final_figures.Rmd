@@ -48,13 +48,14 @@ source("/home/rstudio/NK-NB_study/code/00_NK_paper_utils.R")
 ```{r}
 fetahu2023 <- readRDS(file = params$input_scRNA)
 ALL_NK <-  readRDS(file = params$input_NK)
-```
-
-```{r}
-ATRX_NK <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_ATRXmut_BM_NK_subset_hNK_Bm2_3.Rds"))
+# ALL_NK <-  readRDS(file = paste0(params$out,"Rds/2024_analysis/ALL_NK_cluster.Rds"))
 ```
 
 ```{r eval=FALSE, include=FALSE}
+ATRX_NK <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_ATRXmut_BM_NK_subset_hNK_Bm2_3.Rds"))
+```
+
+```{r}
 fetahu2023@meta.data$case_control <- NA
 fetahu2023@meta.data <- fetahu2023@meta.data %>% 
   mutate(case_control = ifelse(fetahu2023$histology == "NB","NB", "CTRL"))
@@ -64,7 +65,6 @@ fetahu2023@meta.data$case_control  <- droplevels(fetahu2023@meta.data$case_contr
 
 # Change to the new group identitites
 Idents(fetahu2023) <- fetahu2023@meta.data$case_control
-
 
 #crinier2021 <- readRDS(file = paste0(params$input_BM1))
 #crinier2021[["RNA"]] <- as(object = crinier2021[["RNA"]], Class = "Assay5")
@@ -77,10 +77,10 @@ Idents(fetahu2023) <- fetahu2023@meta.data$case_control
 
 ALL_NK@meta.data$case_control <- NA
 ALL_NK@meta.data <- ALL_NK@meta.data %>% 
-  mutate(case_control = ifelse(ALL_NK$histology.x == "NB","NB", "CTRL"))
+  mutate(case_control = ifelse(ALL_NK$histology == "NB","NB", "CTRL"))
 
 ALL_NK@meta.data$case_control  <- factor(ALL_NK@meta.data$case_control)
-ALL_NK@meta.data$case_control  <- droplevels(ALL_NK@meta.data$case_control )
+ALL_NK@meta.data$case_control  <- droplevels(ALL_NK@meta.data$case_control)
 
 # Change to the new group identitites
 Idents(ALL_NK) <- ALL_NK@meta.data$case_control
@@ -154,9 +154,9 @@ ALL_NK@meta.data$rados_et_al_2025  <-
 levels(ALL_NK@meta.data$rados_et_al_2025)
 
 fetahu2023@meta.data$rados_et_al_2025.y  <- 
-  factor(fetahu2023@meta.data$rados_et_al_2025.y, 
+  factor(fetahu2023@meta.data$rados_et_al_2025, 
          levels = PATIENT_ORDER)
-levels(fetahu2023@meta.data$rados_et_al_2025.y)
+levels(fetahu2023@meta.data$rados_et_al_2025)
 
 # Convert group names to a factor with the defined order
 ALL_NK@meta.data$group  <- 
@@ -179,6 +179,11 @@ ALL_NK@meta.data$group_per_NK_subtype  <-
          levels = CLUSTER_GROUP_ORDER)
 levels(ALL_NK@meta.data$group_per_NK_subtype)
 
+# order NK subsets
+ALL_NK@meta.data$predicted_NK_type_de.n350  <- 
+  factor(ALL_NK@meta.data$predicted_NK_type_de.n350, 
+         levels = CLUSTER_ORDER_v2)
+levels(ALL_NK@meta.data$predicted_NK_type_de.n350)
 
 # 
 columns_to_remove <- c("sex.x", "age_at_Dx_months.x", "diagnosis", "stage.x",
@@ -233,7 +238,7 @@ create_loupe_from_seurat(
 for_MaRa <- fetahu2023
 for_MaRa@meta.data <- for_MaRa@meta.data[, c("orig.ident", "sample", "histology.x",
                                              "at_diagnosis.x", "at_relapse.x",
-                                             "sex","rados_et_al_2025.x","group")]
+                                             "sex","rados_et_al_2025","group")]
 
 create_loupe_from_seurat(
     for_MaRa,
@@ -253,7 +258,6 @@ NB_cells <- subset(fetahu2023, idents = "NB (8)")
 # save Robject
 saveRDS(NB_cells, file = paste0(params$out,"Rds/fetahu2023_NB_cells.Rds"))
 ```
-
 
 ```{r}
 NB_cells <- readRDSfile = paste0(params$out,"Rds/fetahu2023_NB_cells.Rds")()
@@ -350,7 +354,6 @@ png(paste0(params$out,"figures/01_INTRO_figure_UMAP_whole_dataset_metaClusters.p
 figure_S1
 dev.off()
 ```
-
 
 ```{r fig.height=5, fig.width=5}
 figure_1_B <-SCpubr::do_DimPlot(sample = ALL_NK,
@@ -451,16 +454,7 @@ dev.off()
 ## ___Stats for ALL clusters___
 
 ```{r fig.height=10, fig.width=10}
-percent_cell_type_group <- table(TME_cells$cell_type,
-                          TME_cells$group)
-
-# Transform this data in %
-data_percentage <- apply(percent_cell_type_group, 2, 
-                         function(x){x*100/sum(x,na.rm=T)})
-
-percent_cell_type_group_trans <- melt(data_percentage) 
-
-barplots_cell_types <- ggplot(percent_cell_type_group_trans, 
+barplots_cell_types <- ggplot(cell_prop_per_group_percent_trans, 
                              aes(x = Var2, y = value, fill = Var1)) + 
   geom_bar(stat = "identity", position = "stack") +
   theme_void() + 
@@ -469,9 +463,8 @@ barplots_cell_types <- ggplot(percent_cell_type_group_trans,
   ggtitle("") +
   theme_minimal(base_size = 22) + 
   theme(axis.text.x = element_text(angle = 45,
-
                                    hjust = 1)) +
-  scale_fill_manual(values = COLOR_CODE_FETAHU2023)
+  scale_fill_manual(values = COLOR_CODE_FETAHU2023) 
 
 barplots_cell_types
 
@@ -486,59 +479,73 @@ dev.off()
 ## ___Stats for NK clusters___
 
 ```{r}
-table_NK_per_sample <- as.data.frame(data_percentage_sample)
-table_NK_per_sample$group <- gsub("_[0-9][0-9]", "", table_NK_per_sample$Var2)
+ALL_NK$orig.ident <-  droplevels(ALL_NK$orig.ident)
+
+table_NK_per_sample <- table(ALL_NK$predicted_NK_type_de.n350,ALL_NK$rados_et_al_2025)
+table_NK_per_sample <- as.data.frame(table_NK_per_sample)
+
+table_NK_per_sample$group <- gsub("*[0-9]", "", table_NK_per_sample$Var2)
 table_NK_per_sample
+
+data_wide <- t(table_NK_per_sample_percent_trans)
+
+library(dplyr)
+
+table_NK_per_sample_percent <- table_NK_per_sample %>%
+  group_by(Var2, Var1) %>%           
+  summarise(total = sum(Freq, na.rm = TRUE)) %>%  
+  mutate(percentage = total * 100 / sum(total)) %>% 
+  ungroup()
+
+table_NK_per_sample_percent <- as.data.frame(table_NK_per_sample_percent)
+table_NK_per_sample_percent$group <- gsub("*[0-9]", "", table_NK_per_sample_percent$Var2)
+table_NK_per_sample_percent
 ```
 
 ### ___hNK_Bm1___
 
 ```{r}
-hNK_Bm1 <- filter(as.data.frame(table_NK_per_sample), Var1 == "hNK_Bm1")
+hNK_Bm1 <- filter(as.data.frame(table_NK_per_sample_percent), Var1 == "hNK_Bm1")
 
 # Perform ANOVA testing
-hNK_Bm1_anova <- aov(Freq ~ group, data = hNK_Bm1)
+hNK_Bm1_anova <- aov(percentage ~ group, data = hNK_Bm1)
 summary(hNK_Bm1_anova)
 
 # Extract p-value
 p_value <- summary(hNK_Bm1_anova)[[1]][["Pr(>F)"]][1]
 
 # perform wilcox testing
-p_value1 <- wilcox.test(Freq ~ group, 
+p_value1 <- wilcox.test(percentage ~ group, 
                         data = subset(hNK_Bm1, 
-                                      group %in% c("ATRXdel", "ATRXwtMYCNwt")))$p.value
-p_value2 <- wilcox.test(Freq ~ group, 
+                                      group %in% c("A", "S")))$p.value
+p_value2 <- wilcox.test(percentage ~ group, 
                         data = subset(hNK_Bm1, 
-                                      group %in% c("ATRXdel", "ctrl")))$p.value
-p_value3 <- wilcox.test(Freq ~ group, 
+                                      group %in% c("A", "C")))$p.value
+p_value3 <- wilcox.test(percentage ~ group, 
                         data = subset(hNK_Bm1, 
-                                      group %in% c("ATRXdel", "MYCNamp")))$p.value
+                                      group %in% c("A", "M")))$p.value
 
 # Create boxplot and add p-value annotation
 boxplot1 <- hNK_Bm1 %>%
-  ggplot( aes(x = group , y = Freq, fill = group)) +
+  ggplot( aes(x = group , y =  percentage, fill = group)) +
     geom_boxplot() +
-    theme_minimal(legend.position="none",
-          axis.text = element_text(size = 18),
-          axis.title.y = element_text(size = 18),
-          plot.title = element_text(size = 18)) +
     ggtitle("NK cluster per NB genetic group: hNK_Bm1") +
-    xlab("") + ylab("Number of cells per group") +
-  geom_signif(comparisons = list(c("ATRXdel", "ctrl"),
-                                 c("ATRXdel", "MYCNamp"),
-                                 c("ATRXdel", "ATRXwtMYCNwt")),
+    xlab("") + ylab("Percentage of NK cells per group") +
+  geom_signif(comparisons = list(c("A", "C"),
+                                 c("A", "M"),
+                                 c("A", "S")),
               map_signif_level = FALSE, 
-              y_position = c(max(hNK_Bm1$Freq) + 50, 
-                             max(hNK_Bm1$Freq) + 65, 
-                             max(hNK_Bm1$Freq) + 80)) +
-  scale_fill_manual(values = COLOR_CODE_GROUP_v1)
+              y_position = c(max(hNK_Bm1$percentage) + 0, 
+                             max(hNK_Bm1$percentage) + 5, 
+                             max(hNK_Bm1$percentage) + 10)) +
+  scale_fill_manual(values = COLOR_CODE_GROUP_v4)
 
 ```
 
 ```{r}
 boxplot1
 
-pdf(paste0(params$out,"Rds/barplot_hNK_Bm1_wStats.pdf"))
+pdf(paste0(params$out,"figures/barplot_hNK_Bm1_wStats.pdf"))
 boxplot1
 dev.off()
 ```
@@ -546,101 +553,93 @@ dev.off()
 ### ___hNK_Bm2___
 
 ```{r}
-hNK_Bm2 <- filter(as.data.frame(table_NK_per_sample), Var1 == "hNK_Bm2")
+hNK_Bm2 <- filter(as.data.frame(table_NK_per_sample_percent), Var1 == "hNK_Bm2")
 
 # Perform ANOVA
-hNK_Bm2_anova <- aov(Freq ~ group, data = hNK_Bm2)
+hNK_Bm2_anova <- aov(percentage ~ group, data = hNK_Bm2)
 summary(hNK_Bm2_anova)
 
 # Extract p-value
 p_value <- summary(hNK_Bm2_anova)[[1]][["Pr(>F)"]][1]
 
 # perform wilcox testing
-p_value1 <- wilcox.test(Freq ~ group, 
+p_value1 <- wilcox.test(percentage ~ group, 
                         data = subset(hNK_Bm2, 
-                                      group %in% c("ATRXdel", "ATRXwtMYCNwt")))$p.value
-p_value2 <- wilcox.test(Freq ~ group, 
+                                      group %in% c("A", "S")))$p.value
+p_value2 <- wilcox.test(percentage ~ group, 
                         data = subset(hNK_Bm2, 
-                                      group %in% c("ATRXdel", "ctrl")))$p.value
-p_value3 <- wilcox.test(Freq ~ group, 
+                                      group %in% c("A", "C")))$p.value
+p_value3 <- wilcox.test(percentage ~ group, 
                         data = subset(hNK_Bm2, 
-                                      group %in% c("ATRXdel", "MYCNamp")))$p.value
+                                      group %in% c("A", "M")))$p.value
 
 # plot boxplot
 boxplot2 <- hNK_Bm2 %>%
-  ggplot( aes(x = group , y = Freq, fill = group)) +
+  ggplot( aes(x = group , y = percentage, fill = group)) +
     geom_boxplot() +
-    theme_minimal(legend.position="none",
-          axis.text = element_text(size = 18),
-          axis.title.y = element_text(size = 18),
-          plot.title = element_text(size = 18)) +
     ggtitle("NK cluster per NB genetic group: hNK_Bm2") +
-    xlab("") + ylab("Number of cells per group") +
-  geom_signif(comparisons = list(c("ATRXdel", "ctrl"),
-                                 c("ATRXdel", "MYCNamp"),
-                                 c("ATRXdel", "ATRXwtMYCNwt")),
+    xlab("") + ylab("Percentage of NK cells per group") +
+  geom_signif(comparisons = list(c("A", "C"),
+                                 c("A", "M"),
+                                 c("A", "S")),
               map_signif_level = FALSE, 
-              y_position = c(max(hNK_Bm2$Freq) + 50, 
-                             max(hNK_Bm2$Freq) + 80, 
-                             max(hNK_Bm2$Freq) + 110))  +
-  scale_fill_manual(values = COLOR_CODE_GROUP_v1)
+              y_position = c(max(hNK_Bm1$percentage) + 0, 
+                             max(hNK_Bm1$percentage) + 5, 
+                             max(hNK_Bm1$percentage) + 10)) +
+  scale_fill_manual(values = COLOR_CODE_GROUP_v4)
 ```
 
 ```{r}
 boxplot2
 
-pdf(paste0(params$out,"Rds/barplot_hNK_Bm2_wStats.pdf"))
-boxplot3
+pdf(paste0(params$out,"figures/barplot_hNK_Bm2_wStats.pdf"))
+boxplot2
 dev.off()
 ```
 
 ### ___hNK_Bm3___
 
 ```{r}
-hNK_Bm3 <- filter(as.data.frame(table_NK_per_sample), Var1 == "hNK_Bm3")
+hNK_Bm3 <- filter(as.data.frame(table_NK_per_sample_percent), Var1 == "hNK_Bm3")
 
 # Perform ANOVA
-hNK_Bm3_anova <- aov(Freq ~ group, data = hNK_Bm3)
+hNK_Bm3_anova <- aov(percentage ~ group, data = hNK_Bm3)
 summary(hNK_Bm3_anova)
 
 # Extract p-value
 p_value <- summary(hNK_Bm3_anova)[[1]][["Pr(>F)"]][1]
 
 # perform wilcox testing
-p_value1 <- wilcox.test(Freq ~ group, 
+p_value1 <- wilcox.test(percentage ~ group, 
                         data = subset(hNK_Bm3, 
-                                      group %in% c("ATRXdel", "ATRXwtMYCNwt")))$p.value
-p_value2 <- wilcox.test(Freq ~ group, 
+                                      group %in% c("A", "S")))$p.value
+p_value2 <- wilcox.test(percentage ~ group, 
                         data = subset(hNK_Bm3, 
-                                      group %in% c("ATRXdel", "ctrl")))$p.value
-p_value3 <- wilcox.test(Freq ~ group, 
+                                      group %in% c("A", "C")))$p.value
+p_value3 <- wilcox.test(percentage ~ group, 
                         data = subset(hNK_Bm3, 
-                                      group %in% c("ATRXdel", "MYCNamp")))$p.value
+                                      group %in% c("A", "M")))$p.value
 
 # plot boxplot
 boxplot3 <- hNK_Bm3 %>%
-  ggplot( aes(x = group , y = Freq, fill = group)) +
+  ggplot( aes(x = group , y = percentage, fill = group)) +
     geom_boxplot() +
-    theme_minimal(legend.position="none",
-          axis.text = element_text(size = 18),
-          axis.title.y = element_text(size = 18),
-          plot.title = element_text(size = 18)) +
     ggtitle("NK cluster per NB genetic group: hNK_Bm3") +
-    xlab("") + ylab("Number of cells per group")  +
-  geom_signif(comparisons = list(c("ATRXdel", "ctrl"),
-                                 c("ATRXdel", "MYCNamp"),
-                                 c("ATRXdel", "ATRXwtMYCNwt")),
+    xlab("") + ylab("Percentage of NK cells per group")  +
+  geom_signif(comparisons = list(c("A", "C"),
+                                 c("A", "M"),
+                                 c("A", "S")),
               map_signif_level = FALSE, 
-              y_position = c(max(hNK_Bm3$Freq) + 50, 
-                             max(hNK_Bm3$Freq) + 80, 
-                             max(hNK_Bm3$Freq) + 110)) +
-  scale_fill_manual(values = COLOR_CODE_GROUP_v1)
+              y_position = c(max(hNK_Bm3$percentage) + 0, 
+                             max(hNK_Bm3$percentage) + 5, 
+                             max(hNK_Bm3$percentage) + 10)) +
+  scale_fill_manual(values = COLOR_CODE_GROUP_v4)
 ```
 
 ```{r}
 boxplot3
 
-pdf(paste0(params$out,"Rds/barplot_hNK_Bm3_wStats.pdf"))
+pdf(paste0(params$out,"figures/barplot_hNK_Bm3_wStats.pdf"))
 boxplot3
 dev.off()
 ```
@@ -648,69 +647,53 @@ dev.off()
 ### ___hNK_Bm4___
 
 ```{r}
-hNK_Bm4 <- filter(as.data.frame(table_NK_per_sample), Var1 == "hNK_Bm4")
+hNK_Bm4 <- filter(as.data.frame(table_NK_per_sample_percent), Var1 == "hNK_Bm4")
 
 # Perform ANOVA
-hNK_Bm4_anova <- aov(Freq ~ group, data = hNK_Bm4)
+hNK_Bm4_anova <- aov(percentage ~ group, data = hNK_Bm4)
 summary(hNK_Bm4_anova)
 
 # Extract p-value
 p_value <- summary(hNK_Bm4_anova)[[1]][["Pr(>F)"]][1]
 
 # perform wilcox testing
-p_value1 <- wilcox.test(Freq ~ group, 
+p_value1 <- wilcox.test(percentage ~ group, 
                         data = subset(hNK_Bm4, 
-                                      group %in% c("ATRXdel", "ATRXwtMYCNwt")))$p.value
-p_value2 <- wilcox.test(Freq ~ group, 
+                                      group %in% c("A", "S")))$p.value
+p_value2 <- wilcox.test(percentage ~ group, 
                         data = subset(hNK_Bm4, 
-                                      group %in% c("ATRXdel", "ctrl")))$p.value
-p_value3 <- wilcox.test(Freq ~ group, 
+                                      group %in% c("A", "C")))$p.value
+p_value3 <- wilcox.test(percentage ~ group, 
                         data = subset(hNK_Bm4, 
-                                      group %in% c("ATRXdel", "MYCNamp")))$p.value
+                                      group %in% c("A", "M")))$p.value
 
 # plot boxplot
 boxplot4 <- hNK_Bm4 %>%
-  ggplot( aes(x = group , y = Freq, fill = group)) +
+  ggplot( aes(x = group , y = percentage, fill = group)) +
     geom_boxplot() +
-    theme_minimal(legend.position="none",
-          axis.text = element_text(size = 18),
-          axis.title.y = element_text(size = 18),
-          plot.title = element_text(size = 18)) +
     ggtitle("NK cluster per NB genetic group: hNK_Bm4") +
-    xlab("") + ylab("Number of cells per group")  +
-  geom_signif(comparisons = list(c("ATRXdel", "ctrl"),
-                                 c("ATRXdel", "MYCNamp"),
-                                 c("ATRXdel", "ATRXwtMYCNwt")),
+    xlab("") + ylab("Percentage of cells per group")  +
+  geom_signif(comparisons = list(c("A", "C"),
+                                 c("A", "M"),
+                                 c("A", "S")),
               map_signif_level = FALSE,
-              y_position = c(max(hNK_Bm4$Freq) + 5, 
-                             max(hNK_Bm4$Freq) + 8, 
-                             max(hNK_Bm4$Freq) + 11))  +
-  scale_fill_manual(values = COLOR_CODE_GROUP_v1)
+              y_position = c(max(hNK_Bm4$percentage) + 0, 
+                             max(hNK_Bm4$percentage) + 5, 
+                             max(hNK_Bm4$percentage) + 10))  +
+  scale_fill_manual(values = COLOR_CODE_GROUP_v4)
 ```
 
 ```{r}
 boxplot4
 
-pdf(paste0(params$out,"Rds/barplot_hNK_Bm4_wStats.pdf"))
+pdf(paste0(params$out,"figures/barplot_hNK_Bm4_wStats.pdf"))
 boxplot4
 dev.off()
 ```
 
-
-
 ## ___DA testing___
 
 ```{r}
-ALL_NK@meta.data$rados_et_al_2025.x <- factor(ALL_NK@meta.data$rados_et_al_2025.x)
-ALL_NK@meta.data$predicted_NK_type_de.n350 <- factor(ALL_NK@meta.data$predicted_NK_type_de.n350)
-```
-
-If comparing more than two sample / groups, use DA testing with contrasts
-MiloR doesn't use the "original" clusters but rather creates neighborhoods
-based on similar logFC (note the fold change here is the number of cells
-per cell type)
-
-```{r miloR prepare data}
 library("statmod")
 library("miloR")
 library("SingleCellExperiment")
@@ -718,7 +701,174 @@ library("scater")
 library("scran")
 library("dplyr")
 library("patchwork")
+```
 
+If comparing more than two sample / groups, use DA testing with contrasts
+MiloR doesn't use the "original" clusters but rather creates neighborhoods
+based on similar logFC (note the fold change here is the number of cells
+per cell type)
+
+### ___0. NB vs. CTRL___
+
+Here using histology ("case_control" column) as grouping
+
+```{r}
+rna_milo <- Milo(as.SingleCellExperiment(ALL_NK))
+rna_milo
+
+reducedDim(rna_milo, "UMAP") <- reducedDim(as.SingleCellExperiment(ALL_NK), 
+                                           "UMAP")
+plotUMAP(rna_milo, 
+         colour_by = "case_control") + 
+  plotUMAP(rna_milo, 
+           colour_by = "rados_et_al_2025")
+
+# Define cell neighbourhoods
+rna_milo <- buildGraph(rna_milo, 
+                       k = 100,
+                       d = 50)
+
+## Constructing kNN graph with k = 10
+rna_milo <- makeNhoods(rna_milo, 
+                       prop = 0.1, 
+                       k = 100,
+                       d = 50, 
+                       refined = TRUE, 
+                       refinement_scheme = "graph") # make nhoods using graph-only as this is faster
+
+# metadata
+colData(rna_milo)$patients <- paste(colData(rna_milo)$case_control, 
+                                    colData(rna_milo)$rados_et_al_2025, sep="_")
+
+# Counting cells in neighbourhoods
+rna_milo <- countCells(rna_milo, meta.data = data.frame(colData(rna_milo)), 
+                       samples="patients") # make the nhood X sample counts matrix
+
+
+# Defining experimental design
+rna_design <- data.frame(colData(rna_milo))[,c("patients", "case_control")]
+rna_design <- distinct(rna_design)
+rownames(rna_design) <- rna_design$patients
+rna_design
+
+# Computing neighborhood connectivity
+rna_milo <- calcNhoodDistance(rna_milo, 
+                              d = 50, 
+                              reduced.dim = "PCA")
+
+# DA testing
+da_results <- testNhoods(rna_milo, 
+                         design = ~ 0 + case_control,
+                         design.df = rna_design, 
+                         reduced.dim="PCA")
+head(da_results)
+
+da_results %>%
+  arrange(SpatialFDR) %>%
+  head() 
+
+rna_milo <- buildNhoodGraph(rna_milo)
+
+
+# QUALITY CHECK OF THE DIFFERENTIAL ABUNDANCE TESTING
+
+# Plot single-cell UMAP
+umap_pl <- plotReducedDim(rna_milo, 
+                          dimred = "UMAP", 
+                          colour_by = "case_control", 
+                          text_by = "predicted_NK_type_de.n350", 
+                          text_size = 3, 
+                          point_size = 0.5,) +
+  guides(fill = "none")
+
+rna_milo <- buildNhoodGraph(rna_milo)
+
+# Plot neighbourhood graph
+nh_graph_pl <- plotNhoodGraphDA(rna_milo, 
+                                da_results, 
+                                layout = "UMAP", 
+                                alpha = 0.05) 
+
+umap_pl + nh_graph_pl +
+  plot_layout(guides = "collect")
+
+# Differential abundance testing with contrasts
+rna_design <- data.frame(colData(rna_milo))[,c("patients", "case_control")]
+rna_design <- distinct(rna_design)
+rownames(rna_design) <- rna_design$patients
+
+# Reorder rownames to match columns of nhoodCounts(milo)
+rna_design <- rna_design[colnames(nhoodCounts(rna_milo)), , drop=FALSE]
+table(rna_design$case_control)
+
+```
+
+```{r}
+saveRDS(rna_milo, file = paste0(params$out,"Rds/miloR_NK_cells_case_control.Rds"))
+```
+
+
+```{r}
+model <- model.matrix(~ 0 + case_control, data = rna_design)
+ave.contrast <- c("case_controlCTRL - case_controlNB")
+mod.constrast <- makeContrasts(contrasts = ave.contrast, levels = model)
+mod.constrast
+
+da_results_CTRL_vs_NB <- testNhoods(rna_milo, 
+                                      design = ~ 0 + case_control, 
+                         design.df = rna_design, 
+                         model.contrasts = ave.contrast, 
+                         fdr.weighting = "graph-overlap")
+
+table(da_results_CTRL_vs_NB$SpatialFDR < 0.1)
+table(da_results_CTRL_vs_NB$SpatialFDR < 0.05)
+
+# annotate hood with original cell type annotation
+da_results_CTRL_vs_NB <- annotateNhoods(rna_milo, 
+                                          da_results_CTRL_vs_NB, 
+                                          coldata_col = "predicted_NK_type_de.n350")
+
+# remove hoods that contained mixed cell type populations
+da_results_CTRL_vs_NB$predicted_NK_type_de.n350 <- 
+  ifelse(da_results_CTRL_vs_NB$predicted_NK_type_de.n350_fraction < 0.7, 
+         "Mixed", da_results_CTRL_vs_NB$predicted_NK_type_de.n350)
+
+# filter only significant populations (less than 10% false discovery rate and 
+# fold change bigger than 0.5)
+results <- da_results_CTRL_vs_NB %>% 
+  arrange(FDR) %>% filter(FDR < 0.1 & abs(logFC) >= 0.5)
+results
+
+da_results_CTRL_vs_NB$predicted_NK_type_de.n350 <- as.factor(da_results_CTRL_vs_NB$predicted_NK_type_de.n350)
+
+DA_plot_CTRL_vs_NB <- plotDAbeeswarm(da_results_CTRL_vs_NB, 
+               group.by = "predicted_NK_type_de.n350", 
+               alpha = 0.1) # cut-off for spatial FDR
+
+DA_plot_CTRL_vs_NB
+```
+```{r}
+pdf(paste0(params$out,"figures/DA_plot_NK_clusters_CTRL_vs_NB.pdf"),
+    width = 10, height = 6)
+DA_plot_CTRL_vs_NB
+dev.off()
+
+write.table(da_results_CTRL_vs_NB, 
+           file = paste0(params$out,"tables/miloR_DA_results_CTRL_vs_NB.csv"),
+           row.names = FALSE, quote = FALSE, sep = "\t")
+```
+
+
+### ___ATRXdel vs. Y___
+
+Here using group, as in NB groups as the grouping factor
+
+```{r}
+ALL_NK@meta.data$rados_et_al_2025 <- factor(ALL_NK@meta.data$rados_et_al_2025)
+ALL_NK@meta.data$predicted_NK_type_de.n350 <- factor(ALL_NK@meta.data$predicted_NK_type_de.n350)
+```
+
+```{r miloR prepare data}
 rna_milo <- Milo(as.SingleCellExperiment(ALL_NK))
 rna_milo
 
@@ -727,28 +877,28 @@ reducedDim(rna_milo, "UMAP") <- reducedDim(as.SingleCellExperiment(ALL_NK),
 plotUMAP(rna_milo, 
          colour_by="group") + 
   plotUMAP(rna_milo, 
-           colour_by="rados_et_al_2025.x")
+           colour_by="rados_et_al_2025")
 
 # Define cell neighbourhoods
 rna_milo <- buildGraph(rna_milo, 
-                       k = 100,
+                       k = 10,
                        d = 30)
 
 ## Constructing kNN graph with k = 10
 rna_milo <- makeNhoods(rna_milo, 
                        prop = 0.1, 
-                       k = 100,
+                       k = 10,
                        d = 30, 
                        refined = TRUE, 
                        refinement_scheme = "graph") # make nhoods using graph-only as this is faster
 
 # metadata
 colData(rna_milo)$patients <- paste(colData(rna_milo)$group, 
-                                    colData(rna_milo)$rados_et_al_2025.x, sep="_")
+                                    colData(rna_milo)$rados_et_al_2025, sep="_")
 
 # Counting cells in neighbourhoods
 rna_milo <- countCells(rna_milo, meta.data = data.frame(colData(rna_milo)), 
-                       samples="patients") # make the nhood X sample counts matrix
+                       samples = "patients") # make the nhood X sample counts matrix
 
 
 # Defining experimental design
@@ -766,7 +916,7 @@ rna_milo <- calcNhoodDistance(rna_milo,
 da_results <- testNhoods(rna_milo, 
                          design = ~ 0 + group,
                          design.df = rna_design, 
-                         reduced.dim="PCA")
+                         reduced.dim = "PCA")
 head(da_results)
 
 da_results %>%
@@ -783,7 +933,7 @@ umap_pl <- plotReducedDim(rna_milo,
                           dimred = "UMAP", 
                           colour_by = "group", 
                           text_by = "predicted_NK_type_de.n350", 
-                          text_size = 3, point_size = 0.5,) +
+                          text_size = 3, point_size = 0.5) +
   guides(fill = "none")
 
 rna_milo <- buildNhoodGraph(rna_milo)
@@ -791,8 +941,8 @@ rna_milo <- buildNhoodGraph(rna_milo)
 # Plot neighbourhood graph
 nh_graph_pl <- plotNhoodGraphDA(rna_milo, 
                                 da_results, 
-                                layout="UMAP", 
-                                alpha=0.05) 
+                                layout = "UMAP", 
+                                alpha = 0.05) 
 
 
 umap_pl + nh_graph_pl +
@@ -806,22 +956,14 @@ rownames(rna_design) <- rna_design$patients
 # Reorder rownames to match columns of nhoodCounts(milo)
 rna_design <- rna_design[colnames(nhoodCounts(rna_milo)), , drop=FALSE]
 table(rna_design$group)
-
-saveRDS(rna_milo, file = paste0(params$out,"Rds/miloR_NK_cells.Rds"))
 ```
 
 ```{r}
-####### Comparisons #######
-levels(ALL_NK$group)
-
-COLOR_CODE_miloR <- c( "hNK_Bm1" ="#161B33",
-                       "hNK_Bm1" = "#419D78",
-                       "hNK_Bm3" = "#AF1B3F",
-                       "hNK_Bm4" = "#E88873",
-                       "Mixed" = "darkgray")
+# save results
+saveRDS(rna_milo, file = paste0(params$out,"Rds/miloR_NK_cells.Rds"))
 ```
 
-## ___A. ATRXdel vs. ATRXwt (MYCNamp and ATRXwtMYCNwt)___
+### ___A. ATRXdel vs. ATRXwt (MYCNamp and ATRXwtMYCNwt)___
 
 ```{r}
 model <- model.matrix(~ 0 + group, data = rna_design)
@@ -846,7 +988,7 @@ da_results_ATRXdel_vs_ATRXwt <- annotateNhoods(rna_milo,
 
 # remove hoods that contained mixed cell type populations
 da_results_ATRXdel_vs_ATRXwt$predicted_NK_type_de.n350 <- 
-  ifelse(da_results_ATRXdel_vs_ATRXwt$predicted_NK_type_de.n350_fraction < 0.7, 
+  ifelse(da_results_ATRXdel_vs_ATRXwt$predicted_NK_type_de.n350_fraction < 0.9, 
          "Mixed", da_results_ATRXdel_vs_ATRXwt$predicted_NK_type_de.n350)
 
 # filter only significant populations (less than 10% false discovery rate and 
@@ -855,21 +997,31 @@ results <- da_results_ATRXdel_vs_ATRXwt %>%
   arrange(FDR) %>% filter(FDR < 0.1 & abs(logFC) >= 0.5)
 results
 
-da_results_ATRXdel_vs_ATRXwt$predicted_NK_type_de.n350 <- as.factor(da_results_ATRXdel_vs_ATRXwt$predicted_NK_type_de.n350)
+da_results_ATRXdel_vs_ATRXwt <- da_results_ATRXdel_vs_ATRXwt %>% 
+  arrange(factor(predicted_NK_type_de.n350, 
+                 levels = CLUSTER_ORDER_v2))
 
 DA_plot_ATRXdel_vs_ATRXwt <- plotDAbeeswarm(da_results_ATRXdel_vs_ATRXwt, 
                group.by = "predicted_NK_type_de.n350", 
                alpha = 0.1) # cut-off for spatial FDR
 
 DA_plot_ATRXdel_vs_ATRXwt
+```
 
+```{r}
 pdf(paste0(params$out,"figures/DA_plot_NK_clusters_ATRXdel_vs_ATRXwt.pdf"),
     width =10, height = 6)
 DA_plot_ATRXdel_vs_ATRXwt
 dev.off()
+
+
+write.table(da_results_ATRXdel_vs_ATRXwt, 
+           file = paste0(params$out,"tables/miloR_DA_results_ATRXdel_vs_ATRXwt.csv"),
+           row.names = FALSE, quote = FALSE, sep = "\t")
 ```
 
-## ___B. ATRXdel vs. ALL (MYCNamp + ATRXwtMYCNwt + control)___
+
+### ___B. ATRXdel vs. ALL (MYCNamp + ATRXwtMYCNwt + control)___
 
 ```{r}
 model <- model.matrix(~ 0 + group, data = rna_design)
@@ -890,7 +1042,7 @@ da_results_ATRXdelvsAll <- annotateNhoods(rna_milo, da_results_ATRXdelvsAll,
 
 # remove hoods that contained mixed cell type populations
 da_results_ATRXdelvsAll$predicted_NK_type_de.n350 <- 
-  ifelse(da_results_ATRXdelvsAll$predicted_NK_type_de.n350_fraction < 0.7, 
+  ifelse(da_results_ATRXdelvsAll$predicted_NK_type_de.n350_fraction < 0.9, 
          "Mixed", da_results_ATRXdelvsAll$predicted_NK_type_de.n350)
 
 # filter only significant populations (less than 10% false discovery rate and 
@@ -899,10 +1051,13 @@ results <- da_results_ATRXdelvsAll %>%
   arrange(FDR) %>% filter(FDR < 0.1 & abs(logFC) >= 0.5)
 results
 
+da_results_ATRXdelvsAll <- da_results_ATRXdelvsAll %>% 
+  arrange(factor(predicted_NK_type_de.n350, 
+                 levels = CLUSTER_ORDER_v2))
 
 DA_plot_ATRXdelvsAll <- plotDAbeeswarm(da_results_ATRXdelvsAll, 
                group.by = "predicted_NK_type_de.n350", 
-               alpha = 0.1) # cut-off for spatial FDR
+               alpha = 0.05) # cut-off for spatial FDR
 
 DA_plot_ATRXdelvsAll
 
@@ -910,42 +1065,345 @@ pdf(paste0(params$out,"figures/DA_plot_NK_clusters_ATRXdelvsAll.pdf"),
     width =10, height = 6)
 DA_plot_ATRXdelvsAll
 dev.off()
+
+write.table(da_results_CTRL_vs_NB, 
+           file = paste0(params$out,"tables/miloR_DA_results_ATRXdel_vs_All.csv"),
+           row.names = FALSE, quote = FALSE, sep = "\t")
 ```
 
-## ___C. CTRL vs. NB (MYCNamp and ATRXwtMYCNwt and ATRXdel)___
+### ___C. CTRL vs. NB (MYCNamp and ATRXwtMYCNwt and ATRXdel)___
 
 ```{r}
 model <- model.matrix(~ 0 + group, data = rna_design)
-ave.contrast <- c("groupcontrol - ((groupMYCNampmp + groupATRXwtMYCNwt + groupATRXdel) / 3)")
+ave.contrast <- c("groupcontrol - ((groupMYCNamp + groupATRXwtMYCNwt + groupATRXdel) / 3)")
 mod.constrast <- makeContrasts(contrasts = ave.contrast, levels = model)
 mod.constrast
 
-da_results_ATRXdelvsAll <- testNhoods(rna_milo, design = ~ 0 + group, 
+da_results_CTRL_vs_NB <- testNhoods(rna_milo, design = ~ 0 + group, 
                          design.df = rna_design, 
                          model.contrasts = ave.contrast, 
                          fdr.weighting = "graph-overlap")
 
-table(da_results_ATRXdelvsAll$SpatialFDR < 0.1)
+table(da_results_CTRL_vs_NB$SpatialFDR < 0.1)
 
 # annotate hood with original cell type annotation
-da_results_ATRXdelvsAll <- annotateNhoods(rna_milo, da_results_ATRXdelvsAll, 
+da_results_CTRL_vs_NB <- annotateNhoods(rna_milo, da_results_CTRL_vs_NB, 
                              coldata_col = "predicted_NK_type_de.n350")
 
 # remove hoods that contained mixed cell type populations
-da_results_ATRXdelvsAll$predicted_NK_type_de.n350 <- 
-  ifelse(da_results_ATRXdelvsAll$predicted_NK_type_de.n350_fraction < 0.7, 
-         "Mixed", da_results_ATRXdelvsAll$predicted_NK_type_de.n350)
+da_results_CTRL_vs_NB$predicted_NK_type_de.n350 <- 
+  ifelse(da_results_CTRL_vs_NB$predicted_NK_type_de.n350_fraction < 0.7, 
+         "Mixed", da_results_CTRL_vs_NB$predicted_NK_type_de.n350)
 
 # filter only significant populations (less than 10% false discovery rate and 
 # fold change bigger than 0.5)
-results <- da_results_ATRXdelvsAll %>% 
+results <- da_results_CTRL_vs_NB %>% 
   arrange(FDR) %>% filter(FDR < 0.1 & abs(logFC) >= 0.5)
 results
 
-plotDAbeeswarm(da_results_ATRXdelvsAll, 
+
+da_results_CTRL_vs_NB <- da_results_CTRL_vs_NB %>% 
+  arrange(factor(predicted_NK_type_de.n350, 
+                 levels = CLUSTER_ORDER_v2))
+
+plotDAbeeswarm(da_results_CTRL_vs_NB, 
                group.by = "predicted_NK_type_de.n350", 
-               alpha=0.1) # alfa is the significance value for spatial FDR
+               alpha = 0.2) # alfa is the significance value for spatial FDR
+
+write.table(da_results_CTRL_vs_NB, 
+           file = paste0(params$out,"tables/miloR_DA_results_CTRL_vs_NB_v2.csv"),
+           row.names = FALSE, quote = FALSE, sep = "\t")
 ```
+
+
+# ___2. ANNOTATION/MATURATION FIGURE___
+
+## ___Crinier et al., 2021___
+
+```{r}
+
+
+pdf(paste0(params$out,"figures/dotplot_activated_CD16pos_NK_vs_CD56bright_CD16neg_NK_subtypes_per_group.pdf"),
+    height = 10, width = 35)
+
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = crinier_et_al_genes,
+           plot.title = "NK subsets",
+           plot.subtitle = "Crinier et al., 2021",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+dev.off()
+```
+
+
+## ___Hannah et al., 2004___
+
+```{r fig.height=10, fig.width=35}
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = activated_CD16pos_NK_vs_CD56bright_CD16neg_NK_genes,
+           plot.title = "activated CD16pos NK vs CD56bright CD16neg NK genes",
+           plot.subtitle = "Hannah et al., 2004",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "group_per_NK_subtype",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = activated_CD16pos_NK_vs_CD56dim_CD16pos_NK_genes,
+           plot.title = "activated CD16pos NK vs CD56dim CD16pos NK genes",
+           plot.subtitle = "Hannah et al., 2004",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "group_per_NK_subtype",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+
+
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = CD56bright_CD16neg_NK_vs_CD56dim_CD16pos_NK_genes,
+           plot.title = "CD56bright CD16neg NK vs CD56dim CD16pos NK genes",
+           plot.subtitle = "Hannah et al., 2004",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "group_per_NK_subtype",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+```
+
+```{r fig.height=10, fig.width=35}
+
+#            legend.position = "bottom",
+#            flip = TRUE,
+
+pdf(paste0(params$out,"figures/dotplot_activated_CD16pos_NK_vs_CD56bright_CD16neg_NK_subtypes_per_group.pdf"),
+    height = 10, width = 35)
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = activated_CD16pos_NK_vs_CD56bright_CD16neg_NK_genes,
+           plot.title = "activated CD16pos NK vs CD56bright CD16neg NK genes",
+           plot.subtitle = "Hannah et al., 2004",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+dev.off()
+
+pdf(paste0(params$out,"figures/dotplot_activated_CD16pos_NK_vs_CD56dim_CD16pos_NK_subtypes_per_group.pdf"),
+    height = 10, width = 35)
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = activated_CD16pos_NK_vs_CD56dim_CD16pos_NK_genes,
+           plot.title = "activated CD16pos NK vs CD56dim CD16pos NK genes",
+           plot.subtitle = "Hannah et al., 2004",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+dev.off()
+
+pdf(paste0(params$out,"figures/dotplot_CD56bright_CD16neg_NK_vs_CD56dim_CD16pos_NK_subtypes_per_group.pdf"),
+    height = 10, width = 35)
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = CD56bright_CD16neg_NK_vs_CD56dim_CD16pos_NK_genes,
+           plot.title = "CD56bright CD16neg NK vs CD56dim CD16pos NK genes",
+           plot.subtitle = "Hannah et al., 2004",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+dev.off()
+```
+
+```{r}
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = CD56bright_CD16neg_NK_vs_CD56dim_CD16pos_NK_genes,
+                         name = "CD56bright_CD16neg_NK_vs_CD56dim_CD16pos_NK_genes",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 10)
+
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = activated_NK_cells,
+                         name = "activated_CD16pos_NK_vs_CD56dim_CD16pos_NK_genes",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 10)
+
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = activated_CD16pos_NK_vs_CD56bright_CD16neg_NK_genes,
+                         name = "activated_CD16pos_NK_vs_CD56bright_CD16neg_NK_genes",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 10)
+```
+
+
+## ___Blanquart et al., 2024___
+
+```{r fig.height=14, fig.width=50}
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = inflammed_NK_genes,
+           plot.title = "inflammed NK genes",
+           plot.subtitle = "Blanquart et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "group_per_NK_subtype",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+
+pdf(paste0(params$out,"figures/dotplot_inflammed_genes_NK_subtypes_per_group.pdf"),
+    height = 14, width = 50)
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = inflammed_NK_genes,
+           plot.title = "inflammed NK genes",
+           plot.subtitle = "Blanquart et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+dev.off()
+```
+
+```{r}
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = inflammed_NK_genes,
+                         name = "inflammed_NK_genes",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 10)
+```
+
+```{r}
+pdf(paste0(params$out,"figures/dotplot_inflammed_module_scores_NK_subtypes_per_group.pdf"),
+    height = 14, width = 7)
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = "inflammed_NK_genes1",
+           plot.title = "inflammed module scores",
+           plot.subtitle = "Blanquart et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled module scores")
+dev.off()
+```
+
+## ___Together___
+
+```{r}
+all_annotations_together <- c("CD56bright_CD16neg_NK_vs_CD56dim_CD16pos_NK_genes1",
+                              "activated_CD16pos_NK_vs_CD56dim_CD16pos_NK_genes1",
+                              "activated_CD16pos_NK_vs_CD56bright_CD16neg_NK_genes1",
+                              "inflammed_NK_genes1")
+
+pdf(paste0(params$out,"figures/dotplot_all_annotations_together_module_scores_NK_subtypes_per_group.pdf"),
+    height = 14, width = 10)
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = all_annotations_together,
+           plot.title = "Module scores",
+           plot.subtitle = "Hannah et al., 2004 & Blanquart et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled module scores")
+dev.off()
+```
+
 
 # ___3. DEG FIGURE___
 
@@ -1045,10 +1503,10 @@ dev.off()
 ## ___per patient___
 
 ```{r}
-Idents(ALL_NK) <- ALL_NK@meta.data$rados_et_al_2025.x
+Idents(ALL_NK) <- ALL_NK@meta.data$rados_et_al_2025
 
 data_sample <- table(ALL_NK$predicted_NK_type_de.n350,
-                          ALL_NK$rados_et_al_2025.x)
+                          ALL_NK$rados_et_al_2025)
 
 # Transform this data in %
 data_percentage <- apply(data_sample, 2, 
@@ -1107,6 +1565,12 @@ final_plot <- dendrogram_plot / barplot
 final_plot
 ```
 
+# ___4. KILLING / EXPRESSION FIGURE___
+
+```{r}
+# CD6 and ALCAM expression on tumor and NK cells
+
+```
 
 
 # ___5. SECRETION FIGURE___
@@ -1374,6 +1838,320 @@ do_DotPlot(sample = NB_cells,
            legend.title = "Scaled RNA expression")
 ```
 
+```{r  fig.height=10, fig.width=12}
+# NK_maturation_genes
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = NK_maturation_genes,
+           plot.title = "NK maturation genes",
+           plot.subtitle = "NK clusters per group",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+```
+
+```{r  fig.height=10, fig.width=25}
+# activated_NK_cells
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = activated_NK_cells,
+           plot.title = "activated NK genes",
+           plot.subtitle = "NK clusters per group",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+
+```
+
+```{r}
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = activated_NK_cells,
+                         name = "activated_NK_cells",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 10)
+```
+
+```{r fig.height=10,fig.width=8}
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = "activated_NK_cells1",
+           plot.title = "activated NK genes",
+           plot.subtitle = "NK clusters per group",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+```
+
+```{r  fig.height=10, fig.width=25}
+# Mei et al., 2024 definition of NK subsets
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = NK_Mei_et_al_markers,
+           plot.title = "NK subsets",
+           plot.subtitle = "NK clusters per group",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+```
+
+# ___Figure 3, Venn diagram___
+
+```{r}
+multiNicheNet_output <- 
+  read.delim("~/mnt_out/NK_project/tables/multiNicheNet_output_NB-NK-axis_ATRXdel-vs-ATRXwt.csv")
+
+NK_NB_Signalling <- multiNicheNet_output %>% filter(prioritization_rank != "NA") %>% filter(sender != receiver)
+
+unique(NK_NB_Signalling$ligand)
+unique(NK_NB_Signalling$receptor)
+
+
+NK_ligands <- NK_NB_Signalling %>% filter(str_detect(sender, regex("\\bNK")))
+NK_ligands <- unique(NK_ligands$ligand)
+NK_receptors <- NK_NB_Signalling %>% filter(str_detect(receiver, regex("\\bNK")))
+NK_receptors <- unique(NK_receptors$receptor)
+
+NB_ligands <- NK_NB_Signalling %>% filter(str_detect(sender, regex("\\bNB")))
+NB_ligands <- unique(NB_ligands$ligand)
+NB_receptors <- NK_NB_Signalling %>% filter(str_detect(receiver, regex("\\bNB")))
+NB_receptors <- unique(NB_receptors$receptor)
+```
+
+```{r}
+# laod DEG tables
+ALL_vs_ATRXdel_NK2 <- read.table(file = paste0(params$out, "tables/DEG_hNK-Bm2_ATRXdel-vs-ALL_2025-04-24.csv"),
+                             sep = "\t", header = TRUE)
+
+ALL_vs_ATRXdel_NK2_signif <- subset(ALL_vs_ATRXdel_NK2, 
+                                ALL_vs_ATRXdel_NK2$padj < 0.1 & ALL_vs_ATRXdel_NK2$log_fc > 1)
+
+ALL_vs_ATRXdel_NK2_DEGs <- ALL_vs_ATRXdel_NK2_signif$feature
+
+# laod DEG tables
+ALL_vs_ATRXdel_NK3 <- read.table(file = paste0(params$out, "tables/DEG_hNK-Bm3_ATRXdel-vs-ALL_2025-04-24.csv"),
+                             sep = "\t", header = TRUE)
+
+ALL_vs_ATRXdel_NK3_signif <- subset(ALL_vs_ATRXdel_NK3, 
+                                ALL_vs_ATRXdel_NK3$padj < 0.1 & ALL_vs_ATRXdel_NK3$log_fc > 1)
+
+ALL_vs_ATRXdel_NK3_DEGs <- ALL_vs_ATRXdel_NK3_signif$feature
+```
+
+```{r}
+NK_ligands_DEGs_NK2 <- intersect(NK_ligands,ALL_vs_ATRXdel_NK2_DEGs)
+NK_receptors_DEGs_NK2 <- intersect(NK_receptors,ALL_vs_ATRXdel_NK2_DEGs)
+
+NK_ligands_DEGs_NK3 <- intersect(NK_ligands,ALL_vs_ATRXdel_NK3_DEGs)
+NK_receptors_DEGs_NK3 <- intersect(NK_receptors,ALL_vs_ATRXdel_NK3_DEGs)
+
+NK_ligands_DEGs <- intersect(NK_ligands_DEGs_NK2,NK_ligands_DEGs_NK3)
+NK_receptors_DEGs <- intersect(NK_receptors_DEGs_NK2,NK_receptors_DEGs_NK3)
+
+NK_ligands_DEGs
+NK_receptors_DEGs
+```
+
+```{r}
+NK_ligands_signif <- list(NK_ligands = NK_ligands,
+                       NK2_DEGs = ALL_vs_ATRXdel_NK2_DEGs,
+                       NK3_DEGs = ALL_vs_ATRXdel_NK3_DEGs)
+
+NK_receptors_signif <- list(NK_receptors = NK_receptors,
+                       NK2_DEGs = ALL_vs_ATRXdel_NK2_DEGs,
+                       NK3_DEGs = ALL_vs_ATRXdel_NK3_DEGs)
+
+NK_LR_pairs <- c(NK_ligands,NK_receptors)
+
+NK_LR_pairs_signif <- list("L-R pairs" = NK_LR_pairs,
+                       "hBM-NK2 DEGs" = ALL_vs_ATRXdel_NK2_DEGs,
+                       "hBM-NK3 DEGs" = ALL_vs_ATRXdel_NK3_DEGs)
+
+ggVennDiagram(NK_ligands_signif, set_size = 6, label_alpha = 0,label_size = 6,
+  category.names = c("NK_ligands","NK2_DEGs","NK3_DEGs"),
+  edge_size = 1, label_percent_digit = 1,label_color = "white") +
+  ggplot2::scale_fill_gradient(low="#B59410",high = "darkblue") +
+  labs(title = "DEGs and ligands specific to ATRXdel NK cells") + 
+  theme(title = element_text(size = 16),legend.text = element_text(size = 14)) +
+  scale_x_continuous(expand = expansion(mult = .2))
+
+ggVennDiagram(NK_receptors_signif, set_size = 6, label_alpha = 0,label_size = 6,
+  category.names = c("NK_receptors","NK2_DEGs","NK3_DEGs"),
+  edge_size = 1, label_percent_digit = 1,label_color = "white") +
+  ggplot2::scale_fill_gradient(low="#B59410",high = "darkblue") +
+  labs(title = "DEGs and receptors specific to ATRXdel NK cells") + 
+  theme(title = element_text(size = 16),legend.text = element_text(size = 14)) +
+  scale_x_continuous(expand = expansion(mult = .2))
+
+pdf(paste0(params$out,"figures/vennDiagram_NK_DEGs_LR_pairs.pdf"),
+    height = 5, width = )
+ggVennDiagram(NK_LR_pairs_signif, set_size = 6, label_alpha = 0,label_size = 6,
+  category.names = c("L-R pairs","hBM-NK2 DEGs","hBM-NK3 DEGs"),
+  edge_size = 1, label_percent_digit = 1,label_color = "white") +
+  ggplot2::scale_fill_gradient(low="darkblue",high = "#B59410") +
+  labs(title = "DEGs and L-R pairs specific to ATRXdel NK cells") + 
+  theme(title = element_text(size = 16),legend.text = element_text(size = 14)) +
+  scale_x_continuous(expand = expansion(mult = .2))
+dev.off()
+
+common_genes <- Reduce(intersect, NK_LR_pairs_signif)
+print(common_genes)
+```
+
+```{r eval=FALSE, include=FALSE}
+# Access the counts matrix
+counts_matrix <- GetAssayData(ALL_NK, slot = "counts")
+
+# set a meaningful cutoff for expressed genes 
+hist(Matrix::rowSums(counts_matrix),breaks = 1000000,xlim = (c(0,100)))
+abline(v=2)
+
+hist(log(Matrix::rowSums(counts_matrix)),breaks = 500)
+
+# Filter genes with at least 11 reads over all samples (rados_et_al_2025)
+# these will be used as background genes for pathways enrichment analysis
+geneUniverse <- rownames(counts_matrix)[Matrix::rowSums(counts_matrix) > 20]
+length(geneUniverse) # 12382 expressed genes
+
+# justify chosen cut-off of expressed genes
+hist(log(Matrix::rowSums(counts_matrix)),breaks = 500) 
+abline(v=0.7)
+abline(v=3)
+
+# remap to ENTREZ IDs
+geneUniverse_entrezIDs <- map_gene_to_entrez(geneUniverse)
+```
+
+```{r eval=FALSE, include=FALSE}
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(common_genes)
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              pvalueCutoff = 0.1)
+
+go_BP
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("Genes specific to ATRXdel-NK cells: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+               ont = "MF",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.20, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_MF
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("Genes specific to ATRXdel-NK cells: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              qvalueCutoff = 0.20, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("Genes specific to ATRXdel-NK cells: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              pvalueCutoff = 0.1,
+                              qvalueCutoff = 0.20, 
+                              universe = geneUniverse,
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(kegg_enrichment@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("Genes specific to ATRXdel-NK cells: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+```
 
 
 # ___THE END___

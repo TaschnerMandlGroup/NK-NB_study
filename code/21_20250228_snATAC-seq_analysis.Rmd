@@ -37,6 +37,10 @@ options(Seurat.object.assay.version = "v5")
 print(params)
 ```
 
+```{r eval=FALSE, include=FALSE}
+remotes::install_github("GuangchuangYu/enrichplot")
+```
+
 ```{r load project specific R packages and color code}
 source("/home/rstudio/NK-NB_study/code/00_NK_paper_setup.R")
 source("/home/rstudio/NK-NB_study/code/00_NK_paper_utils.R")
@@ -44,7 +48,7 @@ source("/home/rstudio/NK-NB_study/code/00_NK_paper_utils.R")
 
 ```{r eval=FALSE, include=FALSE}
 # preprocessed data from Fetahu et al., 2023 publication
-ATAC <- readRDS(file = "/home/rstudio/mnt_out/snATAC-seq_stage_M/results/published/data/nblast_scopen_gene_activity_normalized_motifs_added.rds")
+ATAC <- readRDS(file = "/home/rstudio/mnt_out/CancReg/snATAC-seq_stage_M/results/published/data/nblast_scopen_gene_activity_normalized_motifs_added.rds")
 ```
 
 ```{r eval=FALSE, include=FALSE}
@@ -253,6 +257,8 @@ Idents(ATAC) <- ATAC$cell_type
 NK_ATAC <- subset(ATAC, 
                   idents = "NKT", 
                   invert = FALSE)
+
+NK_ATAC$group <- factor(NK_ATAC$group, levels=GROUP_ORDER)
 
 saveRDS(NK_ATAC, file = paste0(params$out, "/Rds/fetahu2023_scATAC_NK.Rds"))
 ```
@@ -523,3 +529,485 @@ head(da_peaks_0vs2)
 saveRDS(NK_ATAC, file = paste0(params$out, "/Rds/fetahu2023_scATAC_NK_processed.Rds"))
 ```
 
+# ___TF Footprinting___
+
+```{r}
+NK_ATAC <- readRDS(file = paste0(params$out, "/Rds/fetahu2023_scATAC_NK_processed.Rds"))
+```
+
+# ___Generate pseudobulk coverage files per group___
+
+```{r}
+# Create meta-clusters
+NK_ATAC$group <- as.character(NK_ATAC$sample)
+table(NK_ATAC$group)
+
+Idents(NK_ATAC) <- NK_ATAC$group
+
+# Annotate groups
+NK_ATAC$group[grepl("^C", NK_ATAC$group)] <- "control"
+NK_ATAC$group[grepl("^M", NK_ATAC$group)] <- "MYCNamp"
+NK_ATAC$group[grepl("^A", NK_ATAC$group)] <- "ATRXdel"
+NK_ATAC$group[grepl("^S", NK_ATAC$group)] <- "ATRXwtMYCNwt"
+
+NK_ATAC$group <- factor(NK_ATAC$group, levels = GROUP_ORDER)
+NK_ATAC$group <- droplevels(NK_ATAC$group)
+table(NK_ATAC$group)
+```
+
+
+## ___Generate pseudobulk coverage files per NK cluster___
+
+```{r}
+Idents(NK_ATAC) <- NK_ATAC$seurat_clusters # these are not the same clusters as in the RNA data!
+```
+
+
+```{r}
+ExportGroupBigWigs <- function(
+  seurat_obj,
+  group.by,
+  genome = "hg38",
+  min_score = 1,
+  output_dir = "bigwig_output"
+) {
+  library(Signac)
+  library(GenomicRanges)
+  library(rtracklayer)
+  library(Seurat)
+  library(data.table)
+
+  if (length(Fragments(seurat_obj)) == 0) {
+    stop("No fragment object found in Seurat object.")
+  }
+
+  frag_path <- Fragments(seurat_obj)[[1]]@path
+
+  if (!file.exists(frag_path)) {
+    stop("Fragment file does not exist: ", frag_path)
+  }
+
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+
+  groups <- unique(seurat_obj@meta.data[[group.by]])
+
+  for (grp in groups) {
+    message("Processing group: ", grp)
+    group_cells <- colnames(seurat_obj)[seurat_obj@meta.data[[group.by]] == grp]
+
+    # Read in fragments and filter by cell barcodes
+    message("Reading fragment file (this may take a bit)...")
+    frag_dt <- fread(
+      frag_path,
+      select = c(1, 2, 3, 4),
+      col.names = c("chr", "start", "end", "cell"),
+      showProgress = FALSE
+    )
+
+    frag_dt <- frag_dt[cell %in% group_cells]
+
+    if (nrow(frag_dt) == 0) {
+      warning("No fragments found for group: ", grp)
+      next
+    }
+
+    gr <- GRanges(
+      seqnames = frag_dt$chr,
+      ranges = IRanges(start = frag_dt$start, end = frag_dt$end)
+    )
+
+    # Compute coverage
+    cov <- coverage(gr)
+    cov_gr <- as(cov, "GRanges")
+
+    # Filter low coverage
+    if (!is.null(min_score)) {
+      cov_gr <- cov_gr[cov_gr$score >= min_score]
+    }
+
+    # Add genome info
+    seqinfo(cov_gr) <- Seqinfo(genome = genome)
+
+    # Export BigWig
+    out_file <- file.path(output_dir, paste0("NK_ATAC_",grp, ".bw"))
+    export(cov_gr, out_file, format = "BigWig")
+
+    message("Exported BigWig: ", out_file)
+  }
+
+  message("Files saved in: ", normalizePath(output_dir))
+}
+```
+
+```{r}
+ExportGroupBigWigs(
+  seurat_obj = NK_ATAC,
+  group.by = "group",   
+  genome = "hg38",          
+  min_score = 5,       #  filter for low signal
+  output_dir = paste0(params$out,"Rds/bigwigs/")
+)
+```
+
+# ___TF footprinting in NK cells___
+
+# ___ZEB2 motif___
+
+```{r fig.height=6, fig.width=9}
+library(GenomicRanges)
+library(rtracklayer)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(TFBSTools)
+
+# custom motif matrix for ZEB2 TF (from HOMER)
+zeb2_pfm <- matrix(c(
+  0.210, 0.136, 0.489, 0.166,
+  0.172, 0.247, 0.306, 0.275,
+  0.368, 0.242, 0.218, 0.171,
+  0.001, 0.965, 0.001, 0.033,
+  0.997, 0.001, 0.001, 0.001,
+  0.001, 0.001, 0.997, 0.001,
+  0.001, 0.001, 0.997, 0.001,
+  0.001, 0.001, 0.001, 0.997,
+  0.137, 0.001, 0.861, 0.001,
+  0.276, 0.050, 0.123, 0.551,
+  0.178, 0.242, 0.546, 0.034,
+  0.070, 0.498, 0.200, 0.232), 
+  nrow = 4, byrow = TRUE,
+  dimnames = list(c("A", "C", "G", "T"), NULL))
+
+# create PFMatrix from matrix
+zeb2_pwm <- PFMatrix(
+  ID = "ZEB2",
+  name = "ZEB2",
+  matrixClass = "PWM",
+  strand = "+",
+  bg = c(A = 0.25, C = 0.25, G = 0.25, T = 0.25),
+  profileMatrix = zeb2_pfm
+)
+
+# input bigwigs
+group_names <- unique(NK_ATAC$group)  # sample IDs
+bw_files <- paste0(params$out,"Rds/bigwigs/",group_names,".bw")   # assumes filenames like A1.bw etc.
+motif_name <- "ZEB2"
+flank <- 100  # 100bp upstream/downstream of motif center (or less???)
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+# find motif locations
+match_custom_motif <- function(pwm, genome, min.score = "85%") {
+  hits <- matchPWM(pwm, genome, min.score = min.score)
+  gr <- as(hits, "GRanges")
+  seqlevelsStyle(gr) <- "UCSC"
+  return(gr)
+}
+
+# sanitiy check
+zeb2_pfm
+
+motif_gr <- match_custom_motif(zeb2_pfm, genome)
+
+# Keep only canonical chromosomes
+keep_chr <- paste0("chr", c(1:22, "X", "Y"))
+motif_gr <- motif_gr[seqnames(motif_gr) %in% keep_chr]
+
+# sanity check to see if only canonical chromosomes are kept
+table(seqnames(motif_gr) %in% keep_chr)
+
+# center motifs
+motif_center <- resize(motif_gr, 1, fix = "center")
+windows <- resize(motif_center, width = flank * 2 + 1, fix = "center")
+
+# extract coverage around motifs for each group
+get_footprint <- function(bw_file, windows, flank) {
+  bw <- import(BigWigFile(bw_file), which = windows, as = "RleList")
+  cov_matrix <- matrix(nrow = length(windows), ncol = flank * 2 + 1)
+  
+  for (i in seq_along(windows)) {
+    region <- windows[i]
+    chr <- as.character(seqnames(region))
+    cov <- bw[[chr]][start(region):end(region)]
+    cov_matrix[i, ] <- as.numeric(cov)
+  }
+  
+  avg <- colMeans(cov_matrix, na.rm = TRUE)
+  return(avg)
+}
+
+# loop over groups and build dataframe(s)
+footprints <- lapply(seq_along(bw_files), function(i) {
+  signal <- get_footprint(bw_files[i], windows, flank)
+  data.frame(
+    position = -flank:flank,
+    accessibility = signal,
+    group = group_names[i]
+  )
+})
+
+footprints_df <- do.call(rbind, footprints)
+
+# Differential TF footprinting plot 
+ggplot(footprints_df, aes(x = position, y = accessibility, color = group)) +
+  geom_line(size = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  theme_minimal(base_size = 18) +
+  labs(
+    title = paste("ZEB2 Footprinting in NK cells, across groups"),
+    subtitle = "Aggregate scATAC-seq signal around motif centers (±100 bp)",
+    x = "Position relative to motif center [bp]",
+    y = "Mean accessibility (BigWig signal)",
+    color = "Group"
+  ) +
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  ) + 
+  scale_color_manual(values = COLOR_CODE_GROUP_v4) 
+```
+
+```{r}
+install.packages("ggpubr")  # for stat_compare_means
+
+library(ggpubr)
+
+# Extract position 0 values for stats
+center_values <- footprints_df %>% dplyr::filter(position == 0)
+
+# Optional: define pairwise comparisons
+comparisons <- combn(unique(center_values$group), 2, simplify = FALSE)
+
+# Plot with stats and export
+p <- ggplot(footprints_df, aes(x = position, y = accessibility, color = group)) +
+  geom_line(size = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = paste("ZEB2 Footprinting across Conditions"),
+    subtitle = "Aggregate ATAC-seq signal around motif centers (±100 bp)",
+    x = "Position relative to motif center (bp)",
+    y = "Mean accessibility (BigWig signal)",
+    color = "Group"
+  ) +
+  scale_color_manual(values = COLOR_CODE_GROUP_v4) +
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  )
+
+# Create stats bar plot for accessibility at motif center
+p_stat <- ggplot(center_values, aes(x = group, y = accessibility, fill = group)) +
+  geom_boxplot(width = 0.6, alpha = 0.8) +
+  stat_compare_means(comparisons = comparisons, method = "t.test") +
+  scale_fill_manual(values = COLOR_CODE_GROUP_v4) +
+  labs(
+    title = "ZEB2 Motif Accessibility at Footprint Center",
+    y = "Accessibility (BigWig signal at position 0)", x = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+# Save both plots
+ggsave(paste0(params$out,"figures/ZEB2_TF_footprint_plot.pdf"), 
+       plot = p, width = 7, height = 5, dpi = 600)
+ggsave(paste0(params$out,"ZEB2_footprint_center_stats.pdf"), 
+       plot = p_stat, width = 6, height = 5, dpi = 600)
+
+```
+
+```{r}
+install.packages("patchwork")
+
+# --- Combine and export ---
+combined_plot <- p / p_stat + plot_layout(heights = c(2, 1))
+
+ggsave(paste0(params$out,"ZEB2_footprint_combined.pdf"), 
+       plot = combined_plot,
+       width = 7, height = 9, 
+       dpi = 600, device = cairo_pdf)
+```
+
+
+## ___STAT5 motif___
+
+
+```{r fig.height=6, fig.width=9}
+library(GenomicRanges)
+library(rtracklayer)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(Biostrings)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(TFBSTools)
+
+# custom motif matrix for STAT5 TF (from HOMER)
+STAT5_pfm <- matrix(c(
+0.379,	0.156,	0.238,	0.227,
+0.163,	0.196,	0.203,	0.438,
+0.001,	0.001,	0.001	, 0.997,
+0.001,	0.001,	0.001,	0.997,
+0.001,	0.997,	0.001,	0.001,
+0.008,	0.312,	0.001,	0.679,
+0.273,	0.219,	0.224,	0.284,
+0.694,	0.001,	0.297,	0.008,
+0.001,	0.001,	0.997,	0.001,
+0.997,	0.001,	0.001,	0.001,
+0.997,	0.001,	0.001,	0.001,
+0.44,	0.187,	0.208,	0.165), 
+  nrow = 4, byrow = TRUE,
+  dimnames = list(c("A", "C", "G", "T"), NULL))
+
+# create PFMatrix from matrix
+STAT5_pwm <- PFMatrix(
+  ID = "STAT5",
+  name = "STAT5",
+  matrixClass = "PWM",
+  strand = "+",
+  bg = c(A = 0.25, C = 0.25, G = 0.25, T = 0.25),
+  profileMatrix = STAT5_pfm
+)
+
+# input bigwigs
+#group_names <- unique(NK_ATAC$group)  # sample IDs
+group_names <- GROUP_ORDER
+bw_files <- paste0(params$out,"Rds/bigwigs/",group_names,".bw")   # assumes filenames like A1.bw etc.
+motif_name <- "STAT5"
+flank <- 20  # 100bp upstream/downstream of motif center (or less???)
+genome <- BSgenome.Hsapiens.UCSC.hg38
+
+# find motif locations
+match_custom_motif <- function(pwm, genome, min.score = "85%") {
+  hits <- matchPWM(pwm, genome, min.score = min.score)
+  gr <- as(hits, "GRanges")
+  seqlevelsStyle(gr) <- "UCSC"
+  return(gr)
+}
+
+# sanitiy check
+STAT5_pfm
+
+motif_gr <- match_custom_motif(STAT5_pfm, genome)
+
+# Keep only canonical chromosomes
+keep_chr <- paste0("chr", c(1:22, "X", "Y"))
+motif_gr <- motif_gr[seqnames(motif_gr) %in% keep_chr]
+
+# sanity check to see if only canonical chromosomes are kept
+table(seqnames(motif_gr) %in% keep_chr)
+
+# center motifs
+motif_center <- resize(motif_gr, 1, fix = "center")
+windows <- resize(motif_center, width = flank * 2 + 1, fix = "center")
+
+# extract coverage around motifs for each group
+get_footprint <- function(bw_file, windows, flank) {
+  bw <- import(BigWigFile(bw_file), which = windows, as = "RleList")
+  cov_matrix <- matrix(nrow = length(windows), ncol = flank * 2 + 1)
+  
+  for (i in seq_along(windows)) {
+    region <- windows[i]
+    chr <- as.character(seqnames(region))
+    cov <- bw[[chr]][start(region):end(region)]
+    cov_matrix[i, ] <- as.numeric(cov)
+  }
+  
+  avg <- colMeans(cov_matrix, na.rm = TRUE)
+  return(avg)
+}
+
+# loop over groups and build dataframe(s)
+footprints <- lapply(seq_along(bw_files), function(i) {
+  signal <- get_footprint(bw_files[i], windows, flank)
+  data.frame(
+    position = -flank:flank,
+    accessibility = signal,
+    group = group_names[i]
+  )
+})
+
+footprints_df <- do.call(rbind, footprints)
+
+# Differential TF footprinting plot 
+ggplot(footprints_df, aes(x = position, y = accessibility, color = group)) +
+  geom_line(size = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  theme_minimal(base_size = 18) +
+  labs(
+    title = paste("STAT5 Footprinting in NK cells, across groups"),
+    subtitle = "Aggregate scATAC-seq signal around motif centers (±100 bp)",
+    x = "Position relative to motif center [bp]",
+    y = "Mean accessibility (BigWig signal)",
+    color = "Group"
+  ) +
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  ) + 
+  scale_color_manual(values = COLOR_CODE_GROUP_v4) 
+```
+
+```{r}
+#install.packages("ggpubr")  # for stat_compare_means
+
+library(ggpubr)
+
+# Extract position 0 values for stats
+center_values <- footprints_df %>% dplyr::filter(position == 0)
+
+# Optional: define pairwise comparisons
+comparisons <- combn(unique(center_values$group), 2, simplify = FALSE)
+
+# Plot with stats and export
+p <- ggplot(footprints_df, aes(x = position, y = accessibility, color = group)) +
+  geom_line(size = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = paste("STAT5 Footprinting across Conditions"),
+    subtitle = "Aggregate ATAC-seq signal around motif centers (±100 bp)",
+    x = "Position relative to motif center (bp)",
+    y = "Mean accessibility (BigWig signal)",
+    color = "Group"
+  ) +
+  scale_color_manual(values = COLOR_CODE_GROUP_v4) +
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  )
+
+# Create stats bar plot for accessibility at motif center
+p_stat <- ggplot(center_values, aes(x = group, y = accessibility, fill = group)) +
+  geom_boxplot(width = 0.6, alpha = 0.8) +
+  stat_compare_means(comparisons = comparisons, method = "t.test") +
+  scale_fill_manual(values = COLOR_CODE_GROUP_v4) +
+  labs(
+    title = "STAT5 Motif Accessibility at Footprint Center",
+    y = "Accessibility (BigWig signal at position 0)", x = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+# Save both plots
+ggsave(paste0(params$out,"figures/STAT5_TF_footprint_plot.pdf"), 
+       plot = p, width = 7, height = 5, dpi = 600)
+ggsave(paste0(params$out,"STAT5_footprint_center_stats.pdf"), 
+       plot = p_stat, width = 6, height = 5, dpi = 600)
+
+```
+
+```{r}
+#install.packages("patchwork")
+
+# --- Combine and export ---
+combined_plot <- p / p_stat + plot_layout(heights = c(2, 1))
+combined_plot
+ggsave(paste0(params$out,"STAT5_footprint_combined.pdf"), 
+       plot = combined_plot,
+       width = 7, height = 9, 
+       dpi = 600, device = cairo_pdf)
+```

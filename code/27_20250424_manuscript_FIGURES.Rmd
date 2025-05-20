@@ -1,0 +1,1064 @@
+---
+title: "NK project: Paper figures"
+author: "Dr. Sara Wernig-Zorc"
+date: "`r format(Sys.time(), '%B %Y')`"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  input_BM1: "/home/rstudio/mnt_data/CancReg/BM/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"
+  input_fetahu2023: "/home/rstudio/mnt_out/CancReg/scRNA-seq_stage_M/results/published/data/rna_decontaminated.rds"
+  input_scRNA: "/home/rstudio/mnt_out/NK_project/Rds/fetahu2023_withNewMetadata.Rds"
+  input_NK: "/home/rstudio/mnt_out/NK_project/Rds/ALL_NK_cluster_withNewMetadata.Rds"
+  out: "/home/rstudio/mnt_out/NK_project/"
+  GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
+  metadata: "/home/rstudio/mnt_out/CancReg/scRNA-seq_stage_M/results/metadata/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 80)
+options(future.globals.maxSize = 80 * 10^9)
+options(Seurat.object.assay.version = "v5")
+print(params)
+```
+
+```{r load project specific R packages and color code, echo = FALSE}
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_setup.R")
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_utils.R")
+```
+
+```{r}
+library("zen4R")
+```
+
+
+# ___Add new clinical information to the single cell object___
+
+```{r}
+fetahu2023 <- readRDS(file = paste0(params$input_scRNA))
+metadata <- readRDS("/home/rstudio/mnt_out/CancReg/scRNA-seq_stage_M/results/published/data/metadata.rds")
+
+# set cell type annotation to the original annotation
+fetahu2023@active.ident <- setNames(pull(metadata[match(metadata$cell,colnames(fetahu2023)),"cellont_cluster"], "cellont_cluster"),pull(metadata[match(metadata$cell,colnames(fetahu2023)), "cell"], "cell"))
+
+fetahu2023@meta.data$orig.ident <- fetahu2023@active.ident # cell type annotation
+
+# set assay to RNA 
+DefaultAssay(fetahu2023) <- "RNA"
+
+fetahu2023@meta.data
+```
+
+```{r}
+# add the new clinical annotations and additional information 
+full_metadata <- read.csv(file = paste0(params$metadata, 
+  "fetahu2023_scRNA_seq_metadata.csv"), sep ="\t")
+
+metadata <- fetahu2023@meta.data
+metadata$cell_ID <- row.names(metadata)
+
+# Perform the merge using left_join from dplyr, keeping the row order of df1
+merged_metadata <- metadata %>%
+  left_join(full_metadata, by = "sample") %>% 
+  distinct(cell_ID, .keep_all = TRUE)
+
+nrow(metadata)
+nrow(merged_metadata)
+
+row.names(merged_metadata) <- merged_metadata$cell_ID 
+
+# Update the Seurat object's metadata slot
+fetahu2023@meta.data <- merged_metadata
+fetahu2023@meta.data
+```
+
+```{r}
+colnames(fetahu2023@meta.data)
+ 
+columns_to_remove <- c("sample_ID","File.name", "stage.x")
+
+# Drop the unwanted columns while preserving row names (cell IDs)
+old_metadata <- fetahu2023@meta.data 
+new_metadata <- old_metadata %>%
+  dplyr::select(-all_of(columns_to_remove))
+fetahu2023@meta.data <- new_metadata
+
+fetahu2023@meta.data 
+```
+
+```{r}
+# does log normalization make sense?
+# was it already done for this object?
+# does visualization change if we log normalize?
+
+fetahu2023 <- fetahu2023 %>% 
+  NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000)
+```
+
+```{r}
+saveRDS(fetahu2023, file = paste0(params$out,"/Rds/fetahu2023_withNewMetadata.Rds"))
+```
+
+```{r}
+predicted_labels <- readRDS(file = paste0(params$out,                                 "/Rds/2024_analysis/fetahu2023_predicted_NKclusters_from_Crinier2021_de.n=350.Rds"))
+
+predicted_labels$cell_ID <- rownames(predicted_labels)
+
+# subset scRNA-seq data to NK cells only
+NK_cells <- "NK (4)"
+ALL_NK <- subset(fetahu2023, 
+                 idents = NK_cells, 
+                 invert = FALSE)
+
+old_NK_metadata <- ALL_NK@meta.data
+
+old_NK_metadata$cell_ID <- rownames(old_NK_metadata)
+
+new_NK_metadata <- old_NK_metadata %>%
+  dplyr::left_join(as.data.frame(predicted_labels), by = "cell_ID")
+
+new_NK_metadata <- new_NK_metadata %>%
+  rename("labels" = "predicted_NK_type_de.n350")
+  
+row.names(new_NK_metadata) <- new_NK_metadata$cell_ID 
+  
+ALL_NK@meta.data <- merged_metadata
+ALL_NK@meta.data
+
+# log scale counts
+ALL_NK <- ALL_NK %>% 
+  NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000)
+```
+
+```{r}
+Idents(ALL_NK) <- ALL_NK@meta.data$group
+
+# identify cell IDs associated with each cluster 
+M <- WhichCells(ALL_NK, ident = "MYCNamp")        # MYCN amplified
+S <- WhichCells(ALL_NK, ident = "ATRXwtMYCNwt") # sporadic
+C <- WhichCells(ALL_NK, ident = "control")   # control / control (GNB or GNM)
+A <- WhichCells(ALL_NK, ident = "ATRXdel")       # ATRX deletion or mutations
+
+ALL_NK@active.ident <- ALL_NK$orig.ident
+
+# Add ATRX wt vs. mutated annotation
+Idents(object = ALL_NK, cells = M) <- "ATRXwt"
+Idents(object = ALL_NK, cells = S) <- "ATRXwt"
+Idents(object = ALL_NK, cells = A) <- "ATRXdel"
+Idents(object = ALL_NK, cells = C) <- "CTRL"
+
+# Add active identities to metadata column comparison_group
+ALL_NK$comparison_group <- ALL_NK@active.ident
+
+saveRDS(ALL_NK, file = paste0(params$out,"/Rds/ALL_NK_cluster_withNewMetadata.Rds"))
+```
+
+# ___Add sub-group categories___
+
+```{r eval=FALSE, include=FALSE}
+group <- "group" 
+NK_subtype <- "predicted_NK_type_de.n350"  
+
+# Create a new metadata column that concatenates values from both columns
+ALL_NK$group_per_NK_subtype <- paste(ALL_NK@meta.data[[group]], 
+                                      ALL_NK@meta.data[[NK_subtype]], 
+                                      sep = "_")
+
+# Check if the new column is added
+ALL_NK@meta.data$group_per_NK_subtype <- as.factor(ALL_NK@meta.data$group_per_NK_subtype)
+table(ALL_NK@meta.data$group_per_NK_subtype)
+```
+
+```{r eval=FALSE, include=FALSE}
+group <- "group" 
+NK_subtype <- "predicted_NK_type_de.n350"  
+
+# Create a new metadata column that concatenates values from both columns
+ALL_NK$NK_subtype_per_group <- paste(ALL_NK@meta.data[[NK_subtype]], 
+                                     ALL_NK@meta.data[[group]], 
+                                      sep = "_")
+
+# Check if the new column is added
+ALL_NK@meta.data$NK_subtype_per_group <- as.factor(ALL_NK@meta.data$NK_subtype_per_group)
+table(ALL_NK@meta.data$NK_subtype_per_group)
+```
+
+```{r eval=FALSE, include=FALSE}
+saveRDS(ALL_NK, file = paste0(params$out,"/Rds/ALL_NK_cluster_withNewMetadata.Rds"))
+```
+
+
+# ___Input_data___
+
+```{r}
+fetahu2023 <- readRDS(file = params$input_scRNA)
+ALL_NK <-  readRDS(file = params$input_NK)
+# ALL_NK <-  readRDS(file = paste0(params$out,"Rds/2024_analysis/ALL_NK_cluster.Rds"))
+```
+
+# ___Figure 1: Differential abundance and label transfer analysis___
+
+```{r}
+
+```
+
+# ___Figure 2: NK annotation, maturation and trajectory analysis___
+
+## ___Mei et al., 2024___
+
+```{r}
+NK_Mei_et_al_markers
+Mei_et_al_CD56dim_genes <- list(CD56dim_1 = NK_Mei_et_al_markers$CD56dim_1, 
+                                 CD56dim_2 = NK_Mei_et_al_markers$CD56dim_2)
+
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = Mei_et_al_CD56dim_genes,
+                         name = "Mei_et_al_CD56dim_genes",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 10)
+
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = NK_Mei_et_al_markers$CD56dim_1,
+                         name = "CD56dim1_module_",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 5)
+
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = NK_Mei_et_al_markers$CD56dim_2,
+                         name = "CD56dim2_module_",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 5)
+```
+
+```{r fig.height=12, fig.width=8}
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = "Mei_et_al_CD56dim_genes1",
+           plot.title = "NK CD56dim genes",
+           plot.subtitle = "Mei et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "group_per_NK_subtype",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = "Mei_et_al_CD56dim_genes1",
+           plot.title = "NK CD56dim genes",
+           plot.subtitle = "Mei et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15, 
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+
+pdf(paste0(params$out,"figures/dotplot_Mei_et_al_CD56dim_NK_subtypes_per_group.pdf"),
+    height = 12, width = 8)
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = "Mei_et_al_CD56dim_genes1",
+           plot.title = "NK CD56dim genes",
+           plot.subtitle = "Mei et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+dev.off()
+
+pdf(paste0(params$out,"figures/dotplot_Mei_et_al_CD56dim_group_per_NK_subtypes.pdf"),
+    height = 12, width = 8)
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = "Mei_et_al_CD56dim_genes1",
+           plot.title = "NK CD56dim genes",
+           plot.subtitle = "Mei et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "group_per_NK_subtype",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+dev.off()
+```
+
+```{r fig.height=12, fig.width=8}
+CD56dim_module_list <- c("CD56dim1_module_1", "CD56dim2_module_4")
+
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = CD56dim_module_list,
+           plot.title = "NK CD56dim genes",
+           plot.subtitle = "Mei et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "group_per_NK_subtype",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Module score")
+
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = CD56dim_module_list,
+           plot.title = "NK CD56dim genes",
+           plot.subtitle = "Mei et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Module score")
+```
+
+```{r fig.height=10, fig.width=10}
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = Mei_et_al_CD56dim_genes,
+           plot.title = "NK CD56dim genes",
+           plot.subtitle = "Mei et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "group_per_NK_subtype",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = Mei_et_al_CD56dim_genes,
+           plot.title = "NK CD56dim genes",
+           plot.subtitle = "Mei et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+```
+
+```{r fig.height=12, fig.width=22}
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = NK_Mei_et_al_markers,
+           plot.title = "",
+           plot.subtitle = "Mei et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "group_per_NK_subtype",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = NK_Mei_et_al_markers,
+           plot.title = "",
+           plot.subtitle = "Mei et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+
+pdf(paste0(params$out,"figures/dotplot_Mei_et_al_genes_NK_subtypes_per_group.pdf"),
+    height = 12, width = 22)
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = NK_Mei_et_al_markers,
+           plot.title = "",
+           plot.subtitle = "Mei et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+dev.off()
+
+pdf(paste0(params$out,"figures/dotplot_Mei_et_al_genes_NK_group_per_subtype.pdf"),
+    height = 12, width = 22)
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = NK_Mei_et_al_markers,
+           plot.title = "",
+           plot.subtitle = "Mei et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "group_per_NK_subtype",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+dev.off()
+```
+
+```{r fig.height=12, fig.width=18}
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = NK_Mei_et_al_markers_short,
+           plot.title = "",
+           plot.subtitle = "Mei et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "group_per_NK_subtype",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = NK_Mei_et_al_markers_short,
+           plot.title = "",
+           plot.subtitle = "Mei et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+
+pdf(paste0(params$out,"figures/dotplot_Mei_et_al_short_genes_NK_subtypes_per_group.pdf"),
+    height = 12, width = 22)
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = NK_Mei_et_al_markers_short,
+           plot.title = "",
+           plot.subtitle = "Mei et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+dev.off()
+
+pdf(paste0(params$out,"figures/dotplot_Mei_et_al_short_genes_NK_group_per_subtype.pdf"),
+    height = 12, width = 22)
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = NK_Mei_et_al_markers_short,
+           plot.title = "",
+           plot.subtitle = "Mei et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "group_per_NK_subtype",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+dev.off()
+```
+
+
+```{r}
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = NK_Mei_et_al_markers$CD56bright,
+                         name = "CD56bright",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 5)
+
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = NK_Mei_et_al_markers$CD56dim_1,
+                         name = "CD56dim_1",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 5)
+
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = NK_Mei_et_al_markers$CD56dim_2,
+                         name = "CD56dim_2",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 5)
+
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = NK_Mei_et_al_markers$Immature_NK,
+                         name = "Immature_NK",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 5)
+
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = NK_Mei_et_al_markers$NKT_cells,
+                         name = "NKT_cells",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 5)
+
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = NK_Mei_et_al_markers$Active_NK_cells,
+                         name = "Active_NK_cells",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 5)
+```
+
+```{r fig.height=12, fig.width=10}
+NK_Mei_et_al_modules <- c("CD56bright1",
+                          "CD56dim_11",
+                          "CD56dim_21",
+                          "Immature_NK",
+                          "NKT_cells1",
+                          "Active_NK_cells1")
+
+pdf(paste0(params$out,"figures/dotplot_Mei_et_al_moduleScores_NK_group_per_subtype.pdf"),
+    height = 12, width = 10)
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = NK_Mei_et_al_modules,
+           plot.title = "Module scores",
+           plot.subtitle = "Mei et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "group_per_NK_subtype",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Module score")
+dev.off()
+
+pdf(paste0(params$out,"figures/dotplot_Mei_et_al_moduleScores_NK_subtype_per_group.pdf"),
+    height = 12, width = 10)
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = NK_Mei_et_al_modules,
+           plot.title = "Module scores",
+           plot.subtitle = "Mei et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Module score")
+dev.off()
+```
+
+## ___Crinier et al., 2021___
+
+```{r}
+# extract counts
+counts_matrix <- LayerData(ALL_NK, 
+                           assay = "RNA", 
+                           layer = 'data')
+var_genes <- dimnames(counts_matrix)[[1]]
+
+# remove genes not present in the dataset
+adaptive_NK <- intersect(crinier_et_al_genes$adaptive_NK, var_genes)
+conventional_NK <- intersect(crinier_et_al_genes$conventional_NK, var_genes)
+mature_NK <- intersect(crinier_et_al_genes$mature_NK, var_genes)
+progenitor_NK <- intersect(crinier_et_al_genes$progenitor_NK, var_genes)
+```
+
+
+```{r}
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = adaptive_NK,
+                         name = "adaptive_NK",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 5)
+
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = conventional_NK,
+                         name = "conventional_NK",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 5)
+
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = mature_NK,
+                         name = "mature_NK",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 5)
+
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = progenitor_NK,
+                         name = "progenitor_NK",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 5)
+```
+
+
+```{r}
+crinier_et_al_module_scores <- c("mature_NK1",
+                                 "adaptive_NK1",
+                                 "conventional_NK1",
+                                 "progenitor_NK1")
+
+pdf(paste0(params$out,"figures/dotplot_crinier_et_al_genes_NK_subtypes_per_group.pdf"),
+    height = 10, width = 8)
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = crinier_et_al_module_scores,
+           plot.title = "NK subset module scores",
+           plot.subtitle = "Crinier et al., 2021",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Module scores")
+dev.off()
+
+pdf(paste0(params$out,"figures/dotplot_crinier_et_al_genes_group_per_NK_subtype.pdf"),
+    height = 10, width = 8)
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = crinier_et_al_module_scores,
+           plot.title = "NK subset module scores",
+           plot.subtitle = "Crinier et al., 2021",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "group_per_NK_subtype",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Module scores")
+dev.off()
+```
+
+# ___Figure 3: DGE and CCC analysis___
+
+```{r}
+
+```
+
+# ___Figure 4: ALCAM, CD6 gene expression___
+
+```{r}
+# subset scRNA-seq data to NK cells only
+NK_NB_cells <- c("NK (4)", "NB (8)")
+ALL_NK_NB <- subset(fetahu2023, 
+                 idents = NK_NB_cells, 
+                 invert = FALSE)
+
+ALL_NK_NB <- ALL_NK_NB %>% 
+  NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000)
+```
+
+```{r}
+predicted_labels <- readRDS(file = paste0(params$out,                                 "/Rds/2024_analysis/fetahu2023_predicted_NKclusters_from_Crinier2021_de.n=350.Rds"))
+
+predicted_labels$cell_ID <- rownames(predicted_labels)
+NK_subset_labels <- data.frame(cell_ID = predicted_labels$cell_ID, 
+                               NK_subsets = predicted_labels$labels)
+
+old_metadata <- ALL_NK_NB@meta.data
+old_metadata$cell_ID <- rownames(old_metadata)
+
+new_metadata <- old_metadata %>%
+  dplyr::left_join(as.data.frame(NK_subset_labels), by = "cell_ID")
+
+#new_metadata <- new_metadata %>% rename("NK_subsets" = "predicted_NK_type_de.n350")
+  
+row.names(new_metadata) <- new_metadata$cell_ID 
+  
+ALL_NK_NB@meta.data <- new_metadata
+ALL_NK_NB@meta.data
+
+ALL_NK_NB@meta.data$cell_type_detailed <- NA
+
+# Replace NA values in 'NK_subsets' with "NB"
+ALL_NK_NB@meta.data <- ALL_NK_NB@meta.data %>%
+  mutate(cell_type_detailed = ifelse(is.na(NK_subsets), "NB", NK_subsets))
+
+head(ALL_NK_NB@meta.data$cell_type_detailed)
+```
+
+
+```{r fig.height=4, fig.width=9}
+genes <- c("CD6","ALCAM")
+
+combined_RNA_plot <- VlnPlot_scCustom(ALL_NK_NB, 
+                 features = genes, 
+                 group.by = "group",
+                 split.by = "cell_type_detailed",
+                 colors_use = COLOR_CODE_CCC_2,
+                 pt.size = 0) 
+
+combined_RNA_plot
+
+pdf(paste0(params$out,"figures/vlnPlot_CD6_ALCAM_NK_NB.pdf"),
+    height = 4, width = 9)
+combined_RNA_plot
+dev.off()
+
+combined_RNA_plot_v2 <- VlnPlot_scCustom(ALL_NK_NB, 
+                 features = genes, 
+                 group.by = "cell_type_detailed",
+                 split.by = "group",
+                 colors_use = COLOR_CODE_GROUP,
+                 pt.size = 0) 
+
+combined_RNA_plot_v2
+
+pdf(paste0(params$out,"figures/vlnPlot_CD6_ALCAM_NK_NB_v2.pdf"),
+    height = 4, width = 9)
+combined_RNA_plot_v2
+dev.off()
+```
+
+```{r}
+stacked_vln <- Stacked_VlnPlot(ALL_NK_NB, 
+                features = genes, 
+                plot_legend = TRUE,
+                group.by = "group",
+                split.by = "cell_type_detailed",
+                colors_use = COLOR_CODE_CCC_2,
+                x_lab_rotate = 45) 
+
+stacked_vln
+
+pdf(paste0(params$out,"figures/stacked_vlnPlot_CD6_ALCAM.pdf"),
+    height = 4, width = 6)
+stacked_vln
+dev.off()
+
+stacked_vln_v2 <- Stacked_VlnPlot(ALL_NK_NB, 
+                features = genes, 
+                plot_legend = TRUE,
+                group.by = "cell_type_detailed",
+                split.by = "group",
+                colors_use = COLOR_CODE_GROUP,
+                x_lab_rotate = 45) 
+
+stacked_vln_v2
+
+pdf(paste0(params$out,"figures/stacked_vlnPlot_CD6_ALCAM_v2.pdf"),
+    height = 4, width = 6)
+stacked_vln_v2
+dev.off()
+```
+
+
+```{r}
+combined_dotplot <- do_DotPlot(ALL_NK_NB, 
+                 features = genes, 
+                 group.by = "cell_type_detailed",
+                 flip = TRUE,
+                 dot_border = FALSE,
+                 grid.type = "blank",
+                 axis.text.x.angle = 45,
+                 plot.title = "RNA expression",
+                 scale = TRUE,
+                 legend.length = 5,
+                 use_viridis = TRUE,
+                 number.breaks = 7,
+                 viridis.direction = -1,
+                 viridis.palette = "magma",
+                 font.size = 18,
+                 dot.scale = 15,
+                 legend.title = "Log scaled RNA expression",
+                 legend.position = "right"
+                 )
+```
+
+```{r}
+# subset scRNA-seq data to NK cells only
+NK_cells <- c("NK (4)")
+ALL_NK <- subset(fetahu2023, 
+                 idents = NK_cells, 
+                 invert = FALSE)
+
+ALL_NK <- ALL_NK %>% 
+  NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000)
+```
+
+```{r}
+NB_cells <- c("NB (8)")
+ALL_NB <- subset(ALL_NK_NB, 
+                 idents = NB_cells, 
+                 invert = FALSE)
+
+ALL_NB <- ALL_NB %>% 
+  NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000)
+```
+
+
+```{r}
+NK_dotplot <- do_DotPlot(ALL_NK, 
+                 features = genes, 
+                 group.by = "group",
+                 flip = TRUE,
+                 dot_border = FALSE,
+                 grid.type = "blank",
+                 axis.text.x.angle = 45,
+                 plot.title = "NK cells",
+                 scale = TRUE,
+                 legend.length = 10,
+                 use_viridis = TRUE,
+                 number.breaks = 7,
+                 viridis.direction = -1,
+                 viridis.palette = "magma",
+                 font.size = 18,
+                 dot.scale = 15,
+                 legend.title = "Scaled RNA expression"
+                 )
+
+NB_dotplot <- do_DotPlot(ALL_NB, 
+                 features = genes, 
+                 group.by = "group",
+                 flip = TRUE,
+                 dot_border = FALSE,
+                 grid.type = "blank",
+                 axis.text.x.angle = 45,
+                 plot.title = "NB cells",
+                 scale = TRUE,
+                 legend.length = 5,
+                 use_viridis = TRUE,
+                 number.breaks = 7,
+                 viridis.direction = -1,
+                 viridis.palette = "magma",
+                 font.size = 18,
+                 dot.scale = 15,
+                 legend.position = "none" 
+                 )
+
+                 
+NK_dotplot + NB_dotplot
+
+pdf(paste0(params$out,"figures/CD6_ALCAM_expression_dotplot.pdf"))
+NK_dotplot + NB_dotplot
+dev.off()
+```
+```{r}
+NB_vln <- VlnPlot_scCustom(ALL_NB, 
+                 features = genes, 
+                 group.by = "group",
+                 colors_use = COLOR_CODE_GROUP,
+                 pt.size = 0) 
+
+NK_vln <- VlnPlot_scCustom(ALL_NK, 
+                 features = genes, 
+                 group.by = "group",
+                 colors_use = COLOR_CODE_GROUP,
+                 pt.size = 0) 
+NK_vln + NB_vln
+
+```
+
+
+
+
+## ___Bulk RNA-seq: ALCAM expression___
+
+```{r}
+count_data <- read.csv("~/mnt_data/nb_tumors/tumorbiologylab.bulk.RNA/nb-full_omics/full_omics_expression_data_normalized_counts_liblayout_corrected.csv")
+names(count_data)[1] <- "Gene_ID"
+
+metadata_table <- read_excel("~/mnt_data/nb_tumors/tumorbiologylab.bulk.RNA/metadata/metadata_table_wStage.xlsx")
+metadata_table <- as.data.frame(metadata_table)
+metadata_table$classification<- as.factor(metadata_table$classification)
+```
+
+```{r}
+counts_t <- as.data.frame(melt(count_data))
+names(counts_t)[3] <- "omics_id"
+
+df <- merge(metadata_table, counts_t, by = "omics_id")
+df$classification <- as.factor(df$classification)
+
+df_filtered <- df[df$gene_name == "ALCAM", ]
+ALCAM_counts <- df_filtered[, c("classification","value")]
+colnames(ALCAM_counts) <- c("Group", "RNA_expression")
+
+# sample order
+SAMPLE_ORDER <- c("control", # non-tumor-infiltrated-BM
+                 "ATRXdel", # sorted tumor cells
+                 "MYCNamp", # sorted tumor cells
+                 "ATRXwtMYCNwt", # sorted tumor cells
+                 "TMEcells" # TME cells from tumor-infiltrated-BM
+                 )
+
+ALCAM_counts$Group <- factor(ALCAM_counts$Group, levels = SAMPLE_ORDER)
+
+ALCAM_counts_clean <- ALCAM_counts %>%
+  filter(!grepl("TMEcells", Group))
+```
+
+
+```{r}
+library(ggpubr)
+
+bulkRNA_ALCAM_plot <- ggviolin(ALCAM_counts_clean, 
+                               x = "Group", 
+                               y = "RNA_expression",
+                               fill = "Group") + 
+  labs(title = "ALCAM RNA expression", 
+       y = "Normalized expression") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "right") +
+  scale_fill_manual(values = COLOR_CODE_GROUP) + 
+  stat_compare_means(comparisons = list(c("ATRXdel", "MYCNamp"),
+                                        c("ATRXdel", "ATRXwtMYCNwt")),
+                     method = "wilcox.test", label = "p.format",
+                     p.adjust.method = "BH")
+
+bulkRNA_ALCAM_plot
+
+pdf(paste0(params$out,"figures/bulkRNA_ALCAM_expression.pdf"),
+    height = 5, width = 5)
+bulkRNA_ALCAM_plot
+dev.off()
+```
+
+
+# ___Figure 5: Secretome analysis___
+
+```{r}
+
+```
+
+# ___Session Info___
+
+```{r}
+sessionInfo()
+```
+
+# ___The End___

@@ -80,6 +80,16 @@ TME_cells <- subset(fetahu2023,
        invert = TRUE)
 
 TME_cells$celltype <- TME_cells$orig.ident
+
+TME_cells@meta.data$group <- 
+  factor(TME_cells@meta.data$group, 
+         levels = GROUP_ORDER)
+levels(TME_cells@meta.data$group)
+
+TME_cells@meta.data$rados_et_al_2025 <- 
+  factor(TME_cells@meta.data$rados_et_al_2025, 
+         levels = PATIENT_ORDER)
+levels(TME_cells@meta.data$rados_et_al_2025)
 ```
 
 
@@ -126,7 +136,7 @@ barplots_cell_types <- ggplot(percent_cell_type_group_trans,
   theme(axis.text.x = element_text(angle = 45,
 
                                    hjust = 1)) +
-  scale_fill_manual(values = COLOR_CODE_FETAHU2023)
+  scale_fill_manual(values = COLOR_CODE_FETAHU2023_v2)
 
 barplots_cell_types
 
@@ -174,18 +184,154 @@ dev.off()
 
 
 ```{r}
-TME_cells@meta.data$rados_et_al_2025.x <- factor(TME_cells@meta.data$rados_et_al_2025.x)
+TME_cells@meta.data$rados_et_al_2025<- factor(TME_cells@meta.data$rados_et_al_2025)
 TME_cells@meta.data$cell_type <- factor(TME_cells@meta.data$cell_type)
 table(TME_cells$cell_type, TME_cells$group)
 ```
 
 
 ```{r}
-TME_cells@meta.data$rados_et_al_2025.x <- factor(TME_cells@meta.data$rados_et_al_2025.x)
+TME_cells@meta.data$rados_et_al_2025 <- factor(TME_cells@meta.data$rados_et_al_2025)
 TME_cells@meta.data$celltype_meta <- factor(TME_cells@meta.data$celltype_meta)
 table(TME_cells$celltype_meta, TME_cells$group)
 ```
 
+# ___metacluster box plots with stats___
+
+## ___Stats for cell_type clusters___
+
+```{r}
+table_cell_type_per_sample <- table(TME_cells$celltype_meta,TME_cells$rados_et_al_2025)
+table_cell_type_per_sample <- as.data.frame(table_cell_type_per_sample)
+
+table_cell_type_per_sample$group <- gsub("*[0-9]", "", table_cell_type_per_sample$Var2)
+table_cell_type_per_sample
+
+library(dplyr)
+
+table_cell_type_per_sample_percent <- table_cell_type_per_sample %>%
+  group_by(Var2, Var1) %>%           
+  summarise(total = sum(Freq, na.rm = TRUE)) %>%  
+  mutate(percentage = total * 100 / sum(total)) %>% 
+  ungroup()
+
+table_cell_type_per_sample_percent <- as.data.frame(table_cell_type_per_sample_percent)
+table_cell_type_per_sample_percent$group <- gsub("*[0-9]", "", table_cell_type_per_sample_percent$Var2)
+table_cell_type_per_sample_percent
+
+data_wide <- t(table_cell_type_per_sample_percent)
+```
+
+### ___NK cells___
+
+```{r}
+NK_table <- filter(as.data.frame(table_cell_type_per_sample_percent), 
+                   Var1 == "NK-cells")
+
+# Perform ANOVA testing
+NK_table_anova <- aov(percentage ~ group, data = NK_table)
+summary(NK_table_anova)
+
+# Extract p-value
+p_value <- summary(NK_table_anova)[[1]][["Pr(>F)"]][1]
+
+# perform wilcox testing
+p_value1 <- wilcox.test(percentage ~ group, 
+                        data = subset(NK_table, 
+                                      group %in% c("A", "S")))$p.value
+p_value2 <- wilcox.test(percentage ~ group, 
+                        data = subset(NK_table, 
+                                      group %in% c("A", "C")))$p.value
+p_value3 <- wilcox.test(percentage ~ group, 
+                        data = subset(NK_table, 
+                                      group %in% c("A", "M")))$p.value
+
+# Adjust for multiple testing using FDR (Benjamini-Hochberg)
+pvals <- c(p_value1, p_value2, p_value3)
+names(pvals) <- c("ATRXdel_vs_ATRXwtMYCNwt", "ATRXdel_vs_control", "ATRXdel_vs_MYCNamp")
+pvals_adj <- p.adjust(pvals, method = "fdr")
+pvals_adj
+
+# Ensure group order
+NK_table$group <- factor(NK_table$group, levels = c("C", "A", "M", "S"))
+
+# Create boxplot and add p-value annotation
+boxplot1 <- NK_table %>%
+  ggplot( aes(x = group , y =  percentage, fill = group)) +
+    geom_boxplot() +
+    ggtitle("NK cells per group") +
+    xlab("") + ylab("Percentage of NK cells per group") +
+  geom_signif(comparisons = list(c("C", "A"),
+                                 c("A", "M"),
+                                 c("A", "S")),
+              map_signif_level = FALSE, 
+              y_position = c(max(NK_table$percentage) + 0, 
+                             max(NK_table$percentage) + 2, 
+                             max(NK_table$percentage) + 4)) +
+  scale_fill_manual(values = COLOR_CODE_GROUP_v4) +
+  theme(
+    panel.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    strip.background = element_blank(),
+    plot.background = element_blank(),
+    axis.line = element_line(color = "black")
+  )
+```
+
+```{r fig.height=4, fig.width=5}
+boxplot1
+
+pdf(paste0(params$out,"figures/barplot_metaclusters_NKcells_wStats.pdf"),
+    height = 4, width = 5)
+boxplot1
+dev.off()
+```
+```{r fig.height=7, fig.width=7}
+table_cell_type_per_sample_percent <- as.data.frame(table_cell_type_per_sample_percent)
+# Ensure group order
+table_cell_type_per_sample_percent$group <- factor(table_cell_type_per_sample_percent$group, 
+                                                   levels = c("C", "A", "M", "S"))
+
+my_comparisons <- list(c("A", "C"), c("A", "M"), c("A", "S"))
+
+# Create facetted boxplot with p-values
+boxplot_all <- ggplot(table_cell_type_per_sample_percent, 
+                      aes(x = group, y = percentage, fill = group)) +
+  geom_boxplot() +
+  facet_wrap(~ Var1, scales = "free_y") +
+  stat_compare_means(comparisons = my_comparisons, 
+                     label = "p.signif", 
+                     method = "wilcox.test",
+                     tip.length = 0.01,
+                     size = 3) +
+  scale_fill_manual(values = COLOR_CODE_GROUP_v4) +
+  theme(strip.text = element_text(face = "bold")) +
+  labs(title = "Metacluster frequencies per group",
+       y = "Percentage of cells",
+       x = "") +
+  theme(
+    panel.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    strip.background = element_blank(),
+    plot.background = element_blank(),
+    axis.line = element_line(color = "black")
+  )
+
+boxplot_all
+```
+```{r}
+pdf(paste0(params$out,"figures/barplot_metaclusters_wStats.pdf"),
+    height = 8, width = 8)
+boxplot_all
+dev.off()
+```
+
+
+# ___DA analysis___
 
 ```{r miloR prepare data}
 library("statmod")
@@ -502,7 +648,6 @@ ggplot(results_table, aes(x = logFC, fill = celltype_anno)) +
 
 # ___dotplots___
 
-
 ```{r fig.height=10, fig.width=10}
 
 genes_of_interest <- c("CD6","CD8A","FCGR3A","ID2","ZEB2","STAT5A","STAT4","NCR1")
@@ -564,8 +709,6 @@ do_DotPlot(ALL_NK,
            legend.position = "right",
            legend.title = "Scaled RNA expression")
 ```
-
-
 
 ```{r}
 sessionInfo()
