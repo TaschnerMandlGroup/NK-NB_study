@@ -1046,6 +1046,10 @@ pdf(paste0(params$out,"figures/bulkRNA_ALCAM_expression.pdf"),
     height = 5, width = 5)
 bulkRNA_ALCAM_plot
 dev.off()
+
+# ATRXdel, n = 21      
+# MYCNamp, n = 60           
+# ATRXwtMYCNwt, n = 51 
 ```
 
 

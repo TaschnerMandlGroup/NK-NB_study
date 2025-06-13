@@ -246,8 +246,8 @@ ALL_vs_ATRXdel <- DElegate::findDE(hNK_Bm2,
                            replicate_column = "rados_et_al_2025",
                            compare = "ATRXdel")
 
-ALL_vs_ATRXdel_signif <- subset(DEG_hNK_Bm2_ref, 
-                                DEG_hNK_Bm2_ref$padj < 0.10)
+ALL_vs_ATRXdel_signif <- subset(ALL_vs_ATRXdel, 
+                                ALL_vs_ATRXdel$padj < 0.10)
 
 ALL_vs_ATRXdel_signif
 ```
@@ -1227,13 +1227,16 @@ control_vs_ATRXwtMYCNwt <- subset(DEG_hNK_Bm3_DEG,
 
 control_vs_ATRXdel_signif <- subset(control_vs_ATRXdel, 
                                 control_vs_ATRXdel$padj < 0.1)
-
+```
+```{r}
 write.table(control_vs_ATRXdel, 
             sep = "\t",
             row.names = FALSE,
             quote = FALSE,
             file = paste0(params$out, "tables/DEG_hNK-Bm3_control_vs_ATRXdel_2025-04-24.csv"))
 ```
+
+
 
 #### ___2. ATRX wild-type [MYCNamp + ATRXwtMYCNwt] vs. ATRXdel___
 
@@ -1249,14 +1252,15 @@ ATRXwt_vs_ATRXdel <- DElegate::findDE(hNK_Bm3,
 ATRXwt_vs_ATRXdel_signif <- subset(ATRXwt_vs_ATRXdel, ATRXwt_vs_ATRXdel$padj < 0.10)
 
 ATRXwt_vs_ATRXdel_signif
-
+```
+```{r}
 write.table(ATRXwt_vs_ATRXdel, 
             sep = "\t",
             row.names = FALSE,
             quote = FALSE,
             file = paste0(params$out, "tables/DEG_hNK-Bm3_ATRXdel-vs-ATRXwt_2025-04-24.csv"))
-
 ```
+
 
 #### ___3. ALL vs. ATRXdel___
 
@@ -1272,7 +1276,8 @@ ALL_vs_ATRXdel <- DElegate::findDE(hNK_Bm3,
 ALL_vs_ATRXdel_signif <- subset(ALL_vs_ATRXdel, ALL_vs_ATRXdel$padj < 0.10)
 
 ALL_vs_ATRXdel_signif
-
+```
+```{r}
 write.table(ALL_vs_ATRXdel, 
             sep = "\t",
             row.names = FALSE,
@@ -1613,8 +1618,11 @@ if (is.null(kegg_enrichment) == TRUE) {
   print("0 significantly enriched HALLMARK terms")
 }
 
+```
 
-pdf(paste0(params$out,"figures/DEG_hBm-NK3_ATRXdel_vs_CTRL_hallmark_treeplot.pdf"),
+```{r}
+
+pdf(paste0(params$out,"figures/DEG_hBm-NK3_ATRXdel_vs_CTRL_hallmark.pdf"),
     height = 4, width = 9)
 dotplot(hallmark_gene_enrich, showCategory = 20) +
     ggtitle("up- in Bm_hNK3 in ATRXdel: HALLMARK genes")
@@ -1632,12 +1640,30 @@ treeplot_NK3_ctrl <- treeplot(enrichres2,
 
 treeplot_NK3_ctrl
 
-pdf(paste0(params$out,"figures/DEG_hBm-NK3_ATRXdel_vs_CTRL_treeplot.pdf"),
+pdf(paste0(params$out,"figures/DEG_hBm-NK3_ATRXdel_vs_CTRL_KEGG_treeplot.pdf"),
+    height = 4, width = 9)
+treeplot_NK3_ctrl
+dev.off()
+
+enrichres2 <- pairwise_termsim(go_BP) 
+treeplot_NK3_ctrl <- treeplot(enrichres2,
+  showCategory = 15,
+  color = "p.adjust",
+  offset = 10, 
+  offset_tiplab = 0.5, 
+  nCluster = 5, 
+  nWords = 1,
+  split = "subcategory")
+
+treeplot_NK3_ctrl
+
+pdf(paste0(params$out,"figures/DEG_hBm-NK3_ATRXdel_vs_CTRL_GO-BP_treeplot.pdf"),
     height = 4, width = 9)
 treeplot_NK3_ctrl
 dev.off()
 
 ```
+
 
 ```{r fgsea}
 genes <- control_vs_ATRXdel$feature
@@ -1820,6 +1846,18 @@ hallmark_gene_enrich <- enricher(entrez_ids,
 
 head(hallmark_gene_enrich)
 
+enrichres2 <- pairwise_termsim(kegg_enrichment) 
+treeplot_NK3_wt <- treeplot(enrichres2,
+  showCategory = 15,
+  color = "p.adjust",
+  offset = 10, 
+  offset_tiplab = 0.5, 
+  nCluster = 5, 
+  nWords = 1,
+  split = "subcategory")
+
+treeplot_NK3_wt
+
 ```
 
 ```{r fgsea}
@@ -1892,14 +1930,6 @@ hallmark_gene_gsea <- GSEA(filtered_genes,
 
 head(hallmark_gene_gsea)
 dotplot(hallmark_gene_gsea, showCategory = 20)
-```
-
-```{r eval=FALSE, include=FALSE}
-library("enrichplot")
-# calculate pairwise similarities of the enriched terms using Jaccard’s similarity index
-enrichres2 <- pairwise_termsim(kegg_enrichment) 
-# treeplot
-treeplot(enrichres2)
 ```
 
 #### ___ALL vs. ATRXdel___
@@ -2009,6 +2039,18 @@ hallmark_gene_enrich <- enricher(entrez_ids,
                              maxGSSize = 5000)
 
 head(hallmark_gene_enrich)
+
+enrichres2 <- pairwise_termsim(kegg_enrichment) 
+treeplot_NK3_all <- treeplot(enrichres2,
+  showCategory = 15,
+  color = "p.adjust",
+  offset = 10, 
+  offset_tiplab = 0.5, 
+  nCluster = 5, 
+  nWords = 1,
+  split = "subcategory")
+
+treeplot_NK3_all
 ```
 
 ```{r fgsea}
@@ -2082,7 +2124,479 @@ hallmark_gene_gsea <- GSEA(filtered_genes,
 head(hallmark_gene_gsea)
 dotplot(hallmark_gene_gsea, showCategory = 20)
 ```
+#### ___Cluster 2 + 3___
 
+```{r}
+# all genes
+control_vs_ATRXdel <- c(control_vs_ATRXdel_NK2_up$feature, control_vs_ATRXdel_NK3_up$feature)
+control_vs_ATRXdel <- unique(control_vs_ATRXdel)
+length(control_vs_ATRXdel)
+ATRXwt_vs_ATRXdel <- c(ATRXwt_vs_ATRXdel_NK2_up$feature, ATRXwt_vs_ATRXdel_NK3_up$feature)
+ATRXwt_vs_ATRXdel <- unique(ATRXwt_vs_ATRXdel)
+length(ATRXwt_vs_ATRXdel)
+ALL_vs_ATRXdel <- c(ALL_vs_ATRXdel_NK2_up$feature, ALL_vs_ATRXdel_NK3_up$feature)
+ALL_vs_ATRXdel <- unique(ALL_vs_ATRXdel)
+length(ALL_vs_ATRXdel)
+
+# common genes
+```
+
+###### ___pathway enrichment____
+
+___control vs. ATRXdel___
+
+```{r}
+# the background genes here should be all expressed (and detected) in all NK cells
+genes <- control_vs_ATRXdel
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               #universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              pvalueCutoff = 0.05)
+
+go_BP
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+3 in ATRXdel: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+               ont = "MF",
+               OrgDb ="org.Hs.eg.db",
+               #universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              pvalueCutoff = 0.05,
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_MF
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+3 in ATRXdel: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               #universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              pvalueCutoff = 0.05, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+3 in ATRXdel: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+
+# HALLMARK GENE SET
+hallmark_gene_enrich <- enricher(entrez_ids, 
+                             TERM2GENE = hallmark_genes,
+                             pvalueCutoff = 0.05,
+                             pAdjustMethod = "fdr",
+                             #universe = geneUniverse,
+                             minGSSize = 2,
+                             maxGSSize = 5000)
+
+head(hallmark_gene_enrich)
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched HALLMARK terms")
+} else if (any(hallmark_gene_enrich@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(hallmark_gene_enrich, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+3 in ATRXdel: HALLMARK enrichment"))
+} else {
+  print("0 significantly enriched HALLMARK terms")
+}
+
+
+pdf(paste0(params$out,"figures/DEG_hBm-NK2+hBm-NK3_ATRXdel_vs_CTRL_hallmark.pdf"),
+    height = 4, width = 9)
+dotplot(hallmark_gene_enrich, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+3 in ATRXdel: HALLMARK genes")
+dev.off()
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              pvalueCutoff = 0.05,
+                              #universe = geneUniverse,
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(kegg_enrichment@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+3 in ATRXdel: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+
+```
+
+```{r}
+enrichres2 <- pairwise_termsim(go_BP) 
+treeplot_NK2_NK3_ctrl <- treeplot(enrichres2,
+  showCategory = 10,
+  color = "p.adjust",
+  offset = 10, 
+  offset_tiplab = 0.5, 
+  nCluster = 5, 
+  nWords = 1,
+  split = "subcategory")
+
+treeplot_NK2_NK3_ctrl
+
+pdf(paste0(params$out,"figures/DEG_hBm-NK2+hBm-NK3_ATRXdel_vs_CTRL_GO-BP_treeplot.pdf"),
+    height = 4, width = 9)
+treeplot_NK2_NK3_ctrl
+dev.off()
+
+enrichres2 <- pairwise_termsim(kegg_enrichment) 
+treeplot_NK2_NK3_ctrl <- treeplot(enrichres2,
+  showCategory = 10,
+  color = "p.adjust",
+  offset = 10, 
+  offset_tiplab = 0.5, 
+  nCluster = 5, 
+  nWords = 1,
+  split = "subcategory")
+
+treeplot_NK2_NK3_ctrl
+
+pdf(paste0(params$out,"figures/DEG_hBm-NK2+hBm-NK3_ATRXdel_vs_CTRL_KEGG_treeplot.pdf"),
+    height = 4, width = 9)
+treeplot_NK3_ctrl
+dev.off()
+
+
+```
+
+___ATRXwt vs. ATRXdel___
+
+```{r}
+# the background genes here should be all expressed (and detected) in all NK cells
+genes <- ATRXwt_vs_ATRXdel
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               #universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              pvalueCutoff = 0.05)
+
+go_BP
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+3 in ATRXdel: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+               ont = "MF",
+               OrgDb ="org.Hs.eg.db",
+               #universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              pvalueCutoff = 0.05, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_MF
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+3 in ATRXdel: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               #universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              pvalueCutoff = 0.05, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+3 in ATRXdel: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              pvalueCutoff = 0.05,
+                              #universe = geneUniverse,
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(kegg_enrichment@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+3 in ATRXdel: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+
+# HALLMARK GENE SET
+hallmark_gene_enrich <- enricher(entrez_ids, 
+                             TERM2GENE = hallmark_genes,
+                             pvalueCutoff = 0.05,
+                             pAdjustMethod = "fdr",
+                             #universe = geneUniverse,
+                             minGSSize = 2,
+                             maxGSSize = 5000)
+
+head(hallmark_gene_enrich)
+```
+
+```{r}
+enrichres2 <- pairwise_termsim(go_BP) 
+treeplot_NK2_NK3_wt <- treeplot(enrichres2,
+  showCategory = 10,
+  color = "p.adjust",
+  offset = 10, 
+  offset_tiplab = 0.5, 
+  nCluster = 5, 
+  nWords = 1,
+  split = "subcategory")
+
+treeplot_NK2_NK3_wt
+
+pdf(paste0(params$out,"figures/DEG_hBm-NK2+hBm-NK3_ATRXdel_vs_ATRXwt_GO-BP_treeplot.pdf"),
+    height = 4, width = 9)
+treeplot_NK2_NK3_wt 
+dev.off()
+
+enrichres2 <- pairwise_termsim(kegg_enrichment) 
+treeplot_NK2_NK3_wt  <- treeplot(enrichres2,
+  showCategory = 10,
+  color = "p.adjust",
+  offset = 10, 
+  offset_tiplab = 0.5, 
+  nCluster = 5, 
+  nWords = 1,
+  split = "subcategory")
+
+treeplot_NK2_NK3_wt
+
+pdf(paste0(params$out,"figures/DEG_hBm-NK2+hBm-NK3_ATRXdel_vs_ATRXwt_KEGG_treeplot.pdf"),
+    height = 4, width = 9)
+treeplot_NK2_NK3_wt
+dev.off()
+```
+
+___ALL vs. ATRXdel___
+
+```{r}
+# the background genes here should be all expressed (and detected) in all NK cells
+genes <- ALL_vs_ATRXdel
+# remap to ENTREZ IDs
+entrez_ids <- map_gene_to_entrez(genes)
+
+# enrichment BP
+go_BP <- enrichGO(gene = entrez_ids, 
+               ont = "BP",
+               OrgDb ="org.Hs.eg.db",
+               #universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              pvalueCutoff = 0.05)
+
+go_BP
+
+if (is.null(go_BP) == TRUE) {
+  print("no significantly enriched BP terms")
+} else if (any(go_BP@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_BP, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+3 in ATRXdel: BP enrichment"))
+} else {
+  print("0 significantly enriched BP terms")
+}
+
+# enrichment MF
+go_MF <- enrichGO(gene = entrez_ids, 
+               ont = "MF",
+               OrgDb ="org.Hs.eg.db",
+               #universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              pvalueCutoff = 0.05, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_MF
+
+if (is.null(go_MF) == TRUE) {
+  print("no significantly enriched MF terms")
+} else if (any(go_MF@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_MF, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+3 in ATRXdel: MF enrichment"))
+} else {
+  print("0 significantly enriched MF terms")
+}
+
+# enrichment CC
+go_CC <- enrichGO(gene = entrez_ids, 
+               ont = "CC",
+               OrgDb ="org.Hs.eg.db",
+               #universe = geneUniverse,
+               readable = TRUE,
+              pAdjustMethod = "fdr",
+              pvalueCutoff = 0.05, 
+               minGSSize = 2,
+               maxGSSize = 5000)
+
+go_CC
+
+if (is.null(go_CC) == TRUE) {
+  print("no significantly enriched CC terms")
+} else if (any(go_CC@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(go_CC, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+3 in ATRXdel: CC enrichment"))
+} else {
+  print("0 significantly enriched CC terms")
+}
+
+
+# enrichment KEGG
+kegg_enrichment <- enrichKEGG(gene = entrez_ids,
+                              organism = "hsa", 
+                              keyType = "kegg",
+                              pvalueCutoff = 0.05,  
+                              #universe = geneUniverse,
+                              minGSSize = 2,
+                              maxGSSize = 5000)
+
+kegg_enrichment
+
+if (is.null(kegg_enrichment) == TRUE) {
+  print("no significantly enriched KEGG terms")
+} else if (any(kegg_enrichment@result$qvalue < 0.1)) {
+  # If there is at least one term with qvalue < 0.1, show the dotplot
+  print(dotplot(kegg_enrichment, showCategory = 20) +
+    ggtitle("up- in Bm_hNK2+3 in ATRXdel: KEGG enrichment"))
+} else {
+  print("0 significantly enriched KEGG terms")
+}
+
+# HALLMARK GENE SET
+hallmark_gene_enrich <- enricher(entrez_ids, 
+                             TERM2GENE = hallmark_genes,
+                             pvalueCutoff = 0.05, 
+                             pAdjustMethod = "fdr",
+                             #universe = geneUniverse,
+                             minGSSize = 2,
+                             maxGSSize = 5000)
+
+head(hallmark_gene_enrich)
+```
+
+```{r}
+enrichres2 <- pairwise_termsim(go_BP) 
+treeplot_NK2_NK3_all <- treeplot(enrichres2,
+  showCategory = 10,
+  color = "p.adjust",
+  offset = 10, 
+  offset_tiplab = 0.5, 
+  nCluster = 5, 
+  nWords = 1,
+  split = "subcategory")
+
+treeplot_NK2_NK3_all
+
+pdf(paste0(params$out,"figures/DEG_hBm-NK2+hBm-NK3_ATRXdel_vs_all_GO-BP_treeplot.pdf"),
+    height = 4, width = 9)
+treeplot_NK2_NK3_all 
+dev.off()
+
+enrichres2 <- pairwise_termsim(kegg_enrichment) 
+treeplot_NK2_NK3_all  <- treeplot(enrichres2,
+  showCategory = 10,
+  color = "p.adjust",
+  offset = 10, 
+  offset_tiplab = 0.5, 
+  nCluster = 5, 
+  nWords = 1,
+  split = "subcategory")
+
+treeplot_NK2_NK3_all
+
+pdf(paste0(params$out,"figures/DEG_hBm-NK2+hBm-NK3_ATRXdel_vs_all_KEGG_treeplot.pdf"),
+    height = 4, width = 9)
+treeplot_NK2_NK3_all
+dev.off()
+```
 
 ## ___Justify CD6 selection___
 
