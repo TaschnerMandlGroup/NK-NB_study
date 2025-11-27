@@ -8,9 +8,9 @@ fi
 
 # parse config parameters:
 source parse_yaml.sh
-eval $(parse_yaml config_RStudio.yaml CONF_)
+eval $(parse_yaml config_RStudio_general.yaml CONF_)
 
-podman run -d --rm \
+docker run -d --rm \
   --name="RStudio_${CONF_project_name}_${USER}_$(date +'%Y-%m-%d')" \
   -p ${1}:8787 \
   -e PASSWORD=${2} \

@@ -1,0 +1,184 @@
+---
+title: "NK project: DEG analysis - NB cells"
+author: "Dr. Sara Wernig-Zorc"
+date: "`r format(Sys.time(), '%B %Y')`"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  input_BM1: "/home/rstudio/mnt_data/CancReg/BM/crinier2021/Rds/scBM_healthy_seurat_v4.Rds"
+  input_BM2: "/home/rstudio/mnt_data/CancReg/BM/yang2019/Rds/Human_BM_NK_seurat_v4.Rds"
+  input_scRNA: "/home/rstudio/mnt_out/NK_project/Rds/fetahu2023_withNewMetadata.Rds"
+  input_NK: "/home/rstudio/mnt_out/NK_project/Rds/ALL_NK_cluster_withNewMetadata.Rds"
+  input_NB: "/home/rstudio/mnt_out/NK_project/Rds/ALL_NB_cluster_withNewMetadata.Rds"
+  out: "/home/rstudio/mnt_out/NK_project/"
+  GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
+  markers: "/home/rstudio/mnt_resources/MES_ADRN/"
+  metadata: "/home/rstudio/NK_project/metadata/"
+---
+
+PROJECT DESCRIPTION
+
+Identify NK sub-populations in tumor-infiltrated bone marrow rados_et_al_2025 from
+Neuroblastoma patients.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 20)
+options(future.globals.maxSize = 8 * 10^9)
+
+print(params)
+```
+
+```{r echo=FALSE}
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_setup.R")
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_utils.R")
+```
+
+# ___Load data___
+
+```{r eval=FALSE, include=FALSE}
+install.packages('pheatmap')
+install.packages("DOSE")
+remotes::install_github("GuangchuangYu/enrichplot")
+install.packages("ggupset")
+```
+
+```{r}
+suppressPackageStartupMessages(library('pheatmap'))
+suppressPackageStartupMessages(library("DOSE"))
+suppressPackageStartupMessages(library("enrichplot"))
+suppressPackageStartupMessages(library("ggupset"))
+suppressPackageStartupMessages(library("EnhancedVolcano"))
+suppressPackageStartupMessages(library("ggVennDiagram"))
+library("enrichplot")
+```
+
+```{r}
+fetahu2023 <-  readRDS(file = params$input_scRNA)
+
+# subset scRNA-seq data to NB cells only
+NB_cells <- "NB (8)"
+ALL_NB <- subset(fetahu2023, 
+                 idents = NB_cells, 
+                 invert = FALSE)
+
+ALL_NB <- ALL_NB %>% 
+  NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000)
+
+ALL_NB$rados_et_al_2025 <- factor(ALL_NB$rados_et_al_2025)
+```
+
+# ___DEG analysis___
+
+## ___1. ATRXdel vs. ATRXwt___
+
+```{r}
+ALL_NB_DEG <- DElegate::findDE(ALL_NB,
+                               group_column = "group",
+                               order_results = TRUE,
+                               compare_is_ref = FALSE,
+                               replicate_column = "rados_et_al_2025",
+                               compare = "ATRXdel")
+
+ALL_NB_DEG_signif <- subset(ALL_NB_DEG, 
+                            ALL_NB_DEG$padj < 0.1, 
+                            abs(log_fc) > 0.5)
+
+write.table(ALL_NB_DEG, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, "tables/NBcells_DEGs_ATRXwt_vs_ATRXdel.csv"))
+```
+
+```{r}
+ALL_NB_DEG_signif
+```
+
+
+HLA-A
+logFC = 1.67504920
+adj. p-value = 0.47
+
+HLA-B
+logFC = 0.091
+adj. p-value = 1.00
+
+HLA-C
+logFC = 0.44990668
+adj. p-value = 1.00
+
+
+## ___2. ATRXdel vs. MYCNamp___
+
+```{r}
+MYCNamp_DEG <- DElegate::findDE(ALL_NB,
+                               group_column = "group",
+                               order_results = TRUE,
+                               compare_is_ref = TRUE,
+                               replicate_column = "rados_et_al_2025",
+                               compare = "MYCNamp")
+
+MYCNamp_vs_ATRXdel <- subset(MYCNamp_DEG, 
+                        MYCNamp_DEG$group1 == "ATRXdel")
+
+MYCNamp_vs_ATRXdel_signif <- subset(MYCNamp_vs_ATRXdel, 
+                            MYCNamp_vs_ATRXdel$padj < 0.1, 
+                            abs(log_fc) > 0.5)
+
+write.table(MYCNamp_vs_ATRXdel, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, "tables/NBcells_DEGs_MYCNamp_vs_ATRXdel.csv"))
+```
+
+```{r}
+MYCNamp_vs_ATRXdel_signif
+```
+
+
+## ___3. ATRXdel vs. ATRXwtMYCNwt___
+
+```{r}
+ATRXwtMYCNwt_DEG <- DElegate::findDE(ALL_NB,
+                               group_column = "group",
+                               order_results = TRUE,
+                               compare_is_ref = TRUE,
+                               replicate_column = "rados_et_al_2025",
+                               compare = "ATRXwtMYCNwt")
+
+ATRXwtMYCNwt_vs_ATRXdel <- subset(ATRXwtMYCNwt_DEG, 
+                        ATRXwtMYCNwt_DEG$group1 == "ATRXdel")
+
+ATRXwtMYCNwt_vs_ATRXdel_signif <- subset(ATRXwtMYCNwt_vs_ATRXdel, 
+                            ATRXwtMYCNwt_vs_ATRXdel$padj < 0.1, 
+                            abs(log_fc) > 0.5)
+
+write.table(ATRXwtMYCNwt_vs_ATRXdel, 
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE,
+            file = paste0(params$out, "tables/NBcells_DEGs_ATRXwtMYCNwt_vs_ATRXdel.csv"))
+```
+
+```{r}
+ATRXwtMYCNwt_vs_ATRXdel_signif
+```
+
+

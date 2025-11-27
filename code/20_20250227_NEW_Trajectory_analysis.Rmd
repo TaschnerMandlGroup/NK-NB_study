@@ -59,6 +59,8 @@ remotes::install_github("huayc09/SeuratExtend")
 library(reticulate)
 library(SeuratExtend)
 library(tradeSeq)
+library(TSCAN)
+library(scater)
 ```
 
 ```{r}
@@ -522,10 +524,6 @@ The MST is simply an undirected acyclic graph that passes through each centroid
 exactly once and is thus the most parsimonious structure that captures the 
 transitions between clusters. 
 
-```{r}
-library(TSCAN)
-library(scater)
-```
 
 ## ___Whole Fetahu2023 dataset - BM-derived NK cells___
 

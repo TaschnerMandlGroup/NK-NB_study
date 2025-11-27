@@ -535,7 +535,7 @@ saveRDS(NK_ATAC, file = paste0(params$out, "/Rds/fetahu2023_scATAC_NK_processed.
 NK_ATAC <- readRDS(file = paste0(params$out, "/Rds/fetahu2023_scATAC_NK_processed.Rds"))
 ```
 
-# ___Generate pseudobulk coverage files per group___
+## ___Generate pseudobulk coverage files per group___
 
 ```{r}
 # Create meta-clusters
@@ -559,92 +559,194 @@ table(NK_ATAC$group)
 ## ___Generate pseudobulk coverage files per NK cluster___
 
 ```{r}
-Idents(NK_ATAC) <- NK_ATAC$seurat_clusters # these are not the same clusters as in the RNA data!
+NK_ATAC_CTRL <-
+  subset(ATAC_NK, idents = "control")
+
+NK_ATAC_MYCN <-
+  subset(ATAC_NK, idents = "MYCNamp")
+
+NK_ATAC_ATRX <-
+  subset(ATAC_NK, idents = "ATRXmut")
+
+NK_ATAC_WT <-
+  subset(ATAC_NK, idents = "ATRXwtMYCNwt")
+
+frag_path <- "/home/root/mnt_out/NK_project/Rds/feathu2023_ATAC_NKcells_fragments.tsv.gz"
 ```
 
-
-```{r}
+```{r export function v1}
 ExportGroupBigWigs <- function(
-  seurat_obj,
-  group.by,
-  genome = "hg38",
-  min_score = 1,
-  output_dir = "bigwig_output"
-) {
-  library(Signac)
-  library(GenomicRanges)
-  library(rtracklayer)
-  library(Seurat)
-  library(data.table)
-
-  if (length(Fragments(seurat_obj)) == 0) {
-    stop("No fragment object found in Seurat object.")
+    seurat_obj,
+    group.by,
+    genome = "hg38",
+    min_score = 1,
+    output_dir = "bigwig_output") {
+    library(Signac)
+    library(GenomicRanges)
+    library(rtracklayer)
+    library(Seurat)
+    library(data.table)
+  
+    if (length(Fragments(seurat_obj)) == 0) {
+      stop("No fragment object found in Seurat object.")
+    }
+  
+    frag_path <- Fragments(seurat_obj)[[1]]@path
+  
+    if (!file.exists(frag_path)) {
+      stop("Fragment file does not exist: ", frag_path)
+    }
+  
+    if (!dir.exists(output_dir)) {
+      dir.create(output_dir, recursive = TRUE)
+    }
+  
+    groups <- unique(seurat_obj@meta.data[[group.by]])
+  
+    for (grp in groups) {
+      message("Processing group: ", grp)
+      group_cells <- colnames(seurat_obj)[seurat_obj@meta.data[[group.by]] == grp]
+  
+      # Read in fragments and filter by cell barcodes
+      message("Reading fragment file (this may take a bit)...")
+      frag_dt <- fread(
+        frag_path,
+        select = c(1, 2, 3, 4),
+        col.names = c("chr", "start", "end", "cell"),
+        showProgress = FALSE
+      )
+  
+      frag_dt <- frag_dt[cell %in% group_cells]
+  
+      if (nrow(frag_dt) == 0) {
+        warning("No fragments found for group: ", grp)
+        next
+      }
+  
+      gr <- GRanges(
+        seqnames = frag_dt$chr,
+        ranges = IRanges(start = frag_dt$start, end = frag_dt$end)
+      )
+  
+      # Compute coverage
+      cov <- coverage(gr)
+      cov_gr <- as(cov, "GRanges")
+  
+      # Filter low coverage
+      if (!is.null(min_score)) {
+        cov_gr <- cov_gr[cov_gr$score >= min_score]
+      }
+  
+      # Add genome info
+      seqinfo(cov_gr) <- Seqinfo(genome = genome)
+  
+      # Export BigWig
+      out_file <- file.path(output_dir, paste0("NK_ATAC_",grp, ".bw"))
+      export(cov_gr, out_file, format = "BigWig")
+  
+      message("Exported BigWig: ", out_file)
+    }
+  
+    message("Files saved in: ", normalizePath(output_dir))
   }
 
-  frag_path <- Fragments(seurat_obj)[[1]]@path
+```
 
-  if (!file.exists(frag_path)) {
-    stop("Fragment file does not exist: ", frag_path)
-  }
+```{r export function v2}
+ExportGroupBigWigs <- function(
+    seurat_obj,
+    group.by,
+    genome = "hg38",
+    min_score = 1,
+    output_dir = "bigwig_output",
+    frag_path = NULL) {
 
-  if (!dir.exists(output_dir)) {
-    dir.create(output_dir, recursive = TRUE)
-  }
-
-  groups <- unique(seurat_obj@meta.data[[group.by]])
-
-  for (grp in groups) {
-    message("Processing group: ", grp)
-    group_cells <- colnames(seurat_obj)[seurat_obj@meta.data[[group.by]] == grp]
-
-    # Read in fragments and filter by cell barcodes
-    message("Reading fragment file (this may take a bit)...")
-    frag_dt <- fread(
-      frag_path,
-      select = c(1, 2, 3, 4),
-      col.names = c("chr", "start", "end", "cell"),
-      showProgress = FALSE
-    )
-
-    frag_dt <- frag_dt[cell %in% group_cells]
-
-    if (nrow(frag_dt) == 0) {
-      warning("No fragments found for group: ", grp)
-      next
+    library(Signac)
+    library(GenomicRanges)
+    library(rtracklayer)
+    library(Seurat)
+    library(data.table)
+    library(GenomeInfoDb)
+  
+    if (is.null(frag_path)) {
+      if (length(Fragments(seurat_obj)) == 0) {
+        stop("No fragment object found in Seurat object.")
+      }
+      frag_path <- Fragments(seurat_obj)[[1]]@path
+    }
+  
+    if (!file.exists(frag_path)) {
+      stop("Fragment file does not exist: ", frag_path)
     }
 
-    gr <- GRanges(
-      seqnames = frag_dt$chr,
-      ranges = IRanges(start = frag_dt$start, end = frag_dt$end)
+    if (!dir.exists(output_dir))
+        dir.create(output_dir, recursive = TRUE)
+
+    groups <- unique(seurat_obj@meta.data[[group.by]])
+
+    # Read fragments once
+    frag_all <- fread(
+        frag_path,
+        select = c(1,2,3,4),
+        col.names = c("chr","start","end","cell")
     )
 
-    # Compute coverage
-    cov <- coverage(gr)
-    cov_gr <- as(cov, "GRanges")
+    # load genome seqinfo
+    library(BSgenome.Hsapiens.UCSC.hg38)
+    si <- seqinfo(BSgenome.Hsapiens.UCSC.hg38)
+    seqinfo(cov_gr) <- si[names(seqinfo(cov_gr))]
 
-    # Filter low coverage
-    if (!is.null(min_score)) {
-      cov_gr <- cov_gr[cov_gr$score >= min_score]
+    for (grp in groups) {
+        cells <- colnames(seurat_obj)[seurat_obj@meta.data[[group.by]] == grp]
+
+        frag_dt <- frag_all[cell %in% cells]
+        if (nrow(frag_dt) == 0) next
+
+        gr <- GRanges(
+            seqnames = frag_dt$chr,
+            ranges = IRanges(frag_dt$start, frag_dt$end)
+        )
+
+        cov <- coverage(gr)
+        cov_gr <- as(cov, "GRanges")
+
+        if ("score" %in% colnames(mcols(cov_gr)))
+            cov_gr <- cov_gr[cov_gr$score >= min_score]
+
+        seqinfo(cov_gr) <- si[names(seqinfo(cov_gr))]
+
+        sample_name <- seurat_obj@project.name
+        out_file <- file.path(output_dir, paste0(sample_name, "_", grp, ".bw"))
+
+        export(cov_gr, out_file, format = "BigWig")
     }
-
-    # Add genome info
-    seqinfo(cov_gr) <- Seqinfo(genome = genome)
-
-    # Export BigWig
-    out_file <- file.path(output_dir, paste0("NK_ATAC_",grp, ".bw"))
-    export(cov_gr, out_file, format = "BigWig")
-
-    message("Exported BigWig: ", out_file)
-  }
-
-  message("Files saved in: ", normalizePath(output_dir))
 }
 ```
 
 ```{r}
+sample.list <- list(NK_ATAC_CTRL,NK_ATAC_MYCN,NK_ATAC_ATRX,NK_ATAC_WT)
+
+# export per group per NK subset
+
+for (sample in sample.list){
+  Idents(sample) <- sample$seurat_clusters
+  ExportGroupBigWigs(
+  seurat_obj = sample,
+  group.by = "seurat_clusters",
+  genome = "hg38",          
+  min_score = 5,       #  filter for low signal
+  frag_path  = "/home/root/mnt_out/NK_project/Rds/feathu2023_ATAC_NKcells_fragments.tsv.gz",
+  output_dir = paste0(params$out,"Rds/bigwigs/")
+)
+}
+```
+
+```{r}
+# export per group
+
 ExportGroupBigWigs(
   seurat_obj = NK_ATAC,
-  group.by = "group",   
+  group.by = "group",
   genome = "hg38",          
   min_score = 5,       #  filter for low signal
   output_dir = paste0(params$out,"Rds/bigwigs/")
@@ -653,7 +755,7 @@ ExportGroupBigWigs(
 
 # ___TF footprinting in NK cells___
 
-# ___ZEB2 motif___
+## ___ZEB2 motif___
 
 ```{r fig.height=6, fig.width=9}
 library(GenomicRanges)
@@ -1011,3 +1113,6 @@ ggsave(paste0(params$out,"STAT5_footprint_combined.pdf"),
        width = 7, height = 9, 
        dpi = 600, device = cairo_pdf)
 ```
+
+
+## ___TBX21 motif___

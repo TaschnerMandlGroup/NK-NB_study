@@ -214,9 +214,6 @@ ALL_NK <-  readRDS(file = params$input_NK)
 
 # ___Figure 1: Differential abundance and label transfer analysis___
 
-```{r}
-
-```
 
 # ___Figure 2: NK annotation, maturation and trajectory analysis___
 
@@ -762,10 +759,6 @@ dev.off()
 
 # ___Figure 3: DGE and CCC analysis___
 
-```{r}
-
-```
-
 # ___Figure 4: ALCAM, CD6 gene expression___
 
 ```{r}
@@ -807,6 +800,8 @@ ALL_NK_NB@meta.data <- ALL_NK_NB@meta.data %>%
   mutate(cell_type_detailed = ifelse(is.na(NK_subsets), "NB", NK_subsets))
 
 head(ALL_NK_NB@meta.data$cell_type_detailed)
+
+ALL_NK_NB@meta.data$cell_type_detailed <- factor(ALL_NK_NB@meta.data$cell_type_detailed)
 ```
 
 
@@ -1055,7 +1050,403 @@ dev.off()
 
 # ___Figure 5: Secretome analysis___
 
+
+# ___Supp. figure___
+
+```{r fig.height=10, fig.width=10}
+HMC1_genes <- c("HLA-A","HLA-B","HLA-C",
+                "HLA-E","HLA-F","HLA-G")
+HMC1_dotplot <- do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = HMC1_genes,
+           plot.title = "HMC1 genes",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "group_per_NK_subtype",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression") + theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right",
+    plot.title = element_text(size = 18),
+    axis.text.y = element_text(size = 14)
+  ) + scale_y_discrete(limits = rev(HMC1_genes))
+
+
+HMC1_dotplot
+
+pdf(paste0(params$out,"figures/dotplot_HMC1_NK_NB.pdf"),
+    height = 10, width = 10)
+HMC1_dotplot
+dev.off()
+
+HMC1_genes_canonical <- c("HLA-A","HLA-B","HLA-C")
+HMC1_dotplot_canonical <- do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = HMC1_genes_canonical,
+           plot.title = "HMC1 genes",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "group_per_NK_subtype",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+
+HMC1_dotplot_canonical
+
+pdf(paste0(params$out,"figures/dotplot_HMC1_canonical_only_NK_NB.pdf"),
+    height = 10, width = 8)
+HMC1_dotplot_canonical
+dev.off()
+```
+
+```{r fig.height=5, fig.width=14}
+HMC1_vlnplot <- VlnPlot_scCustom(ALL_NK_NB, 
+                 features = HMC1_genes_canonical, 
+                 group.by = "group",
+                 split.by = "cell_type_detailed",
+                 colors_use = COLOR_CODE_CCC_2,
+                 pt.size = 0) 
+
+HMC1_vlnplot
+
+pdf(paste0(params$out,"figures/vlnPlot_HMC1_NK_NB.pdf"),
+    height = 5, width = 14)
+HMC1_vlnplot
+dev.off()
+```
+
+```{r fig.height=5, fig.width=14}
+HMC1_genes_alt <- c("HLA-E","HLA-F","HLA-G")
+HMC1_vlnplot_alt <- VlnPlot_scCustom(ALL_NK_NB, 
+                 features = HMC1_genes_alt, 
+                 group.by = "group",
+                 split.by = "cell_type_detailed",
+                 colors_use = COLOR_CODE_CCC_2,
+                 pt.size = 0) 
+
+HMC1_vlnplot_alt
+
+pdf(paste0(params$out,"figures/vlnPlot_HMC1_alt_NK_NB.pdf"),
+    height = 5, width = 14)
+HMC1_vlnplot_alt
+dev.off()
+```
+
+```{r fig.height=4, fig.width=9}
+genes <- c("HLA-A","HLA-B","HLA-C")
+
+combined_RNA_plot <- VlnPlot_scCustom(ALL_NK_NB, 
+                 features = genes,
+                 group.by = "group",
+                 split.by = "cell_type_detailed",
+                 colors_use = COLOR_CODE_CCC_2,
+                 pt.size = 0) 
+
+combined_RNA_plot
+
+pdf(paste0(params$out,"figures/vlnPlot_HLA-A_HLA-B_HLA-C_v1.pdf"),
+    height = 3, width = 10)
+combined_RNA_plot
+dev.off()
+
+combined_RNA_plot_v2 <- VlnPlot_scCustom(ALL_NK_NB, 
+                 features = genes, 
+                 group.by = "cell_type_detailed",
+                 split.by = "group",
+                 colors_use = COLOR_CODE_GROUP,
+                 pt.size = 0) 
+
+combined_RNA_plot_v2
+
+pdf(paste0(params$out,"figures/vlnPlot_HLA-A_HLA-B_HLA-C_v2.pdf"),
+    height = 3, width = 10)
+combined_RNA_plot_v2
+dev.off()
+```
+
 ```{r}
+genes <- c("HLA-A","HLA-B","HLA-C")
+
+stacked_vln <- Stacked_VlnPlot(ALL_NK_NB, 
+                features = genes, 
+                plot_legend = TRUE,
+                group.by = "group",
+                split.by = "cell_type_detailed",
+                colors_use = COLOR_CODE_CCC_2,
+                x_lab_rotate = 45,vln_linewidth = 0) 
+
+stacked_vln
+
+pdf(paste0(params$out,"figures/stacked_vlnPlot_HLA-A_HLA-B_HLA-C.pdf"),
+    height = 6, width = 6)
+stacked_vln
+dev.off()
+
+stacked_vln_v2 <- Stacked_VlnPlot(ALL_NK_NB, 
+                features = genes, 
+                plot_legend = TRUE,
+                group.by = "cell_type_detailed",
+                split.by = "group",
+                colors_use = COLOR_CODE_GROUP,
+                x_lab_rotate = 45,
+                vln_linewidth = 0) 
+
+stacked_vln_v2
+
+pdf(paste0(params$out,"figures/stacked_vlnPlot_HLA-A_HLA-B_HLA-C_v2.pdf"),
+    height = 6, width = 6)
+stacked_vln_v2
+dev.off()
+```
+
+```{r fig.height = 4, fig.width = 13}
+ALL_NK_NB <- ALL_NK_NB %>% NormalizeData() %>% ScaleData()
+
+comparisons_list <- list(
+  c("ATRXdel", "MYCNamp"),
+  c("ATRXdel", "ATRXwtMYCNwt"),
+  c("MYCNamp", "ATRXwtMYCNwt"),
+    c("control","ATRXdel"),
+  c("control","MYCNamp"),
+  c("control","ATRXwtMYCNwt")
+)
+
+genes <- c("ALCAM", "CD6", "HLA-A","HLA-B","HLA-C")
+
+df_all_genes <- lapply(genes, function(gene) {
+  df_gene <- FetchData(ALL_NK_NB, vars = c(gene, "group", "cell_type_detailed"))
+  colnames(df_gene)[1] <- "expression"
+  df_gene$gene <- gene  
+  return(df_gene)
+}) %>% bind_rows() 
+
+ymin <- min(df_all_genes$expression, na.rm = TRUE)
+ymax <- max(df_all_genes$expression, na.rm = TRUE)
+
+for (gene in genes) {
+  df_gene <- FetchData(ALL_NK_NB, 
+                       vars = c(gene, "group", "cell_type_detailed"))
+  colnames(df_gene)[1] <- "expression"
+
+  p <- ggplot(df_gene, aes(x = group, 
+                           y = expression, 
+                           fill = group)) +
+    geom_violin(trim = FALSE, color = NA) +
+    geom_boxplot(width = 0.1, outlier.shape = NA, color = "black") +
+    coord_cartesian(ylim = c(-2, 6)) +
+    facet_wrap(~cell_type_detailed, nrow = 5, scales = "fixed") +
+    scale_fill_manual(values = COLOR_CODE_GROUP) +
+    stat_compare_means(comparisons = comparisons_list,
+                       method = "wilcox.test", 
+                       label = "p.signif",
+                       p.adjust.method = "BH") +
+    labs(title = paste0("RNA expression of ", gene), 
+         y = "Normalized expression") +
+    theme_minimal(base_size = 16) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+      panel.grid.major = element_blank(),  
+      panel.grid.minor = element_blank(),  
+      panel.border = element_blank(),     
+      strip.background = element_blank(), 
+      strip.text = element_text(face = "bold"),
+      axis.line = element_line(color = "black")
+    )
+
+  print(p)
+  
+  # Save plot to file
+  ggsave(paste0(params$out,"figures/vlnPlot_",gene,"_wStats_one_column.pdf"),
+         plot = p,
+         width = 5, height = 12, dpi = 300)
+}
+
+```
+
+```{r}
+# subset scRNA-seq data to NB cells only
+NB_cells <- "NB (8)"
+ALL_NB <- subset(fetahu2023, 
+                 idents = NB_cells, 
+                 invert = FALSE)
+
+
+comparisons_list <- list(
+  c("ATRXdel", "MYCNamp"),
+  c("ATRXdel", "ATRXwtMYCNwt"),
+  c("MYCNamp", "ATRXwtMYCNwt")
+)
+
+genes <- c("HLA-A","HLA-B","HLA-C", "ALCAM", "CD6")
+
+for (gene in genes) {
+  df_gene <- FetchData(ALL_NB, 
+                       vars = c(gene, "group"))
+  colnames(df_gene)[1] <- "expression"
+
+  p <- ggplot(df_gene, aes(x = group, 
+                           y = expression, 
+                           fill = group)) +
+    geom_violin(trim = FALSE, color = NA) +
+    geom_boxplot(width = 0.001, outlier.shape = NA, color = "black") +
+    scale_fill_manual(values = COLOR_CODE_GROUP) +
+    stat_compare_means(comparisons = comparisons_list,
+                       method = "wilcox.test", 
+                       label = "p.signif",
+                       p.adjust.method = "BH") +
+    labs(title = paste0("RNA expression of ", gene, " on NB cells"), 
+         y = "Normalized expression") +
+    theme_minimal(base_size = 10) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+      panel.grid.major = element_blank(),  
+      panel.grid.minor = element_blank(),  
+      panel.border = element_blank(),     
+      strip.background = element_blank(), 
+      strip.text = element_text(face = "bold"),
+      axis.line = element_line(color = "black")
+    )
+
+  print(p)
+  
+  # Save plot to file
+  ggsave(paste0(params$out,"figures/vlnPlot_",gene,"_wStats_NBcells_smallerBox.pdf"),
+         plot = p,
+         width = 4, height = 3.5, dpi = 300)
+}
+```
+
+
+
+```{r}
+ALL_NK_NB <- AddModuleScore(ALL_NK_NB,
+                            features = HMC1_genes_canonical,
+                            name = "HMC1_genes_moduleScore")
+
+HMC1_moduleScore <- VlnPlot_scCustom(ALL_NK_NB, 
+                 features = "HMC1_genes_moduleScore1", 
+                 group.by = "group",
+                 split.by = "cell_type_detailed",
+                 colors_use = COLOR_CODE_CCC_2,
+                 pt.size = 0) 
+
+HMC1_moduleScore
+
+pdf(paste0(params$out,"figures/vlnPlot_HMC1_moduleScore_NK_NB.pdf"),
+    height = 4, width = 7)
+HMC1_moduleScore
+dev.off()
+```
+
+# ___tSNE plot___
+
+```{r}
+tsne_plot <- do_DimPlot(ALL_NK,
+           group.by = "predicted_NK_type_de.n350",
+           colors.use = COLOR_CODE_MiloR,
+           reduction = "tSNE",
+           pt.size = 1,
+           legend.title = "NK clusters",
+           plot.axes = TRUE,
+           shuffle = TRUE,
+           raster = FALSE,
+           raster.dpi = 300,
+           font.size = 16,
+           plot_cell_borders = FALSE)
+
+tsne_plot
+
+pdf(paste0(params$out,"figures/tsne_plot_NK_cells.pdf"),
+    height = 6, width = 5)
+tsne_plot
+dev.off()
+```
+
+```{r}
+cell_per_cluster_per_group <- as.data.frame(table(ALL_NK$group,
+                                                  ALL_NK$predicted_NK_type_de.n350))
+
+write.csv(cell_per_cluster_per_group,
+          paste0(params$out,"tables/NK_subsets_per_Group.csv"),
+          sep = "\t",quote = FALSE,row.names = FALSE)
+
+cell_per_cluster_per_sample <- as.data.frame(table(ALL_NK$rados_et_al_2025,
+                                                  ALL_NK$predicted_NK_type_de.n350))
+
+write.csv(cell_per_cluster_per_sample,
+          paste0(params$out,"tables/NK_subsets_per_Sample.csv"),
+          sep = "\t",quote = FALSE,row.names = FALSE)
+
+```
+
+```{r }
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = inflammed_NK_genes,
+                         name = "inflammed_NK_score",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 10)
+```
+
+# ___Blanquart et al., 2024___
+
+```{r fig.height=14, fig.width=50}
+inflammed <- do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = "inflammed_NK_score1",
+           plot.title = "inflammed NK genes",
+           plot.subtitle = "Blanquart et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "group_per_NK_subtype",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 12,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
+
+inflammed
+
+pdf(paste0(params$out,"figures/dotplot_inflammed_genes_NK_subtypes_per_group.pdf"),
+    height = 9, width = 7)
+inflammed
+dev.off()
+
+
+do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 45,
+           features = "inflammed_NK_score1",
+           plot.title = "inflammed NK genes",
+           plot.subtitle = "Blanquart et al., 2024",
+           scale = TRUE,
+           legend.length = 5,
+           group.by = "NK_subtype_per_group",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 10,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled RNA expression")
 
 ```
 

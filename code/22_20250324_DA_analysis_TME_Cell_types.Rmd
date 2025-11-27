@@ -60,8 +60,8 @@ fetahu2023 <- readRDS(params$input_scRNA)
 ```
 
 ```{r}
-fetahu2023$cell_type <- fetahu2023$orig.ident
-table(fetahu2023$cell_type, fetahu2023$group)
+fetahu2023$celltype <- fetahu2023$orig.ident
+table(fetahu2023$celltype, fetahu2023$group)
 ```
 
 # ___DA testing___
@@ -70,7 +70,6 @@ If comparing more than two sample / groups, use DA testing with contrasts
 MiloR doesn't use the "original" clusters but rather creates neighborhoods
 based on similar logFC (note the fold change here is the number of cells
 per cell type)
-
 
 ```{r}
 Idents(fetahu2023) <- fetahu2023$orig.ident
@@ -116,16 +115,16 @@ Idents(TME_cells) <- TME_cells$celltype_meta
 
 
 ```{r fig.height=10, fig.width=10}
-percent_cell_type_group <- table(TME_cells$cell_type,
+percent_celltype_group <- table(TME_cells$celltype,
                           TME_cells$group)
 
 # Transform this data in %
-data_percentage <- apply(percent_cell_type_group, 2, 
+data_percentage <- apply(percent_celltype_group, 2, 
                          function(x){x*100/sum(x,na.rm=T)})
 
-percent_cell_type_group_trans <- melt(data_percentage) 
+percent_celltype_group_trans <- melt(data_percentage) 
 
-barplots_cell_types <- ggplot(percent_cell_type_group_trans, 
+barplots_celltypes <- ggplot(percent_celltype_group_trans, 
                              aes(x = Var2, y = value, fill = Var1)) + 
   geom_bar(stat = "identity", position = "stack") +
   theme_void() + 
@@ -138,11 +137,11 @@ barplots_cell_types <- ggplot(percent_cell_type_group_trans,
                                    hjust = 1)) +
   scale_fill_manual(values = COLOR_CODE_FETAHU2023_v2)
 
-barplots_cell_types
+barplots_celltypes
 
-pdf(paste0(params$out,"figures/barplot_ALL_cell_types_per_NB_group.pdf"),
+pdf(paste0(params$out,"figures/barplot_ALL_celltypes_per_NB_group.pdf"),
     height = 10, width = 10)
-barplots_cell_types
+barplots_celltypes
 dev.off()
 
 
@@ -150,16 +149,16 @@ dev.off()
 
 
 ```{r fig.height=10, fig.width=10}
-percent_cell_type_group <- table(TME_cells$celltype_meta,
+percent_celltype_group <- table(TME_cells$celltype_meta,
                           TME_cells$group)
 
 # Transform this data in %
-data_percentage <- apply(percent_cell_type_group, 2, 
+data_percentage <- apply(percent_celltype_group, 2, 
                          function(x){x*100/sum(x,na.rm=T)})
 
-percent_cell_type_group_trans <- melt(data_percentage) 
+percent_celltype_group_trans <- melt(data_percentage) 
 
-barplots_cell_types <- ggplot(percent_cell_type_group_trans, 
+barplots_celltypes <- ggplot(percent_celltype_group_trans, 
                              aes(x = Var2, y = value, fill = Var1)) + 
   geom_bar(stat = "identity", position = "stack") +
   theme_void() + 
@@ -172,11 +171,11 @@ barplots_cell_types <- ggplot(percent_cell_type_group_trans,
                                    hjust = 1)) +
   scale_fill_manual(values = COLOR_CODE_FETAHU2023_META)
 
-barplots_cell_types
+barplots_celltypes
 
-pdf(paste0(params$out,"figures/barplot_ALL_meta_cell_types_per_NB_group.pdf"),
+pdf(paste0(params$out,"figures/barplot_ALL_meta_celltypes_per_NB_group.pdf"),
     height = 10, width = 10)
-barplots_cell_types
+barplots_celltypes
 dev.off()
 
 
@@ -185,47 +184,87 @@ dev.off()
 
 ```{r}
 TME_cells@meta.data$rados_et_al_2025<- factor(TME_cells@meta.data$rados_et_al_2025)
-TME_cells@meta.data$cell_type <- factor(TME_cells@meta.data$cell_type)
-table(TME_cells$cell_type, TME_cells$group)
+TME_cells@meta.data$celltype <- factor(TME_cells@meta.data$celltype)
+TME_per_group <- table(TME_cells$celltype, TME_cells$group)
+TME_per_group
+
+write.table(TME_per_group, file = paste0(params$out,"tables/TME_per_group.csv"))
 ```
+
 
 
 ```{r}
 TME_cells@meta.data$rados_et_al_2025 <- factor(TME_cells@meta.data$rados_et_al_2025)
 TME_cells@meta.data$celltype_meta <- factor(TME_cells@meta.data$celltype_meta)
-table(TME_cells$celltype_meta, TME_cells$group)
+TME_meta_per_group <- table(TME_cells$celltype_meta, TME_cells$group)
+
+TME_meta_per_group
+
+write.table(TME_meta_per_group, 
+            file = paste0(params$out,"tables/TME_meta_per_group.csv"))
 ```
 
 # ___metacluster box plots with stats___
 
-## ___Stats for cell_type clusters___
+## ___Stats for celltype clusters___
 
 ```{r}
-table_cell_type_per_sample <- table(TME_cells$celltype_meta,TME_cells$rados_et_al_2025)
-table_cell_type_per_sample <- as.data.frame(table_cell_type_per_sample)
+table_celltype_per_sample <- table(TME_cells$celltype_meta,TME_cells$rados_et_al_2025)
+write.table(TME_meta_per_group, 
+            file = paste0(params$out,"tables/TME_meta_per_sample.csv"))
 
-table_cell_type_per_sample$group <- gsub("*[0-9]", "", table_cell_type_per_sample$Var2)
-table_cell_type_per_sample
+table_celltype_per_sample <- as.data.frame(table_celltype_per_sample)
+
+table_celltype_per_sample$group <- gsub("*[0-9]", "", table_celltype_per_sample$Var2)
+table_celltype_per_sample
 
 library(dplyr)
 
-table_cell_type_per_sample_percent <- table_cell_type_per_sample %>%
+table_celltype_per_sample_percent <- table_celltype_per_sample %>%
   group_by(Var2, Var1) %>%           
   summarise(total = sum(Freq, na.rm = TRUE)) %>%  
   mutate(percentage = total * 100 / sum(total)) %>% 
   ungroup()
 
-table_cell_type_per_sample_percent <- as.data.frame(table_cell_type_per_sample_percent)
-table_cell_type_per_sample_percent$group <- gsub("*[0-9]", "", table_cell_type_per_sample_percent$Var2)
-table_cell_type_per_sample_percent
+table_celltype_per_sample_percent <- as.data.frame(table_celltype_per_sample_percent)
+table_celltype_per_sample_percent$group <- gsub("*[0-9]", "", table_celltype_per_sample_percent$Var2)
+table_celltype_per_sample_percent
 
-data_wide <- t(table_cell_type_per_sample_percent)
+data_wide <- t(table_celltype_per_sample_percent)
 ```
+
+
+```{r}
+# TME clusters per sample
+
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+
+TME_cells_per_meta_cluster <- ggplot(table_celltype_per_sample_percent, 
+       aes(x = Var2, y = percentage, fill = Var1)) + 
+  geom_bar(stat = "identity", position = "stack") +
+  theme_void() + 
+  labs(x = "", y = "Percentage of cells per cluster", 
+       fill = "Clusters") +  
+  ggtitle("") +
+  theme_minimal(base_size = 22) + 
+  theme(axis.text.x = element_text(angle = 45,
+                                   hjust = 1)) +
+  scale_fill_manual(values = COLOR_CODE_FETAHU2023_META_v2)
+
+
+pdf(paste0(params$out,"figures/barplot_ALL_meta_celltypes_per_sample.pdf"),
+    height = 5, width = 8)
+TME_cells_per_meta_cluster
+dev.off()
+```
+
 
 ### ___NK cells___
 
 ```{r}
-NK_table <- filter(as.data.frame(table_cell_type_per_sample_percent), 
+NK_table <- filter(as.data.frame(table_celltype_per_sample_percent), 
                    Var1 == "NK-cells")
 
 # Perform ANOVA testing
@@ -280,24 +319,76 @@ boxplot1 <- NK_table %>%
   )
 ```
 
+```{r}
+# FINAL PLOT
+
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+
+NK_table <- NK_table %>%
+  mutate(group_label = recode(group,
+                              "C" = "control",
+                              "A" = "ATRXdel",
+                              "M" = "MYCNamp",
+                              "S" = "ATRXwtMYCNwt"),
+         group_label = factor(group_label,
+                              levels = c("control", "ATRXdel", "MYCNamp", "ATRXwtMYCNwt")))
+
+comparisons <- list(c("control", "ATRXdel"),
+                    c("control", "MYCNamp"),
+                    c("control", "ATRXwtMYCNwt"))
+
+
+boxplot1 <- NK_table %>%
+  ggplot(aes(x = group_label, y = percentage, fill = group_label)) +
+  geom_boxplot(outlier.shape = NA, color = NA, width = 0.5) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, color = "black", fatten = 0.9) +
+  stat_summary(fun.data = mean_sdl, fun.args = list(mult = 1),
+               geom = "errorbar", width = 0.2, color = "black") +
+  geom_point(position = position_dodge(width = 0.5), color = "black", size = 2, alpha = 0.7) +
+  stat_compare_means(comparisons = comparisons,
+                     method = "wilcox.test",
+                     p.adjust.method = "BH",
+                     label = "p.format", # "p.signif"
+                     tip.length = 0.01,
+                     size = 3.5) +
+  scale_fill_manual(values = COLOR_CODE_GROUP) +
+  ggtitle("NK cells per group") +
+  xlab("") +
+  ylab("Percentage of NK cells per group") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    strip.background = element_blank(),
+    plot.background = element_blank(),
+    axis.line = element_line(color = "black")
+  )
+```
+
+
 ```{r fig.height=4, fig.width=5}
 boxplot1
 
-pdf(paste0(params$out,"figures/barplot_metaclusters_NKcells_wStats.pdf"),
+pdf(paste0(params$out,"figures/barplot_metaclusters_NKcells_wStats_p-value_FINAL.pdf"),
     height = 4, width = 5)
 boxplot1
 dev.off()
 ```
+
 ```{r fig.height=7, fig.width=7}
-table_cell_type_per_sample_percent <- as.data.frame(table_cell_type_per_sample_percent)
+table_celltype_per_sample_percent <- as.data.frame(table_celltype_per_sample_percent)
 # Ensure group order
-table_cell_type_per_sample_percent$group <- factor(table_cell_type_per_sample_percent$group, 
+table_celltype_per_sample_percent$group <- factor(table_celltype_per_sample_percent$group, 
                                                    levels = c("C", "A", "M", "S"))
 
 my_comparisons <- list(c("A", "C"), c("A", "M"), c("A", "S"))
 
 # Create facetted boxplot with p-values
-boxplot_all <- ggplot(table_cell_type_per_sample_percent, 
+boxplot_all <- ggplot(table_celltype_per_sample_percent, 
                       aes(x = group, y = percentage, fill = group)) +
   geom_boxplot() +
   facet_wrap(~ Var1, scales = "free_y") +
@@ -323,6 +414,7 @@ boxplot_all <- ggplot(table_cell_type_per_sample_percent,
 
 boxplot_all
 ```
+
 ```{r}
 pdf(paste0(params$out,"figures/barplot_metaclusters_wStats.pdf"),
     height = 8, width = 8)
@@ -464,7 +556,7 @@ results <- da_results_ATRXdelvsWT %>%
   arrange(FDR) %>% filter(FDR < 0.1 & abs(logFC) >= 0.5)
 results
 
-da_results_ATRXdelvsWT$cell_type <- as.factor(da_results_ATRXdelvsWT$celltype)
+da_results_ATRXdelvsWT$celltype <- as.factor(da_results_ATRXdelvsWT$celltype)
 
 DA_plot_ATRTXdel_vs_ATRXwt <- plotDAbeeswarm(da_results_ATRXdelvsWT, 
                group.by = "celltype", 

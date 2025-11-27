@@ -21,26 +21,26 @@ suppressPackageStartupMessages(library("SingleR"))
 suppressPackageStartupMessages(library("ggpubr"))
 suppressPackageStartupMessages(library("stats"))
 suppressPackageStartupMessages(library("viridis"))
-suppressPackageStartupMessages(library("DElegate"))
-suppressPackageStartupMessages(library("clusterProfiler"))
-suppressPackageStartupMessages(library("org.Hs.eg.db"))
-suppressPackageStartupMessages(library("enrichplot"))
-suppressPackageStartupMessages(library("AnnotationDbi"))
-suppressPackageStartupMessages(library("pathview"))
-suppressPackageStartupMessages(library("knitr"))
-suppressPackageStartupMessages(library("pathview"))
-suppressPackageStartupMessages(library("aggregateBioVar"))
-suppressPackageStartupMessages(library("SummarizedExperiment"))
+suppressPackageStartupMessages(library("DElegate")) #
+suppressPackageStartupMessages(library("clusterProfiler")) #
+suppressPackageStartupMessages(library("org.Hs.eg.db")) # 
+suppressPackageStartupMessages(library("enrichplot")) #
+suppressPackageStartupMessages(library("AnnotationDbi")) #
+suppressPackageStartupMessages(library("pathview")) #
+suppressPackageStartupMessages(library("knitr")) #
+suppressPackageStartupMessages(library("pathview")) #
+suppressPackageStartupMessages(library("aggregateBioVar")) #
+suppressPackageStartupMessages(library("SummarizedExperiment")) 
 suppressPackageStartupMessages(library("DESeq2"))
-suppressPackageStartupMessages(library("magrittr"))
-suppressPackageStartupMessages(library("pheatmap"))
-suppressPackageStartupMessages(library("ggtext"))
-suppressPackageStartupMessages(library("ggbeeswarm"))
-suppressPackageStartupMessages(library("ggthemes"))
-suppressPackageStartupMessages(library("slingshot"))
-suppressPackageStartupMessages(library("reshape2"))
-suppressPackageStartupMessages(library("EnhancedVolcano"))
-suppressPackageStartupMessages(library("msigdbr"))
+suppressPackageStartupMessages(library("magrittr")) #
+suppressPackageStartupMessages(library("pheatmap")) # 
+suppressPackageStartupMessages(library("ggtext")) #
+suppressPackageStartupMessages(library("ggbeeswarm")) #
+suppressPackageStartupMessages(library("ggthemes")) #
+suppressPackageStartupMessages(library("slingshot")) #
+suppressPackageStartupMessages(library("reshape2")) #
+suppressPackageStartupMessages(library("EnhancedVolcano")) 
+suppressPackageStartupMessages(library("msigdbr")) #
 
 # ___NK sub-set markers___
 
@@ -243,6 +243,15 @@ COLOR_CODE_FETAHU2023_META = c("NB (8)" = "darkgreen",
                           "Progenitor cells" = "brown",  
                           "Unknwon" = "#000000")
 
+COLOR_CODE_FETAHU2023_META_v2 = c("T-cells" = "darkblue",   
+                               "NK-cells" = "#b4d1ee",
+                               "Myeloid cells" = "#FF0080",
+                               "B-cells" = "purple",   
+                               "Dendritic cells" = "#FAA21B",   
+                               "Erythroid cells" = "#CDA646",   
+                               "Progenitor cells" = "brown",  
+                               "Unknwon" = "#000000")
+
 COLOR_CODE_FETAHU2023_v2  = c("NB (8)" = "#006400",                  # darkgreen
                                                "T (5)" = "#00008B",                   # darkblue variants
                                                "T (6)" = "#000099",
@@ -286,6 +295,12 @@ COLOR_CODE_v2 <- c("hNK_Bm1"  = "#6376AE",
                    "hNK_Bm2"  = "#679F8F",
                    "hNK_Bm3"  = "#BF4E4E",
                    "hNK_Bm4"  = "#CDA646")
+
+COLOR_CODE_MiloR <- c("hNK_Bm1"  = "#6376AE",
+                   "hNK_Bm2"  = "#679F8F",
+                   "hNK_Bm3"  = "#BF4E4E",
+                   "hNK_Bm4"  = "#CDA646",
+                   "Mixed" = "#520c61")
 
 COLOR_CODE_CCC <- c("hNK_Bm1"  = "#6376AE",
                    "hNK_Bm2"  = "#679F8F",

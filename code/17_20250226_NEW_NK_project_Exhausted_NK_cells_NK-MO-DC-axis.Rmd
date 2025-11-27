@@ -43,15 +43,15 @@ print(params)
 ```
 
 ```{r load project specific R packages and color code}
-source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_setup.R")
-source("/home/rstudio/scRNA.scATAC/R/00_NK_paper_utils.R")
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_setup.R")
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_utils.R")
 ```
 
 # ___Load data___
 
 ```{r}
 fetahu2023 <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_withNewMetadata.Rds"))
-predicted_labels <- readRDS(file = paste0(params$out,"/Rds/fetahu2023_predicted_NKclusters_from_Crinier2021_de.n=350.Rds"))
+predicted_labels <- readRDS(file = paste0(params$out,"/Rds/",params$input_scRNA))
 ALL_NK <- readRDS(file = paste0(params$out,"/Rds/ALL_NK_cluster_withNewMetadata.Rds"))
 ```
 
@@ -75,6 +75,11 @@ saveRDS(ALL_NK, file = paste0(params$out,"/Rds/ALL_NK_cluster_withNewMetadata.Rd
 
 
 # ___Desensitized/exhausted NK cells___
+
+```{r}
+ALL_NK <- readRDS(file = paste0(params$out,"/Rds/ALL_NK_cluster_withNewMetadata.Rds"))
+```
+
 
 List of genes from NK Cell Exhaustion review paper from 2017 
 DOI: 10.3389/fimmu.2017.00760
@@ -103,7 +108,191 @@ do_DotPlot(ALL_NK,
            viridis.palette = "A",
            viridis.direction = -1
            )
+
+do_DotPlot(ALL_NK, 
+           features = exhausted_NK_genes, 
+           group.by = "NK_subtype_per_group", 
+           scale = TRUE,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1
+           )
+
 ```
+
+
+```{r}
+# Consensus NK cell exhaustion genes from 
+# https://onlinelibrary.wiley.com/doi/epdf/10.1111/imm.13464
+
+exhausted_NK_genes <- list("Increased in NK cell exhaustion" = c("TIGIT", "LAG3", "HAVCR2","PDCD1","KLRC1","CD69",
+                                  "KIR2DL1", "KIR2DL2", "KIR2DL3", "KIR2DL5A",
+                                  "KIR2DL5B", "KIR3DL1", "KIR3DL2", "KIR3DL3"),
+                           "Decreased in NK cell exhaustion" = c("KLRK1","CD226","LAMP1",
+                                    "IFNG","TNF","PRF1",
+                                    "FCGR3A",
+                                    "GZMA","GZMB", "GZMH", "GZMK","GZMM")) 
+
+exhust_NK_plot_v1 <- do_DotPlot(ALL_NK, 
+           features = exhausted_NK_genes, 
+           group.by = "group_per_NK_subtype", 
+           legend.title = "Scaled RNA expression",
+           scale = TRUE,
+           dot.scale = 10,
+           dot_border = NA,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1
+           )
+
+exhust_NK_plot_v1
+
+pdf(file = paste0(params$out,"figures/NK_cell_exhustion_dotplot_perNKgroup.pdf"),
+    width = 9.82,  height = 7.63)
+exhust_NK_plot_v1
+dev.off()
+
+exhust_NK_plot_v2 <- do_DotPlot(ALL_NK, 
+           features = exhausted_NK_genes, 
+           group.by = "NK_subtype_per_group",
+           legend.title = "Scaled RNA expression",
+           scale = TRUE,
+           dot.scale = 10,
+           dot_border = NA,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1)
+
+exhust_NK_plot_v2
+
+pdf(file = paste0(params$out,"figures/NK_cell_exhustion_dotplot_perNBgroup.pdf"),
+    width = 9.82,  height = 7.63)
+exhust_NK_plot_v2
+dev.off()
+
+exhust_NK_plot_v3 <- do_DotPlot(ALL_NK, 
+           features = exhausted_NK_genes, 
+           group.by = "group",
+           legend.title = "Scaled RNA expression",
+           scale = TRUE,
+           dot_border = NA,
+           dot.scale = 10,
+           font.size = 16,
+           dot_border = NA,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1)
+
+exhust_NK_plot_v3
+
+pdf(file = paste0(params$out,"figures/NK_cell_exhustion_dotplot_perAllNK.pdf"),
+    width = 8.38,  height = 3.99)
+exhust_NK_plot_v3
+dev.off()
+
+exhust_NK_plot_v4 <- do_DotPlot(ALL_NK, 
+           features = exhausted_NK_genes, 
+           group.by = "group",
+           legend.title = "Normalized RNA expression",
+           scale = FALSE,
+           dot_border = NA,
+           dot.scale = 10,
+           font.size = 16,
+           number.breaks = 4,
+           use_viridis = TRUE,
+           viridis.palette = "A",
+           viridis.direction = -1)
+
+exhust_NK_plot_v4
+
+pdf(file = paste0(params$out,"figures/NK_cell_exhustion_dotplot_perAllNK_noScaling.pdf"),
+    width = 8.38,  height = 3.99)
+exhust_NK_plot_v4
+dev.off()
+```
+```{r}
+# Module score for NK cell exhaustion (up-regulated genes)
+NK_cell_exhaustion <- c("TIGIT", "LAG3", "HAVCR2","PDCD1","KLRC1","CD69")
+
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = NK_cell_exhaustion,
+                         name = "NK_cell_exhaustion_score",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 10)
+
+moduleScore_plot <- do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 90,
+           features = "NK_cell_exhaustion_score1",
+           plot.title = "NK cell exhaustion score",
+           plot.subtitle = "Upregulated genes",
+           scale = TRUE,
+           legend.length = 10,
+           group.by = "group_per_NK_subtype",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled module score")
+
+moduleScore_plot
+
+pdf(file = paste0(params$out,"figures/NK_cell_exhustion_moduleScore.pdf"),
+    width = 7,  height =10)
+moduleScore_plot
+dev.off()
+```
+
+```{r}
+# Module score for NK cell exhaustion (up-regulated genes)
+NK_cell_exhaustion_down <- c("KLRK1","CD226","LAMP1","IFNG","TNF","PRF1", "FCGR3A",
+                        "GZMA","GZMB", "GZMH", "GZMK","GZMM")
+
+ALL_NK <- AddModuleScore(ALL_NK, 
+                         features = NK_cell_exhaustion_down,
+                         name = "NK_cell_exhaustion_down",
+                         seed = "2805",
+                         slot = "data",
+                         nbin = 10)
+
+moduleScore_plot_down <- do_DotPlot(sample = ALL_NK,
+           axis.text.x.angle = 90,
+           features = "NK_cell_exhaustion_down1",
+           plot.title = "NK cell exhaustion score",
+           plot.subtitle = "Downregulated genes",
+           scale = TRUE,
+           legend.length = 10,
+           group.by = "group_per_NK_subtype",
+           use_viridis = TRUE,
+           number.breaks = 7,
+           viridis.direction = -1,
+           viridis.palette = "magma",
+           font.size = 18,
+           dot.scale = 15,
+           dot_border = FALSE, 
+           legend.position = "right",
+           legend.title = "Scaled module score")
+
+moduleScore_plot_down
+
+pdf(file = paste0(params$out,"figures/NK_cell_exhustion_moduleScore_downGenes.pdf"),
+    width = 7,  height =10)
+moduleScore_plot_down
+dev.off()
+```
+
 
 # ___CCC analysis___
 

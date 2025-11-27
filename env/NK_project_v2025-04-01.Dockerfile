@@ -114,6 +114,9 @@ RUN R -e "BiocManager::install(c('scater', 'zellkonverter','SCpubr', 'scCustomiz
 'statmod', 'ggpubr', 'reshape2', 'TSCAN', 'scater', 'org.Hs.eg.db', 'enrichplot', \
 'AnnotationDbi', 'pathview', 'aggregateBioVar'))"
 
+# dependencies
+RUN R -e "BiocManager::install(c('sva','genefilter'))"
+
 # CCC tools
 RUN R -e "remotes::install_github(repo = 'saeyslab/nichenetr')"
 RUN R -e "remotes::install_github(repo = 'saeyslab/multinichenetr')"
