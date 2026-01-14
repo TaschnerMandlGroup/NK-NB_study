@@ -1,0 +1,1863 @@
+---
+title: "NK project: snATAC-seq analysis"
+author: "Dr. Sara Wernig-Zorc"
+date: "`r format(Sys.time(), '%B %Y')`"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  out: "/home/rstudio/mnt_out/"
+  anno: "/home/rstudio/mnt_resources/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 80)
+options(future.globals.maxSize = 80 * 10^9)
+options(Seurat.object.assay.version = "v5")
+print(params)
+```
+
+```{r eval=FALSE, include=FALSE}
+remotes::install_github("GuangchuangYu/enrichplot")
+```
+
+```{r load project specific R packages and color code}
+source("/home/rstudio/00_NK_paper_setup.R")
+source("/home/rstudio/00_NK_paper_utils.R")
+```
+
+```{r}
+readRDS(NK_ATAC, file = paste0(params$out, "/Rds/fetahu2023_scATAC_NK_processed.Rds"))
+```
+
+"scOpen"      # latent low-rank embedding from scOpen
+"umap_scopen" # a UMAP embedding already computed from scOpen
+"lsi"         # LSI embedding from Signac
+"umap"        # another UMAP embedding (likely from LSI)
+
+```{r}
+reduction.use <- "scOpen"    
+dims.use <- 2:30             
+
+NK_ATAC <- RunUMAP(
+  NK_ATAC,
+  reduction = reduction.use,
+  dims = dims.use
+)
+
+NK_ATAC <- FindNeighbors(object = NK_ATAC, 
+                         k.param = 20,
+                         reduction = reduction.use, 
+                         dims = dims.use, 
+                         return.neighbor = TRUE)
+
+NK_ATAC <- FindClusters(object = NK_ATAC, 
+                        verbose = FALSE, 
+                        resolution = 0.2,
+                        algorithm = 3)
+
+DimPlot(object = NK_ATAC, label = TRUE) + NoLegend()
+```
+
+```{r testing functions}
+run_neighbors <- function(obj, k, reduction, dims) {
+  obj <- FindNeighbors(
+    obj,
+    reduction = reduction,
+    dims = dims,
+    k.param = k,
+    return.neighbor = TRUE
+  )
+  return(obj)
+}
+
+run_clustering_resolutions <- function(obj, resolutions, algorithm = 3) {
+  for (res in resolutions) {
+    obj <- FindClusters(
+      obj,
+      resolution = res,
+      algorithm = algorithm,
+      verbose = FALSE
+    )
+  }
+  return(obj)
+}
+
+compute_connectivity <- function(obj, graph.name) {
+  g <- obj@graphs[[graph.name]]
+  mean(Matrix::rowSums(g > 0))
+}
+
+compute_trustworthiness <- function(obj, reduction, dims, k) {
+  emb <- Embeddings(obj, reduction)[, dims]
+  # (Insert trustworthiness function from previous message)
+  trustworthiness(emb, k = k)
+}
+```
+
+```{r}
+k.values    <- c(15, 20, 30, 40, 50)
+res.values  <- seq(0.1, 2.0, by = 0.1)
+
+results.list <- list()
+
+for (k in k.values) {
+  message("Running k = ", k)
+
+  obj_k <- run_neighbors(
+    obj = NK_ATAC,
+    k = k,
+    reduction = reduction.use,
+    dims = dims.use
+  )
+
+  obj_k <- run_clustering_resolutions(
+    obj = obj_k,
+    resolutions = res.values
+  )
+
+  results.list[[paste0("k_", k)]] <- obj_k
+}
+```
+
+```{r}
+library(clustree)
+
+obj_k20 <- results.list[["k_20"]]
+clustree(obj_k20)
+```
+
+```{r}
+NK_ATAC <- FindNeighbors(object = NK_ATAC, 
+                         k.param = 20,
+                         reduction = reduction.use, 
+                         dims = dims.use, 
+                         return.neighbor = TRUE)
+
+NK_ATAC <- FindClusters(object = NK_ATAC, 
+                        verbose = FALSE, 
+                        resolution = 0.3,
+                        algorithm = 3)
+
+DimPlot(object = NK_ATAC, label = TRUE) + NoLegend()
+```
+
+
+```{r}
+#saveRDS(NK_ATAC, file = paste0(params$out, "/Rds/fetahu2023_scATAC_NK_processed_v2025-12-09.Rds"))
+```
+
+# ___NK subset composition barplots___
+
+```{r}
+library(reshape2)
+
+Idents(NK_ATAC) <- NK_ATAC$seurat_clusters
+
+NK_ATAC$group <- as.factor(NK_ATAC$group)
+NK_ATAC$seurat_clusters <- as.factor(NK_ATAC$seurat_clusters)
+percent_group <- table(NK_ATAC$seurat_clusters, NK_ATAC$group)
+
+
+
+# Transform this data in %
+data_percentage <- apply(percent_group, 2, 
+                         function(x){x*100/sum(x,na.rm=T)})
+
+percent_group_trans <- reshape2::melt(data_percentage) 
+
+percent_group_trans$Var1 <- factor(percent_group_trans$Var1)
+
+COLOR_CODE_BAR_PLOT <- c("0" = "#0A369D",
+                         "1" = "#8AB17D",
+                         "2" = "#E05263",
+                         "3" = "#F4A261")
+
+ggplot(percent_group_trans, aes(x = Var2, y = value, fill = Var1)) + 
+  geom_bar(stat = "identity", position = "stack") +
+  theme_void() + 
+  labs(x = "", y = "Percentage of NK cells assigned to each sub-cluster", 
+       fill = "NK clusters") +  
+  ggtitle("Clustered Stacked Bar Plot of NK Groups") +
+  theme(axis.text.x = element_text(angle = 0, 
+                                   color = "black",
+                                   size = 16),
+        axis.text.y = element_text(angle = 0, 
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 16),
+        legend.text = element_text(angle = 0, 
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 18),
+        axis.title.x = element_text(size = 16,
+                                    color = "black",),                        
+        axis.title.y = element_text(size = 16,
+                                    color = "black",angle = 90),                 
+        legend.title = element_text(size = 16,
+                                    color = "black"),
+        title = element_text(size = 20,
+                                    color = "black")) +  
+  scale_fill_manual(values = COLOR_CODE_BAR_PLOT) 
+```
+
+```{r}
+NK_ATAC <- readRDS(file = paste0(params$out, "/Rds/fetahu2023_scATAC_NK_processed_v2025-12-09.Rds"))
+```
+
+
+```{r}
+# extrapolating RNA activity based on chromatin accessibility of the corresponding promoter regions
+gene.activities <- GeneActivity(NK_ATAC)
+
+# add the gene activity matrix to the Seurat object as a new assay and normalize it
+NK_ATAC[['RNA']] <- CreateAssayObject(counts = gene.activities)
+NK_ATAC <- NormalizeData(
+  object = NK_ATAC,
+  assay = 'RNA',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(NK_ATAC$nCount_RNA)
+)
+```
+
+```{r}
+DefaultAssay(NK_ATAC) <- 'RNA'
+
+FeaturePlot(
+  object = NK_ATAC,
+  features = c("ZEB2","KLF2"),
+  pt.size = 0.3,
+  max.cutoff = 'q25',
+  ncol = 2)
+```
+
+```{r fig.height=20, fig.width=20}
+FeaturePlot(
+  object = NK_ATAC,
+  features = TFs,
+  pt.size = 0.3,
+  max.cutoff = 'q75',
+  ncol = 4)
+```
+
+# ___Differentially accessible peaks between NK sub-types___
+
+## ___Add promoter, enhancer regions___
+
+https://screen.encodeproject.org/
+
+Promoter-like (PLS)
+Proximal enhancer-like (pELS)
+Distal enhancer-like (dELS)
+CTCF-only
+DNase-H3K4me3
+
+
+```{r}
+library(AnnotationHub)
+library(EnsDb.Hsapiens.v86)
+library(rtracklayer)
+library(data.table)
+
+bed_file <- "/home/rstudio/mnt_resources/regulatory_regions/GRCh38-cCREs.bed"
+# Read all columns as character to avoid scan() guessing numeric
+bed_df <- fread(
+  bed_file,
+  header = FALSE,
+  sep = "\t",
+  colClasses = "character"
+) 
+
+
+colnames(bed_df)[1:3] <- c("chr", "start", "end")
+
+bed_gr <- makeGRangesFromDataFrame(
+  bed_df,
+  seqnames.field      = "chr",
+  start.field         = "start",
+  end.field           = "end",
+  keep.extra.columns  = TRUE
+)
+
+bed_gr
+
+enhancer_terms <- c("dELS", "pELS", "DNase-H3K4me3")
+
+bed_gr$region_type[bed_gr$V6 %in% enhancer_terms] <- "Enhancer"
+bed_gr$region_type[bed_gr$V6 == "PLS"] <- "Promoter"
+
+Annotation(NK_ATAC) <- bed_gr
+Annotation(NK_ATAC)
+```
+
+## ___Compare groups___
+
+if we compare every peak, we get none significant due to multiple testing correction
+(> 300k tests)
+
+```{r}
+Idents(NK_ATAC) <- NK_ATAC$group
+DefaultAssay(NK_ATAC) <- "peaks"
+table(NK_ATAC$seurat_clusters, NK_ATAC$group)
+
+find_DA_within_cluster <- function(obj, cluster_id, group1, group2,
+                                   latent.vars = "nCount_peaks") {
+  # subset to one NK cluster
+  obj_sub <- subset(obj, subset = seurat_clusters == cluster_id)
+  Idents(obj_sub) <- "group"
+  
+  da <- FindMarkers(
+    obj_sub,
+    ident.1      = group1,
+    ident.2      = group2,
+    test.use     = "LR",
+    only.pos     = FALSE,
+    min.pct      = 0.1,
+    logfc.threshold = 0.5
+  )
+  
+  da$peak <- rownames(da)
+  da$NK_cluster <- cluster_id
+  da$group1 <- group1
+  da$group2 <- group2
+  da
+}
+
+groups <- levels(NK_ATAC$group)
+clusters <- levels(NK_ATAC$seurat_clusters)
+g1 <- "ATRXmut"
+g2 <- "control"
+da_list <- list()
+
+for (cl in clusters) {
+    da <- find_DA_within_cluster(NK_ATAC, cl, g1,g2)
+    da_list[[paste0("cl", cl, "_", g1, "_vs_", g2)]] <- da
+}
+
+# Example: DA peaks for NK cluster 0, group A vs B
+da_list[["cl3_ATRXmut_vs_control"]] %>% dplyr::filter(p_val_adj < 0.05) 
+```
+
+```{r}
+DefaultAssay(NK_ATAC) <- "peaks"
+
+
+NK_ATAC <- FindTopFeatures(NK_ATAC, assay = "peaks", min.cutoff = "q90")
+
+top_var_regions <- VariableFeatures(NK_ATAC)
+all_peaks <- granges(NK_ATAC)  # all peaks
+```
+
+## ___Find motifs in DARs___
+
+
+
+
+
+# ___Pseudobulk analysis___
+
+```{r}
+NK_ATAC$bulk_id <- paste0( NK_ATAC$group,"_", NK_ATAC$seurat_clusters )
+NK_ATAC$bulk_id <- factor(NK_ATAC$bulk_id)
+
+# Aggregate pseudobulk counts 
+pb <- AggregateExpression(
+  NK_ATAC,
+  assays = "peaks",
+  group.by = "bulk_id",
+  return.seurat = FALSE
+)
+pb_counts <- pb$peaks
+
+bulk_meta <- data.frame(bulk_id = colnames(pb_counts))
+
+bulk_meta$NK_clusters <- c("0","1","2","3",
+                           "0","1","2","3",
+                           "0","1","2","3",
+                           "0","1","2","3")
+bulk_meta$group <- c("ATRXdel","ATRXdel","ATRXdel","ATRXdel",
+                     "ATRXwtMYCNwt","ATRXwtMYCNwt","ATRXwtMYCNwt","ATRXwtMYCNwt",
+                     "control","control","control","control",
+                     "MYCNamp","MYCNamp","MYCNamp","MYCNamp")
+
+bulk_meta$NK_clusters <- factor(bulk_meta$NK_clusters)
+bulk_meta$group      <- factor(bulk_meta$group, ordered = FALSE,
+                               levels = c("control","ATRXdel","MYCNamp","ATRXwtMYCNwt"))
+bulk_meta$group <- relevel(bulk_meta$group, ref = "ATRXdel")
+bulk_meta
+
+dds <- DESeqDataSetFromMatrix(
+  countData = pb_counts,
+  colData   = bulk_meta,
+  design    = ~ group
+)
+
+
+library(edgeR)
+
+keep <- filterByExpr(dds, group = dds$group)
+dds <- dds[keep,]
+
+dds <- calcNormFactors(dds)
+
+design <- model.matrix(~ group, data = dds$samples)
+dds <- estimateDisp(dds, design)
+
+fit <- glmFit(dds, design)
+lrt <- glmLRT(fit, coef = 2) 
+
+DARs <- as.data.frame(topTags(lrt, n = Inf))
+head(DARs)
+
+DARs_signif <- DARs %>% filter(FDR < 0.05)
+granges()
+```
+
+```{r}
+library(stringr)
+
+dar_tbl <- DARs_signif %>%
+tibble::rownames_to_column("region") %>%
+tidyr::separate(region, into = c("chr", "start", "end"), sep = "-", convert = TRUE)
+dar_gr <- GRanges(
+seqnames = dar_tbl$chr,
+ranges   = IRanges(start = dar_tbl$start, end = dar_tbl$end),
+mcols    = dar_tbl %>% select(-chr, -start, -end)
+)
+
+table(bed_gr$region_type)
+hits <- findOverlaps(dar_gr, bed_gr, ignore.strand = TRUE)
+hits
+
+# annotate
+annotated <- data.frame(
+  #dar_id     = dar_gr[queryHits(hits)],
+  seqnames   = as.character(seqnames(dar_gr)[queryHits(hits)]),
+  dar_start  = start(dar_gr)[queryHits(hits)],
+  dar_end    = end(dar_gr)[queryHits(hits)],
+  logFC      = dar_gr$mcols.logFC[queryHits(hits)],
+  FDR        = dar_gr$mcols.FDR[queryHits(hits)],
+  
+  RE_type    = bed_gr$region_type[subjectHits(hits)],
+  RE_id      = bed_gr$V5[subjectHits(hits)],
+  RE_feature = bed_gr$V6[subjectHits(hits)]
+)
+
+annotated
+
+table(annotated$RE_feature)
+
+# --------------------------------------- #
+gr <- GRanges(
+    seqnames = annotated$seqnames,
+    ranges   = IRanges(start = annotated$dar_start,
+                       end   = annotated$dar_end),
+    mcols    = annotated
+  )
+
+gr
+
+hits <- findOverlaps(gr, Annotation(NK_ATAC), ignore.strand = TRUE)
+hits
+
+if (length(hits) > 0) {
+    gene_df <- data.frame(
+      index       = queryHits(hits),
+      gene_seq    = as.character(seqnames(Annotation(NK_ATAC))[subjectHits(hits)]),
+      gene_start  = start(Annotation(NK_ATAC))[subjectHits(hits)],
+      gene_end    = end(Annotation(NK_ATAC))[subjectHits(hits)],
+      mcols(Annotation(NK_ATAC))[subjectHits(hits), , drop = FALSE] %>% as.data.frame()
+    )
+
+    # Many-to-one mapping: join back using row index
+    re_out <- annotated %>%
+      mutate(index = row_number()) %>%
+      left_join(gene_df, by = "index") %>%
+      select(-index)
+
+  } else {
+
+    # If no gene hits, append NA columns for gene annotations
+    gene_meta_cols <- colnames(mcols(Annotation(NK_ATAC)))
+
+    re_out <- annotated %>%
+      mutate(
+        gene_seq   = NA,
+        gene_start = NA,
+        gene_end   = NA
+      ) %>%
+      bind_cols(
+        as.data.frame(matrix(
+          NA,
+          nrow = nrow(annotated),
+          ncol = length(gene_meta_cols),
+          dimnames = list(NULL, gene_meta_cols)
+        ))
+      )
+  }
+
+table(re_out$gene_name)
+```
+
+```{r}
+gene_of_interest <- "ZNF215"
+
+gene_of_interest <- TFs[2]
+
+CoveragePlot(peaks = TRUE,
+             group.by = "bulk_id",
+             window = 2000,
+             object = NK_ATAC,
+             region = gene_of_interest,
+             extend.upstream = 10000,
+             extend.downstream = 5000
+)
+
+CoveragePlot(peaks = TRUE,
+             group.by = "group",
+             window = 2000,
+             object = NK_ATAC,
+             region = gene_of_interest,
+             extend.upstream = 10000,
+             extend.downstream = 5000
+)
+```
+
+# ___TF footprinting___
+
+```{r}
+library(motifmatchr)
+library(JASPAR2024)
+library(TFBSTools)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(RSQLite)
+
+JASPAR2024 <- JASPAR2024()
+con24 <- RSQLite::dbConnect(RSQLite::SQLite(), db(JASPAR2024))
+
+# extract position frequency matrices for the motifs
+pwm <- getMatrixSet(
+  x = con24, # why does JASPAR2024 not work?
+  opts = list(species = 9606, all_versions = TRUE)
+)
+pwm
+
+# add motif information
+NK_ATAC <- AddMotifs(NK_ATAC, genome = BSgenome.Hsapiens.UCSC.hg38, pfm = pwm)
+
+# gather the footprinting information for set of motifs
+NK_ATAC <- Footprint(
+  object = NK_ATAC,
+  motif.name = "TBX21",
+  genome = BSgenome.Hsapiens.UCSC.hg38
+)
+
+# plot the TF footprints
+PlotFootprint(NK_ATAC, 
+              group.by = "bulk_id",
+              features = "TBX21")
+```
+
+
+## ___ZNF215 motif___
+
+```{r}
+ZNF215_motif <- "/home/rstudio/mnt_resources/TFs/MA2547.1_ZNF215.jaspar"
+
+# Read PFM(s) 
+pfm_list <- readJASPARMatrix(ZNF215_motif, matrixClass = "PFM")
+pfm_znf215 <- pfm_list[[1]]
+
+# create PFMatrix from matrix
+ZNF215_pwm <- PFMatrix(
+  ID = "ZNF215",
+  name = "ZNF215",
+  matrixClass = "PFM",
+  strand = "+",
+  bg = c(A = 0.25, C = 0.25, G = 0.25, T = 0.25),
+  profileMatrix = as.matrix(pfm_znf215)
+)
+
+pwm_znf215 <- toPWM(pfm_znf215)
+
+pfm_list <- PFMatrixList(pfm_znf215)
+names(pfm_list) <- pfm_znf215@name  
+
+NK_ATAC <- AddMotifs(
+  object = NK_ATAC,
+  genome = BSgenome.Hsapiens.UCSC.hg38,
+  pfm    = pfm_list
+)
+
+NK_ATAC <- Footprint(
+  object    = NK_ATAC,
+  genome    = BSgenome.Hsapiens.UCSC.hg38,
+  motif.name = "ZNF215",    
+  assay     = "peaks"     
+)
+
+PlotFootprint(NK_ATAC, 
+              group.by = "bulk_id",
+              features = "ZNF215",
+              assay     = "peaks")
+
+PlotFootprint(NK_ATAC, 
+              group.by = "group",
+              features = "ZNF215",
+              assay     = "peaks",)
+```
+
+# ___Label transfer from scRNA-seq data___
+
+two options: Original reference data crinier2021 OR fetahu2023 RNA data w/Label transfer from crinier2021 
+
+```{r}
+NK_ATAC <- readRDS(file = paste0(params$out, "/Rds/fetahu2023_scATAC_NK_processed_v2025-12-09.Rds"))
+```
+
+```{r}
+frag_file <- paste0(params$out, "/Rds/feathu2023_ATAC_NKcells_fragments.tsv.gz")
+fr_obj <- CreateFragmentObject(path = frag_file, cells = colnames(NK_ATAC))
+NK_ATAC[["peaks"]]@fragments <- list(fr_obj)
+
+# fix fragment file
+frag <- Fragments(NK_ATAC)[[1]]@path
+file.exists(frag)
+file.exists(paste0(frag, ".tbi"))
+```
+
+```{r}
+# Compute gene activity from peaks
+gene.activities <- GeneActivity(NK_ATAC)
+
+# Add as a new assay
+NK_ATAC[["GeneActivity"]] <- CreateAssayObject(counts = gene.activities)
+DefaultAssay(NK_ATAC) <- "GeneActivity"
+
+# Standard normalization on gene activity
+NK_ATAC <- NormalizeData(NK_ATAC)
+NK_ATAC <- FindVariableFeatures(NK_ATAC, nfeatures = 10000)
+NK_ATAC <- ScaleData(NK_ATAC)
+```
+
+```{r}
+NK_RNA <- readRDS(paste0(params$out, "/Rds/ALL_NK_cluster_withNewMetadata.Rds"))
+
+NK_RNA <- NormalizeData(NK_RNA)
+NK_RNA <- FindVariableFeatures(NK_RNA, nfeatures = 5000)
+NK_RNA <- ScaleData(NK_RNA)
+
+DefaultAssay(NK_RNA) <- "RNA"
+DefaultAssay(NK_ATAC)  <- "GeneActivity"  # for anchoring
+
+# Intersect features
+common.features <- intersect(
+  VariableFeatures(NK_RNA),
+  rownames(NK_ATAC[["GeneActivity"]])
+)
+length(common.features)
+```
+
+```{r}
+transfer.anchors <- FindTransferAnchors(
+  reference        = NK_RNA,
+  query            = NK_ATAC,
+  features         = common.features,
+  reference.assay  = "RNA",
+  query.assay      = "GeneActivity",
+  reduction        = "cca",     # CCA between RNA and gene activity
+  dims             = 2:30
+)
+
+# Use LSI as weight reduction (chromatin space) for the ATAC object
+DefaultAssay(NK_ATAC) <- "peaks"  # ensure LSI is linked to this assay
+
+predictions <- TransferData(
+  anchorset        = transfer.anchors,
+  refdata          = NK_RNA$predicted_NK_type_de.n350,  
+  weight.reduction = NK_ATAC[["lsi"]],
+  dims             = 2:30
+)
+
+# Add predicted labels and scores
+NK_ATAC <- AddMetaData(NK_ATAC, metadata = predictions)
+
+# Inspect metadata columns
+head(NK_ATAC@meta.data)
+```
+
+```{r}
+DimPlot(NK_ATAC,group.by = "predicted.id")
+
+table(NK_ATAC$predicted.id,NK_ATAC$group)
+table(NK_ATAC$predicted.id,NK_ATAC$seurat_clusters)
+```
+
+```{r}
+Idents(NK_ATAC) <- "predicted.id"
+
+VlnPlot(NK_ATAC, features = "prediction.score.max", pt.size = 0)
+
+# Filter out low-confidence assignments, if desired
+high_conf_cells <- WhichCells(NK_ATAC, expression = prediction.score.max > 0.6)
+atac_nk_high_conf <- subset(NK_ATAC, cells = high_conf_cells)
+
+DimPlot(NK_ATAC, reduction = "umap_scopen", group.by = "predicted.id")
+```
+
+```{r}
+library(reshape2)
+
+Idents(NK_ATAC) <- NK_ATAC$predicted.id
+
+NK_ATAC$group <- as.factor(NK_ATAC$group)
+NK_ATAC$predicted.id <- as.factor(NK_ATAC$predicted.id)
+percent_group <- table(NK_ATAC$predicted.id, NK_ATAC$group)
+
+
+# Transform this data in %
+data_percentage <- apply(percent_group, 2, 
+                         function(x){x*100/sum(x,na.rm=T)})
+
+percent_group_trans <- reshape2::melt(data_percentage) 
+
+percent_group_trans$Var1 <- factor(percent_group_trans$Var1)
+
+ggplot(percent_group_trans, aes(x = Var2, y = value, fill = Var1)) + 
+  geom_bar(stat = "identity", position = "stack") +
+  theme_void() + 
+  labs(x = "", y = "Percentage of NK cells assigned to each sub-cluster", 
+       fill = "NK clusters") +  
+  ggtitle("Clustered Stacked Bar Plot of NK Groups") +
+  theme(axis.text.x = element_text(angle = 0, 
+                                   color = "black",
+                                   size = 16),
+        axis.text.y = element_text(angle = 0, 
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 16),
+        legend.text = element_text(angle = 0, 
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 18),
+        axis.title.x = element_text(size = 16,
+                                    color = "black",),                        
+        axis.title.y = element_text(size = 16,
+                                    color = "black",angle = 90),                 
+        legend.title = element_text(size = 16,
+                                    color = "black"),
+        title = element_text(size = 20,
+                                    color = "black")) +  
+  scale_fill_manual(values = COLOR_CODE_v2) 
+```
+
+
+```{r}
+Idents(NK_ATAC) <- NK_ATAC$predicted.id
+DefaultAssay(NK_ATAC) <- "peaks"
+table(NK_ATAC$predicted.id, NK_ATAC$group)
+
+find_DA_within_cluster <- function(obj, cluster_id, group1, group2,
+                                   latent.vars = "nCount_peaks") {
+  # subset to one NK cluster
+  obj_sub <- subset(obj, subset = predicted.id == cluster_id)
+  Idents(obj_sub) <- "group"
+  
+  da <- FindMarkers(
+    obj_sub,
+    ident.1      = group1,
+    ident.2      = group2,
+    test.use     = "LR",
+    only.pos     = FALSE,
+    min.pct      = 0.1,
+    logfc.threshold = 0.5
+  )
+  
+  da$peak <- rownames(da)
+  da$NK_cluster <- cluster_id
+  da$group1 <- group1
+  da$group2 <- group2
+  da
+}
+
+groups <- levels(NK_ATAC$group)
+clusters <- levels(NK_ATAC$predicted.id)
+g1 <- "ATRXmut"
+g2 <- "control"
+da_list <- list()
+
+for (cl in clusters) {
+    da <- find_DA_within_cluster(NK_ATAC, cl, g1,g2)
+    da_list[[paste0("cl", cl, "_", g1, "_vs_", g2)]] <- da
+}
+
+#  DA peaks for NK cluster 3, group A vs B
+DARs_hNK_Bm3 <- da_list[["clhNK_Bm3_ATRXmut_vs_control"]] %>% dplyr::filter(p_val_adj < 0.05) 
+```
+
+
+
+```{r}
+library(stringr)
+
+dar_tbl <- DARs_hNK_Bm3 %>%
+tibble::rownames_to_column("region") %>%
+tidyr::separate(region, into = c("chr", "start", "end"), sep = "-", convert = TRUE)
+
+dar_gr <- GRanges(
+seqnames = dar_tbl$chr,
+ranges   = IRanges(start = dar_tbl$start, end = dar_tbl$end),
+mcols    = dar_tbl %>% select(-chr, -start, -end)
+)
+
+table(bed_gr$region_type)
+hits <- findOverlaps(dar_gr, bed_gr, ignore.strand = TRUE)
+hits
+
+# annotate
+annotated <- data.frame(
+  #dar_id     = dar_gr[queryHits(hits)],
+  seqnames   = as.character(seqnames(dar_gr)[queryHits(hits)]),
+  dar_start  = start(dar_gr)[queryHits(hits)],
+  dar_end    = end(dar_gr)[queryHits(hits)],
+  logFC      = dar_gr$mcols.avg_log2FC[queryHits(hits)],
+  p.adj        = dar_gr$mcols.p_val_adj[queryHits(hits)],
+  
+  RE_type    = bed_gr$region_type[subjectHits(hits)],
+  RE_id      = bed_gr$V5[subjectHits(hits)],
+  RE_feature = bed_gr$V6[subjectHits(hits)]
+)
+
+annotated
+
+table(annotated$RE_feature)
+
+# --------------------------------------- #
+gr <- GRanges(
+    seqnames = annotated$seqnames,
+    ranges   = IRanges(start = annotated$dar_start,
+                       end   = annotated$dar_end),
+    mcols    = annotated
+  )
+
+gr
+
+hits <- findOverlaps(gr, Annotation(NK_ATAC), ignore.strand = TRUE)
+hits
+
+if (length(hits) > 0) {
+    gene_df <- data.frame(
+      index       = queryHits(hits),
+      gene_seq    = as.character(seqnames(Annotation(NK_ATAC))[subjectHits(hits)]),
+      gene_start  = start(Annotation(NK_ATAC))[subjectHits(hits)],
+      gene_end    = end(Annotation(NK_ATAC))[subjectHits(hits)],
+      mcols(Annotation(NK_ATAC))[subjectHits(hits), , drop = FALSE] %>% as.data.frame()
+    )
+
+    # Many-to-one mapping: join back using row index
+    re_out <- annotated %>%
+      mutate(index = row_number()) %>%
+      left_join(gene_df, by = "index") %>%
+      select(-index)
+
+  } else {
+
+    # If no gene hits, append NA columns for gene annotations
+    gene_meta_cols <- colnames(mcols(Annotation(NK_ATAC)))
+
+    re_out <- annotated %>%
+      mutate(
+        gene_seq   = NA,
+        gene_start = NA,
+        gene_end   = NA
+      ) %>%
+      bind_cols(
+        as.data.frame(matrix(
+          NA,
+          nrow = nrow(annotated),
+          ncol = length(gene_meta_cols),
+          dimnames = list(NULL, gene_meta_cols)
+        ))
+      )
+  }
+
+table(re_out$gene_name)
+```
+
+```{r}
+NK_ATAC$predicted_groups <- paste0(NK_ATAC$group,"_", NK_ATAC$predicted.id)
+NK_ATAC$predicted_groups <- factor(NK_ATAC$predicted_groups)
+
+candidate_genes <- c("ZNF471","DOCK1")
+
+for (gene in candidate_genes){
+  CoveragePlot(peaks = TRUE,
+             group.by = "predicted_groups",
+             window = 2000,
+             object = NK_ATAC,
+             region = gene,
+             extend.upstream = 10000,
+             extend.downstream = 5000)
+  
+  CoveragePlot(peaks = TRUE,
+             group.by = "group",
+             window = 2000,
+             object = NK_ATAC,
+             region = gene,
+             extend.upstream = 10000,
+             extend.downstream = 5000)
+}
+
+```
+
+## ___SingleR label transfer___
+
+```{r}
+# Compute gene activity from peaks
+gene.activities <- GeneActivity(NK_ATAC)
+
+# Add as a new assay
+NK_ATAC[["GeneActivity"]] <- CreateAssayObject(counts = gene.activities)
+DefaultAssay(NK_ATAC) <- "GeneActivity"
+
+# Standard normalization on gene activity
+NK_ATAC <- NormalizeData(NK_ATAC)
+
+NK_ATAC <- 
+  NK_ATAC %>% 
+  NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000)
+
+NK_ATAC <- FindVariableFeatures(NK_ATAC, nfeatures = 10000)
+NK_ATAC <- ScaleData(NK_ATAC)
+
+Assay(NK_ATAC) <- "GeneActivity"
+
+# RNA data
+NK_RNA <- 
+  NK_RNA %>% 
+  NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000)
+
+
+# RNA as reference
+NK_clusters <- NK_RNA$predicted_NK_type_de.n350
+original_clusters <- NK_ATAC$seurat_clusters
+
+NK_ATAC_mat <- GetAssayData(NK_ATAC, 
+                        assay = "RNA", 
+                        slot = "data")
+
+NK_RNA_mat <- GetAssayData(NK_RNA, 
+                            assay = "RNA", 
+                            slot = "data")
+```
+
+(optional) remove NK cluster 4
+
+```{r (optional) remove NK cluster 4}
+# remove cluster hNK_Bm4 due to low abundance
+Idents(NK_RNA) <- NK_RNA$predicted_NK_type_de.n350
+
+NK_RNA_core <- subset(NK_RNA, idents = "hNK_Bm4", invert = TRUE)
+NK_RNA_core$predicted_NK_type_de.n350 <- factor(NK_RNA_core$predicted_NK_type_de.n350)
+
+# RNA data
+NK_RNA_core <- 
+  NK_RNA_core %>% 
+  NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000)
+
+NK_RNA_mat <- GetAssayData(NK_RNA_core, 
+                            assay = "RNA", 
+                            slot = "data")
+
+NK_clusters <- NK_RNA_core$predicted_NK_type_de.n350 
+```
+
+#### ___Sensitivity analysis for de.n parameter___
+
+```{r}
+# Store de.n values [Number of DE genes] from 5 to 500 with a 10 step increment
+de_n_values <- seq(5, 500, by=10) 
+
+# store results
+results <- data.frame(de_n = integer(), cluster = character(), num_cells = integer())
+
+# Loop through de.n values
+for (de_n in de_n_values) {
+ 
+  # Run SingleR with the current de.n parameter
+  singleR_result <- SingleR(test = NK_ATAC_mat, 
+                            ref = NK_RNA_mat, 
+                            labels = NK_clusters, 
+                            de.n = de_n,
+                            num.threads = 30)
+  
+  # Get the number of cells per cluster
+  cluster_counts <- table(singleR_result$labels)
+  
+  # Add the results to the data frame
+  results <- rbind(results, data.frame(de_n = de_n, 
+                                       cluster = names(cluster_counts), 
+                                       num_cells = as.integer(cluster_counts)))
+}
+
+saveRDS(singleR_result, file = paste0(params$out,                       "Rds/Label_transfer_sensitivity_analysis_20260112_without-cluster-NK4.Rds"))
+
+write.table(results, file = paste0(params$out,                                "tables/label_transfer_sensitivity_analysis_20260112_without-cluster-NK4.csv"),
+            sep = "\t", quote = FALSE,row.names = FALSE)
+```
+
+```{r}
+# Plot the results using ggplot2
+sensitivity_analysis <- ggplot(results, aes(x = de_n, y = num_cells, color = cluster)) +
+  geom_line(linewidth = 0.5) +
+  geom_point(size = 1) +
+  labs(title = "Number of cells per cluster vs. de.n parameter",
+       x = "de.n parameter",
+       y = "Number of cells per cluster") +
+  theme_minimal() +  scale_color_manual(values = COLOR_CODE_v2)
+
+sensitivity_analysis
+
+# save as PDF
+pdf(paste0(params$out,"figures/label_transfer_sensitivity_analysis_results_20260112_without-cluster-NK4.pdf"),
+    height = 3, width = 5)
+sensitivity_analysis
+dev.off()
+```
+
+```{r}
+# Load required libraries
+library(reshape2)
+
+#  range for de.n parameter
+de_n_values <- seq(5, 1000, by=10)  
+
+# Initialize a list to store results
+results_list <- list()
+
+# Loop through de.n values
+for (de_n in de_n_values) {
+  
+  # Run SingleR with the current de.n parameter
+  singleR_result <- SingleR(test = NK_ATAC_mat, 
+                            ref = NK_RNA_mat, 
+                            labels = NK_clusters, 
+                            de.n = de_n,
+                            num.threads = 30)
+  
+  # Store the results in a list, using de.n as the name
+  results_list[[as.character(de_n)]] <- singleR_result$labels
+}
+
+# Convert the results list to a data frame
+results_df <- do.call(cbind, results_list)
+colnames(results_df) <- de_n_values
+results_df <- as.data.frame(results_df)
+results_df$de_n <- de_n_values #
+results_df$Cell_ID <- rownames(results_df)
+
+# Melt the data frame for plotting
+results_melted <- reshape2::melt(results_df, 
+                       id.vars = "Cell_ID", 
+                       variable.name = "de_n", 
+                       value.name = "Predicted_Type")
+
+results_melted
+
+# Make sure de.n is treated as a numeric variable
+results_melted$de_n <- as.numeric(as.character(results_melted$de_n))
+
+# Plot the heatmap
+params_sensitivity_heatmap_plot <- ggplot(results_melted, aes(x = de_n, 
+                                                              y = Cell_ID, 
+                                                              fill = Predicted_Type)) +
+  geom_tile() +
+  scale_fill_manual(values = COLOR_CODE_v2) +
+  labs(title = "Heatmap of predicted NK sub-types across different de.n values",
+       x = "de.n parameter",
+       y = "Cell ID",
+       fill = "Predicted NK Type") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),  # Optional: Hide y-axis text if there are too many cells
+        axis.ticks.y = element_blank(),
+        panel.grid = element_blank())
+
+
+write.table(results_df, file = paste0(params$out,"tables/label_transfer_sensitivity_analysis_per_cell_ID_20260112_without-cluster-NK4.csv"),
+            sep = "\t")
+```
+
+```{r}
+params_sensitivity_heatmap_plot
+
+pdf(paste0(params$out,"figures/label_transfer_heatmap_plot_20260112_without-cluster-NK4.pdf"))
+params_sensitivity_heatmap_plot
+dev.off()
+```
+
+```{r subsampled}
+set.seed(123)
+num_cells <- nrow(results_df)
+
+# If the number of cells is greater than 500, sub-sample
+if (num_cells > 500) {
+  # Randomly sample 500 cell IDs
+  sampled_cell_ids <- sample(results_df$Cell_ID, 500, replace = FALSE)
+  
+  # Subset results_df to include only the sampled cells
+  results_df_subsampled <- results_df[results_df$Cell_ID %in% sampled_cell_ids, ]
+} else {
+  # If there are fewer than 500 cells, use the entire dataset
+  results_df_subsampled <- results_df
+  warning("The number of cells is less than or equal to 500; using the entire dataset.")
+}
+
+# Display the first few rows of the subsampled data frame
+head(results_df_subsampled)
+
+# Melt the data frame for plotting
+df_subsampled_melted <- reshape2::melt(results_df_subsampled, 
+                       id.vars = "Cell_ID", 
+                       variable.name = "de_n", 
+                       value.name = "Predicted_Type")
+
+df_subsampled_melted
+
+# Make sure de.n is treated as a numeric variable
+df_subsampled_melted$de_n <- as.numeric(as.character(df_subsampled_melted$de_n))
+
+# Plot the heatmap
+params_sensitivity_plot <- ggplot(df_subsampled_melted, 
+                                  aes(x = de_n, y = Cell_ID, fill = Predicted_Type)) +
+  geom_tile() +
+  scale_fill_manual(values = COLOR_CODE_v2) +
+  labs(title = "Heatmap of predicted NK sub-types across different de.n values",
+       x = "de.n parameter",
+       y = "Cell ID",
+       fill = "Predicted NK Type") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),  # Optional: Hide y-axis text if there are too many cells
+        axis.ticks.y = element_blank(),
+        panel.grid = element_blank())
+```
+
+```{r}
+params_sensitivity_plot
+
+pdf(params$out,"figures/label_transfer_sensitivity_analysis_v2_20260112_without-cluster-NK4.pdf")
+params_sensitivity_plot
+dev.off()
+```
+
+### ___Label transfer___
+
+```{r}
+predicted_labels <- SingleR(test = NK_ATAC_mat, 
+                            ref = NK_RNA_mat, 
+                            labels = NK_clusters, 
+                            de.n = 250, # based on above sensitivity analysis
+                            num.threads = 30) # GPU server
+```
+
+### ___QC of label transfer___
+
+```{r QC of predicted labels: NK_RNA}
+# filtering step
+predicted_label <- predicted_labels$labels
+
+final_labels <- predicted_labels$pruned.labels
+final_labels[is.na(final_labels)] <- "unassigned"
+
+# Compute an empirical delta threshold from non-pruned cells
+ok <- predicted_labels$pruned.labels %in% unique(predicted_labels$pruned.labels[!is.na(predicted_labels$pruned.labels)])
+delta_ok <- predicted_labels$delta[ok]
+
+# Example: conservative threshold = 20th percentile of delta among pruned-kept cells
+delta_thr <- unname(quantile(delta_ok, probs = 0.20, na.rm = TRUE))
+
+# Apply: require delta >= threshold
+low_delta <- predicted_labels$delta < delta_thr | is.na(predicted_labels$delta)
+final_labels[low_delta] <- "unassigned"
+final_labels <- factor(final_labels)
+
+##########
+
+# Start with SingleR pruning
+final <- predicted_labels$pruned.labels
+final[is.na(final)] <- "unassigned"
+table(final)
+
+# restrict threshold estimation to cells that passed pruning
+keep0 <- predicted_labels$pruned.labels[!is.na(predicted_labels$pruned.labels)]
+delta0 <- predicted_labels$delta.next[!is.na(predicted_labels$pruned.labels)]
+
+# percentile-based threshold (increase p for stricter filtering)
+p <- 0.50
+delta_thr <- unname(quantile(delta0, probs = p, na.rm = TRUE))
+
+# Apply threshold
+final[final != "unassigned" & predicted_labels$delta.next < delta_thr] <- "unassigned"
+table(final)
+
+##########
+
+plotScoreHeatmap(predicted_labels, 
+                 normalize = TRUE,
+                 show.labels = TRUE,
+                 annotation_col = as.data.frame(NK_ATAC@meta.data[,"sample",
+                                                         drop = FALSE]))
+
+plotDeltaDistribution(predicted_labels, 
+                      ncol = 2)
+
+# defult delta treshold
+to.remove <- is.na(predicted_labels$pruned.labels)
+table(Label=predicted_labels$labels, Removed = to.remove)
+# manual delta treshold
+to.remove <- pruneScores(predicted_labels, min.diff.med = 0.01)
+table(Label=predicted_labels$labels, Removed = to.remove)
+
+plotScoreHeatmap(predicted_labels[to.remove,], 
+                 normalize = TRUE,
+                 show.labels = TRUE,
+                 annotation_col = as.data.frame(NK_ATAC@meta.data[,"sample",
+                                                         drop = FALSE]))
+
+to.remove <- pruneScores(predicted_labels, min.diff.med = 0.001)
+table(Label=predicted_labels$labels, Removed = to.remove)
+
+plotScoreHeatmap(predicted_labels[to.remove,], 
+                 normalize = TRUE,
+                 show.labels = TRUE,
+                 annotation_col = as.data.frame(NK_ATAC@meta.data[,"sample",
+                                                         drop = FALSE]))
+```
+
+
+```{r}
+# save plot
+pdf(paste0(params$out,"figures/RNAtoATAC_label_transfer_QC_without-cluster-NK4.pdf"),
+    height = 5,width = 7)
+plotScoreHeatmap(predicted_labels, 
+                 normalize = TRUE,
+                 show.labels = TRUE,
+                 annotation_col = as.data.frame(NK_ATAC@meta.data[,"sample",
+                                                         drop = FALSE]))
+dev.off()
+```
+
+
+```{r label transfer results: NK_RNA}
+NK_ATAC$predicted_NK_type <- predicted_label
+
+cluster_anno <- c("hNK_Bm1","hNK_Bm2","hNK_Bm3","hNK_Bm4")
+
+DimPlot(NK_ATAC,
+        group.by = "predicted_NK_type",
+        cols = COLOR_CODE_GROUP)
+
+DimPlot(NK_ATAC,
+        group.by = "predicted_NK_type",
+        split.by = "group",
+        cols = COLOR_CODE_GROUP)
+
+percent_NK_group <- table(NK_ATAC$predicted_NK_type,
+                          NK_ATAC$group)
+percent_NK_group
+
+percent_NK_sample <- table(NK_ATAC$predicted_NK_type,
+                          NK_ATAC$sample)
+
+barplot(percent_NK_group,
+        col = COLOR_CODE_GROUP, 
+        border = "white", 
+        xlab = "Group",
+        legend.text = cluster_anno)
+        
+# Transform this data in %
+data_percentage <- apply(percent_NK_group, 2, 
+                         function(x){x*100/sum(x,na.rm=T)})
+ 
+
+data_percentage_sample <- apply(percent_NK_sample, 2, 
+                         function(x){x*100/sum(x,na.rm=T)})
+
+# Make a stacked barplot in %
+barplot(data_percentage, 
+        col = COLOR_CODE_v2, 
+        border = "white", 
+        xlab = "Group",
+        legend.text = cluster_anno)
+
+barplot(data_percentage_sample, 
+        col = COLOR_CODE_v2, 
+        border = "white", 
+        xlab = "Group",
+        legend.text = cluster_anno)
+
+# with ggplot2
+
+percent_NK_group_trans <- reshape2::melt(data_percentage) 
+
+ggplot(percent_NK_group_trans, aes(x = Var2, y = value, fill = Var1)) + 
+  geom_bar(stat = "identity", position = "stack") +
+  theme_void() + 
+  labs(x = "", y = "Percentage of NK cells assigned to each sub-cluster", 
+       fill = "NK clusters") +  
+  ggtitle("Clustered Stacked Bar Plot of NK Groups") +
+  theme(axis.text.x = element_text(angle = 0, 
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 16),
+        axis.text.y = element_text(angle = 0,
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 16),
+        legend.text = element_text(angle = 0, 
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 18),
+        axis.title.x = element_text(size = 16,
+                                    color = "black",),                        
+        axis.title.y = element_text(size = 16,
+                                    angle = 90,
+                                    color = "black",),                 
+        legend.title = element_text(size = 16,
+                                    color = "black"),
+        title = element_text(size = 20,
+                                    color = "black")) +
+  scale_fill_manual(values = COLOR_CODE_v2)
+
+
+# all samples
+percent_NK_samples_trans <- reshape2::melt(data_percentage_sample) 
+
+# Step 1: Reshape the data into wide format for clustering
+data_wide <- t(data_percentage_sample)
+
+# Compute the Euclidean distance matrix
+d <- dist(data_wide, method = "euclidean")
+
+# Perform hierarchical clustering using complete linkage
+hc <- hclust(d, method = "complete")
+
+# Step 3: Reorder the samples based on clustering
+ordered_samples <- rownames(data_wide)[hc$order]
+
+# Arrange the data frame by the ordered Var2 column
+percent_NK_samples_trans <- percent_NK_samples_trans %>%
+  arrange(Var2)
+
+# View the reordered data frame
+print(percent_NK_samples_trans)
+
+
+# Step 4: Plot the clustered bar plot
+ggplot(percent_NK_samples_trans, aes(x = Var2, y = value, fill = Var1)) + 
+  geom_bar(stat = "identity", position = "stack") +
+  theme_void() + 
+  labs(x = "", y = "Percentage of NK cells assigned to each sub-cluster", 
+       fill = "NK clusters") +  
+  ggtitle("Clustered Stacked Bar Plot of NK Groups") +
+  theme(axis.text.x = element_text(angle = 90,
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 16),
+        axis.text.y = element_text(angle = 0,
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 16),
+        legend.text = element_text(angle = 0, 
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 18),
+        axis.title.x = element_text(size = 16,
+                                    color = "black",),                        
+        axis.title.y = element_text(size = 16,
+                                    angle = 90,
+                                    color = "black",),                 
+        legend.title = element_text(size = 16,
+                                    color = "black"),
+        title = element_text(size = 20,
+                                    color = "black")) +
+  scale_fill_manual(values = COLOR_CODE_v2)
+
+
+
+# sort by alphabet
+ordered_samples <- sort(ordered_samples)
+
+# Step 1: Ensure Var2 is correctly converted into a factor with the desired order
+percent_NK_samples_trans$Var2 <- factor(percent_NK_samples_trans$Var2, levels = ordered_samples)
+
+# Arrange the data frame by the ordered Var2 column
+percent_NK_samples_trans <- percent_NK_samples_trans %>% 
+  arrange(Var2,value)
+
+
+ggplot(percent_NK_samples_trans, aes(x = Var2, y = value, fill = Var1)) + 
+  geom_bar(stat = "identity", position = "stack") +
+  theme_void() + 
+  labs(x = "", y = "Percentage of NK cells assigned to each sub-cluster", 
+       fill = "NK clusters") +  
+  ggtitle("Stacked Bar Plot of NK Groups") +
+  theme(axis.text.x = element_text(angle = 90,
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 16),
+        axis.text.y = element_text(angle = 0,
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 16),
+        legend.text = element_text(angle = 0, 
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 18),
+        axis.title.x = element_text(size = 16,
+                                    color = "black",),                        
+        axis.title.y = element_text(size = 16,
+                                    angle = 90,
+                                    color = "black",),                 
+        legend.title = element_text(size = 16,
+                                    color = "black"),
+        title = element_text(size = 20,
+                                    color = "black")) +
+  scale_fill_manual(values = COLOR_CODE_v2)
+
+```
+
+### ___Save predicted labels___
+
+```{r eval=FALSE, include=FALSE}
+saveRDS(predicted_labels, 
+        file = paste0(params$out,"/Rds/NK_ATAC_predicted_NKclusters_without-cluster-NK4_RNAtoATAC_de.n=250.Rds"))
+
+saveRDS(NK_ATAC, 
+       file = paste0(params$out, "/Rds/NK_ATAC_wMatchedRNAcells_without-cluster-NK4_v2026-01_de.n=250.Rds"))
+```
+
+
+## ___ArchR label transfer___
+
+```{r}
+# devtools::install_github("GreenleafLab/ArchR", ref="master", repos = BiocManager::repositories())
+
+library("ArchR")
+set.seed(2805)
+
+# archR params setup
+addArchRThreads(threads = 24) 
+addArchRGenome("hg38")
+
+#frag_file <- paste0(params$out, "/Rds/feathu2023_ATAC_NKcells_fragments.tsv.gz")
+names(frag_file) <- "NK_ATAC"
+
+ArrowFiles <- createArrowFiles(
+  inputFiles = frag_file, # loaded in the code above
+  sampleNames = names(frag_file),
+  minTSS = 4, # adjust
+  minFrags = 1000, # adjust
+  addTileMat = TRUE,
+  addGeneScoreMat = TRUE
+)
+```
+
+Per-cell quality control information that was calculated during Arrow file creation:
+TSSEnrichment - the per-cell TSS enrichment score
+ReadsInTSS - the number of reads that fall within TSS regions (default is 100 bp around TSS)
+ReadsInPromoter - the number of reads that fall in promoter regions (default is -2000 to +100 from the TSS)
+PromoterRatio - the ratio of reads in promoters to reads outside of promoters
+ReadsInBlacklist - the number of reads that fall in blacklist regions
+BlacklistRatio - the ratio of reads in blacklist regions to reads outside of blacklist regions
+NucleosomeRatio - similar to above but for reads mapping to nucleosome-sized reads, defined as: (nDiFrags + nMultiFrags) / nMonoFrags)
+nFrags - the number of fragments recovered per cell
+nMonoFrags - the number of fragments that have length less than 2 * nucLength (nucLength is the length of DNA that wraps around a nucleosome (147 bp by default))
+nDiFrags - the number of fragments that have length less than 3 * nucLength but greater than 2 * nucLength
+nMultiFrags - the number of fragments that have length >= 3*nucLength
+PassQC - equal to 1 if the cell passed QC filters or 0 if not
+
+```{r}
+# create archR project file
+proj <- ArchRProject(
+  ArrowFiles       = ArrowFiles,
+  outputDirectory  = paste0(params$out,"/ArchR"),
+  copyArrows       = TRUE
+)
+
+# TSS enrichment plot
+df <- getCellColData(proj, select = c("log10(nFrags)", "TSSEnrichment"))
+
+p <- ggPoint(
+    x = df[,1], 
+    y = df[,2], 
+    colorDensity = TRUE,
+    continuousSet = "sambaNight",
+    xlabel = "Log10 Unique Fragments",
+    ylabel = "TSS Enrichment",
+    xlim = c(log10(500), quantile(df[,1], probs = 0.99)),
+    ylim = c(0, quantile(df[,2], probs = 0.99))
+) + geom_hline(yintercept = 4, lty = "dashed") + geom_vline(xintercept = 3, lty = "dashed")
+
+p
+
+plotPDF(p, name = "NK_ATAC_archR_TSS-vs-frag_QC.pdf", ArchRProj = proj, addDOC = FALSE)
+
+# fragment size distribution plot
+p1 <- plotFragmentSizes(
+  ArchRProj = proj,
+  sample    = "NK_ATAC",
+  plotAs    = "line"
+)
+
+p2 <- plotTSSEnrichment(ArchRProj = proj)
+
+plotPDF(p1,p2, name = "NK_ATAC_archR_FragSizes+TSSProfile.pdf", 
+        ArchRProj = proj, addDOC = FALSE, width = 5, height = 5)
+
+```
+ 
+```{r}
+doubScores <- addDoubletScores(
+    input = ArrowFiles,
+    k = 10, # adjust! 
+    # how many cells near a "pseudo-doublet" the algorithm should count
+    knnMethod = "UMAP", # can change to  knnMethod = "LSI" and force = TRUE 
+    LSIMethod = 1
+)
+```
+
+
+ArchR reports the R2 value for the UMAP projection for each Arrow file. If these R2 values are much lower (i.e. less than 0.9), this often indicates that the cells within the Arrow file have very little heterogeneity. This makes the accuracy of doublet calling worse because the majority of doublets would be “homotypic” - or a single droplet with two very similar cells. 
+
+In these cases, ArchR will skip doublet prediction because it is not accurate. Alternatively, you can try setting knnMethod = "LSI" and force = TRUE to perform projection in the LSI subspace; however, you should manually assess the results and make sure this is performing as you would expect.
+
+Adding doublet scores will create plots in the “QualityControl” directory. There are 3 plots associated with each of your samples in this folder:
+
+Doublet Enrichments - These represent the enrichment of simulated doublets nearby each single cell compared to the expected if we assume a uniform distribution.
+
+Doublet Scores - These represent the significance (-log10(binomial adjusted p-value)) of simulated doublets nearby each single cell compared to the expected if we assume a uniform distribution. We have found this value to be less consistent than the doublet enrichments and therefore use doublet enrichments for doublet identification.
+
+Doublet Density - This represents the density of the simulated doublet projections. This allows you to visualize where the synthetic doublets were located after projection into your 2-dimensional embedding.
+
+### ___QC filtering and Doublet removal___
+
+```{r}
+cd <- getCellColData(proj, select = c("nFrags", "TSSEnrichment"))
+keep <- rownames(cd)[
+  cd$nFrags >= 3000 &
+  cd$nFrags <= 25000 &
+  cd$TSSEnrichment >= 10
+]
+
+proj_filt <- subsetArchRProject(
+  ArchRProj = proj,
+  cells = keep,
+  outputDirectory = "ArchR_QCfiltered",
+  dropCells = TRUE,
+  force = TRUE
+)
+
+table(proj_filt$DoubletEnrichment) 
+summary(proj_filt$DoubletScore)
+```
+
+```{r}
+# Confirm available per-cell QC fields
+colnames(getCellColData(proj_filt))
+
+# Pull the relevant columns
+cd <- as.data.frame(getCellColData(
+  proj_filt,
+  select = c("nFrags", "TSSEnrichment", "DoubletScore", "DoubletEnrichment", "BlacklistRatio")
+))
+
+summary(cd$DoubletScore)
+summary(cd$DoubletEnrichment)
+quantile(cd$DoubletEnrichment, probs = c(0.5, 0.9, 0.95, 0.99))
+
+ggplot(cd, aes(x = log10(nFrags), y = DoubletEnrichment)) +
+  geom_point(size = 0.6, alpha = 0.6) +
+  theme_classic() +
+  xlab("log10(nFrags)") + ylab("DoubletEnrichment")
+
+ggplot(cd, aes(x = DoubletScore, y = DoubletEnrichment)) +
+  geom_point(size = 0.6, alpha = 0.6) +
+  theme_classic()
+```
+
+```{r}
+proj_auto <- filterDoublets(proj)
+c(before = nCells(proj_filt), after = nCells(proj_auto), removed = nCells(proj_filt) - nCells(proj_auto))
+```
+
+ATAC data pre-processing with archR
+
+```{r}
+# Standard ATAC preprocessing
+proj_filt <- addIterativeLSI(
+  ArchRProj = proj_filt,
+  useMatrix = "TileMatrix",
+  name = "IterativeLSI",
+  iterations = 2,
+  clusterParams = list(
+    resolution = c(0.2),
+    sampleCells = 10000,
+    n.start = 10
+  ),
+  varFeatures = 25000,
+  dimsToUse = 1:30
+)
+
+proj_filt <- addClusters(
+  input = proj_filt,
+  reducedDims = "IterativeLSI",
+  method = "Seurat",
+  name = "Clusters",
+  resolution = 0.6
+)
+
+proj_filt <- addUMAP(
+  ArchRProj = proj_filt,
+  reducedDims = "IterativeLSI",
+  name = "UMAP",
+  nNeighbors = 30,
+  minDist = 0.5,
+  metric = "cosine"
+)
+
+# Gene activity-like matrix for integration
+proj_filt <- addGeneScoreMatrix(proj_filt,force = TRUE)
+```
+
+label transfer RNA to ATAC
+
+```{r}
+library(SingleCellExperiment)
+library(Seurat)
+
+sceRNA <- as.SingleCellExperiment(NK_RNA)
+
+proj_filt <- addGeneIntegrationMatrix(
+  ArchRProj = proj_filt,
+  useMatrix = "GeneScoreMatrix",
+  matrixName = "GeneIntegrationMatrix_v3",
+  reducedDims = "IterativeLSI",
+  seRNA = sceRNA,
+  addToArrow = FALSE,   # add to arrow file
+  groupRNA = "predicted_NK_type_de.n350", 
+  nameCell = "predicted_NK_subset", # predicted cell ID
+  nameGroup = "predicted_group", # predicted label
+  nameScore = "predicted_score", # prediction score - higher score, higher confidence
+  dimsToUse = 1:30,
+  force = TRUE
+)
+```
+
+QC
+
+```{r}
+p1 <- plotEmbedding(
+  ArchRProj = proj_filt,
+  colorBy = "cellColData",
+  name = "predicted_group",
+  embedding = "UMAP"
+)
+
+p2 <- plotEmbedding(
+  ArchRProj = proj_filt,
+  colorBy = "cellColData",
+  name = "predicted_score",
+  embedding = "UMAP"
+)
+
+p1
+p2
+```
+
+```{r}
+table(proj_filt$predicted_group)
+
+proj_filt$predicted_group <- as.character(proj_filt$predicted_group)
+proj_filt$predicted_group <- as.factor(proj_filt$predicted_group)
+
+validGroups <- setdiff(names(table(proj_filt$predicted_group)), "hNK_Bm4")
+
+maker_feat <- getMarkerFeatures(
+    ArchRProj = proj_filt,
+    useMatrix = "GeneIntegrationMatrix", # GeneIntegrationMatrix_v3
+    groupBy = "predicted_group",
+    useGroups = validGroups,
+    bias = c("TSSEnrichment", "log10(nFrags)")
+  )
+hm <- plotMarkerHeatmap(
+  seMarker = maker_feat,
+  cutOff = "FDR <= 0.1 & Log2FC >= 0.5",
+  labelMarkers = NK_functional_markers
+)
+
+hm
+```
+### ___Add metadata___
+
+```{r}
+# ArchR cell IDs
+archr_cells <- proj_filt$cellNames
+
+# Seurat cell IDs
+seurat_cells <- colnames(NK_ATAC)
+
+
+# Normalize to base barcode sequence:
+# - remove ArchR "prefix#"
+# - remove trailing "-<digits>" (e.g., -1, -7)
+norm_bc <- function(x) {
+  x <- sub("^.*#", "", x)       # drop prefix up to '#'
+  x <- sub("-\\d+$", "", x)     # drop trailing -<number>
+  x
+}
+
+archr_bc  <- norm_bc(archr_cells)
+seurat_bc <- norm_bc(seurat_cells)
+
+# Sanity: overlap rate
+overlap <- length(intersect(archr_bc, seurat_bc))
+cat("Overlap:", overlap, "of", length(archr_bc), "ArchR cells\n")
+
+# Create Seurat lookup table for metadata you want to transfer
+lut <- data.frame(
+  bc = seurat_bc,
+  sample = NK_ATAC$sample,
+  group  = NK_ATAC$group,
+  stringsAsFactors = FALSE
+)
+
+# Critical: ensure Seurat base barcodes are unique, otherwise mapping is ambiguous
+dup <- duplicated(lut$bc)
+if (any(dup)) {
+  # show how many duplicates (often indicates barcode reuse across multiple samples)
+  cat("WARNING: duplicated Seurat base barcodes =", sum(dup), "\n")
+  print(head(lut[lut$bc %in% lut$bc[dup], ], 10))
+  stop("Mapping is ambiguous because Seurat base barcodes are not unique. See notes below for resolution.")
+}
+
+# Map Seurat metadata onto ArchR cells
+m <- match(archr_bc, lut$bc)
+
+# How many ArchR cells did not map?
+cat("Unmapped ArchR cells:", sum(is.na(m)), "\n")
+
+proj_filt$sample <- lut$sample[m]
+proj_filt$group  <- lut$group[m]
+
+# QC check
+table(proj_filt$sample, useNA = "ifany")
+table(proj_filt$group,  useNA = "ifany")
+```
+
+```{r}
+tab <- table(proj_filt$group, proj_filt$predicted_group)
+tab
+tab_prop <- prop.table(tab, margin = 1) 
+
+barplot(
+  tab_prop,
+  beside = FALSE,
+  las = 2,
+  ylab = "Fraction of NK cells",
+  xlab = "Group",
+  legend.text = TRUE,
+  args.legend = list(x = "topright", bty = "n", cex = 0.9)
+)
+```
+
+```{r}
+# Make pseudo-bulk coverages (often by cell state or sample)
+proj_filt <- addGroupCoverages(
+  ArchRProj = proj_filt,
+  groupBy = "sample"   # or "predicted_group"
+)
+
+# Call peaks on those pseudo-bulks
+proj_filt <- addReproduciblePeakSet(
+  ArchRProj = proj_filt,
+  groupBy = "sample",  # same as above
+  pathToMacs2 = "/path/to/macs2" # must be available in your environment
+)
+```
+
+
+
+```{r}
+celltypes <- levels(proj_filt$predicted_group)
+
+# differentially accesible regions
+marker_list <- lapply(celltypes, function(ct) {
+  cells_ct <- proj_filt$cellNames[proj_filt$predicted_group == ct]
+  proj_ct <- subsetArchRProject(
+    ArchRProj = proj_filt,
+    cells = cells_ct,
+    outputDirectory = paste0("ArchR_", ct),
+    dropCells = TRUE
+  )
+
+  getMarkerFeatures(
+    ArchRProj = proj_ct,
+    useMatrix = "TileMatrix",            # or "GeneScoreMatrix" for RNA or "TileMatrix" if MACS2  isnot available
+    groupBy = "group",                   # your condition (e.g., control vs ATRXmut)
+   # bias = c("TSSEnrichment", "log10(nFrags)")
+  )
+})
+
+names(marker_list) <- celltypes
+
+# differential gene scores
+seMarker <- getMarkerFeatures(
+  ArchRProj = proj_ct,
+  useMatrix = "GeneScoreMatrix", 
+  groupBy = "group",
+  bias = c("TSSEnrichment", "log10(nFrags)")
+)
+```
+
+
+### ___save Rds___
+
+```{r}
+# SAVE
+saveArchRProject(ArchRProj = proj_filt, 
+                 outputDirectory = paste0(params$out,"/ArchR_filt/"), 
+                 load = FALSE)
+
+# LOAD SAVED FILE
+proj <- readRDS( "ArchR_QCfiltered/Save-ArchR-Project.rds")
+proj <- loadArchRProject(path  = paste0(params$out,"/ArchR"))
+```
+
+
+
+
+
+
+# ___The End___
+
+```{r}
+sessionInfo()
+```
+

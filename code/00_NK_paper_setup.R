@@ -9,7 +9,7 @@ suppressPackageStartupMessages(library("SCpubr"))
 suppressPackageStartupMessages(library("scCustomize"))
 suppressPackageStartupMessages(library("ggVennDiagram"))
 suppressPackageStartupMessages(library("statmod"))
-suppressPackageStartupMessages(library("miloR"))
+suppressPackageStartupMessages(library("miloR")) 
 suppressPackageStartupMessages(library("scran"))
 suppressPackageStartupMessages(library("scater"))
 suppressPackageStartupMessages(library("dplyr"))
@@ -17,51 +17,50 @@ suppressPackageStartupMessages(library("patchwork"))
 suppressPackageStartupMessages(library("RColorBrewer"))
 suppressPackageStartupMessages(library("dplyr"))
 suppressPackageStartupMessages(library("ggplot2"))
-suppressPackageStartupMessages(library("SingleR"))
+suppressPackageStartupMessages(library("SingleR")) 
 suppressPackageStartupMessages(library("ggpubr"))
 suppressPackageStartupMessages(library("stats"))
 suppressPackageStartupMessages(library("viridis"))
-suppressPackageStartupMessages(library("DElegate")) #
-suppressPackageStartupMessages(library("clusterProfiler")) #
-suppressPackageStartupMessages(library("org.Hs.eg.db")) # 
-suppressPackageStartupMessages(library("enrichplot")) #
-suppressPackageStartupMessages(library("AnnotationDbi")) #
-suppressPackageStartupMessages(library("pathview")) #
-suppressPackageStartupMessages(library("knitr")) #
-suppressPackageStartupMessages(library("pathview")) #
-suppressPackageStartupMessages(library("aggregateBioVar")) #
+suppressPackageStartupMessages(library("DElegate")) 
+suppressPackageStartupMessages(library("clusterProfiler")) 
+suppressPackageStartupMessages(library("org.Hs.eg.db")) 
+suppressPackageStartupMessages(library("enrichplot")) 
+suppressPackageStartupMessages(library("AnnotationDbi")) 
+suppressPackageStartupMessages(library("pathview")) 
+suppressPackageStartupMessages(library("knitr")) 
+suppressPackageStartupMessages(library("pathview")) 
+suppressPackageStartupMessages(library("aggregateBioVar")) 
 suppressPackageStartupMessages(library("SummarizedExperiment")) 
 suppressPackageStartupMessages(library("DESeq2"))
-suppressPackageStartupMessages(library("magrittr")) #
-suppressPackageStartupMessages(library("pheatmap")) # 
-suppressPackageStartupMessages(library("ggtext")) #
-suppressPackageStartupMessages(library("ggbeeswarm")) #
-suppressPackageStartupMessages(library("ggthemes")) #
-suppressPackageStartupMessages(library("slingshot")) #
-suppressPackageStartupMessages(library("reshape2")) #
+suppressPackageStartupMessages(library("magrittr")) 
+suppressPackageStartupMessages(library("pheatmap")) 
+suppressPackageStartupMessages(library("ggtext"))
+suppressPackageStartupMessages(library("ggbeeswarm")) 
+suppressPackageStartupMessages(library("ggthemes")) 
+suppressPackageStartupMessages(library("slingshot")) 
+suppressPackageStartupMessages(library("reshape2")) 
 suppressPackageStartupMessages(library("EnhancedVolcano")) 
-suppressPackageStartupMessages(library("msigdbr")) #
+suppressPackageStartupMessages(library("msigdbr")) 
+suppressPackageStartupMessages(library("Signac")) 
 
 # ___NK sub-set markers___
 
 ## ___NK functional markers from: Yang et al., 2019___
 
-yang2019_clust <- 
-  read_excel("/home/rstudio/mnt_resources/NK_cells_gene_sets/Yang2019_supp_Table_1.xlsx")
-
-yang2019_clust_mark <- yang2019_clust$gene
-length(yang2019_clust_mark)
+#yang2019_clust <- read_excel("/home/rstudio/mnt_resources/NK_genes/Yang2019_supp_Table_1.xlsx")
+#yang2019_clust_mark <- yang2019_clust$gene
+#length(yang2019_clust_mark)
 
 
 ## ____NK functional markers from: Crinier et al., 2021____
 
-adaptive_NK_genes <- read.csv("/home/rstudio/mnt_resources/NK_cells_gene_sets/adaptive_NK_marker_genes.txt", header = FALSE)
+adaptive_NK_genes <- read.csv("/home/rstudio/mnt_resources/NK_genes/adaptive_NK_marker_genes.txt", header = FALSE)
 adaptive_NK_genes <- adaptive_NK_genes$V1
-conventional_NK_genes <- read.csv("/home/rstudio/mnt_resources/NK_cells_gene_sets/conventional_NK_marker_genes.txt", header = FALSE)
+conventional_NK_genes <- read.csv("/home/rstudio/mnt_resources/NK_genes/conventional_NK_marker_genes.txt", header = FALSE)
 conventional_NK_genes <- conventional_NK_genes$V1
-mature_NK_genes <- read.csv("/home/rstudio/mnt_resources/NK_cells_gene_sets/mature_NK_marker_genes.txt", header = FALSE)
+mature_NK_genes <- read.csv("/home/rstudio/mnt_resources/NK_genes/mature_NK_marker_genes.txt", header = FALSE)
 mature_NK_genes <- mature_NK_genes$V1
-NKP_genes <- read.csv("/home/rstudio/mnt_resources/NK_cells_gene_sets/NKP_marker_genes.txt", header = FALSE)
+NKP_genes <- read.csv("/home/rstudio/mnt_resources/NK_genes/NKP_marker_genes.txt", header = FALSE)
 NKP_genes <- NKP_genes$V1
 
 crinier_et_al_genes <- list(adaptive_NK = adaptive_NK_genes,
@@ -74,18 +73,18 @@ crinier_et_al_genes <- list(adaptive_NK = adaptive_NK_genes,
 
 library(readr)
 CD56bright_CD16neg_NK_vs_CD56dim_CD16pos_NK_genes <- 
-  read_delim("~/mnt_resources/NK_cells_gene_sets/CD56bright_CD16neg_NK_vs_CD56dim_CD16pos_NK_genes.csv",
+  read_delim("~/mnt_resources/NK_genes/CD56bright_CD16neg_NK_vs_CD56dim_CD16pos_NK_genes.csv",
              delim = "\t", escape_double = FALSE, 
              col_names = FALSE, trim_ws = TRUE, skip = 2)
 
 
 activated_CD16pos_NK_vs_CD56dim_CD16pos_NK_genes <- 
-  read_delim("~/mnt_resources/NK_cells_gene_sets/activated_CD16pos_NK_vs_CD56dim_CD16pos_NK_genes.csv",
+  read_delim("~/mnt_resources/NK_genes/activated_CD16pos_NK_vs_CD56dim_CD16pos_NK_genes.csv",
              delim = "\t", escape_double = FALSE,
              col_names = FALSE, trim_ws = TRUE, skip = 2)
 
 activated_CD16pos_NK_vs_CD56bright_CD16neg_NK_genes <- 
-  read_delim("~/mnt_resources/NK_cells_gene_sets/activated_CD16pos_NK_vs_CD56bright_CD16neg_NK_genes.csv",
+  read_delim("~/mnt_resources/NK_genes/activated_CD16pos_NK_vs_CD56bright_CD16neg_NK_genes.csv",
              delim = "\t", escape_double = FALSE,
              col_names = FALSE, trim_ws = TRUE, skip = 2)
 
@@ -102,7 +101,7 @@ activated_CD16pos_NK_vs_CD56dim_CD16pos_NK_genes <- rbind(activated_CD16pos_NK_v
 
 ## ____NK functional markers from: Blanquart et al., 2024___
 
-inflammed_NK_genes <- read_delim("~/mnt_resources/NK_cells_gene_sets/inflammed_NK_genes.csv",
+inflammed_NK_genes <- read_delim("~/mnt_resources/NK_genes/inflammed_NK_genes.csv",
                                  delim = "\t", escape_double = FALSE,
                                  col_names = FALSE, trim_ws = TRUE, skip = 2)
 

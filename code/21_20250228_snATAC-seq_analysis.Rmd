@@ -157,6 +157,7 @@ VlnPlot(
   split.by = "group",
   ncol = 5)
 ```
+
 ```{r fig.height=10, fig.width=10}
 
 UMAP_plot_byGroup <- SCpubr::do_DimPlot(ATAC,
