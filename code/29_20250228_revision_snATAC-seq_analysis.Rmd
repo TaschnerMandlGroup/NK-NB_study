@@ -31,9 +31,6 @@ options(Seurat.object.assay.version = "v5")
 print(params)
 ```
 
-```{r eval=FALSE, include=FALSE}
-remotes::install_github("GuangchuangYu/enrichplot")
-```
 
 ```{r load project specific R packages and color code}
 source("/home/rstudio/00_NK_paper_setup.R")
@@ -215,10 +212,10 @@ ggplot(percent_group_trans, aes(x = Var2, y = value, fill = Var1)) +
   scale_fill_manual(values = COLOR_CODE_BAR_PLOT) 
 ```
 
+
 ```{r}
 NK_ATAC <- readRDS(file = paste0(params$out, "/Rds/fetahu2023_scATAC_NK_processed_v2025-12-09.Rds"))
 ```
-
 
 ```{r}
 # extrapolating RNA activity based on chromatin accessibility of the corresponding promoter regions
@@ -672,6 +669,8 @@ common.features <- intersect(
 length(common.features)
 ```
 
+## ___1. Seurat/Signac CCA integration and label transfer___
+
 ```{r}
 transfer.anchors <- FindTransferAnchors(
   reference        = NK_RNA,
@@ -809,8 +808,6 @@ for (cl in clusters) {
 DARs_hNK_Bm3 <- da_list[["clhNK_Bm3_ATRXmut_vs_control"]] %>% dplyr::filter(p_val_adj < 0.05) 
 ```
 
-
-
 ```{r}
 library(stringr)
 
@@ -899,14 +896,14 @@ table(re_out$gene_name)
 ```
 
 ```{r}
-NK_ATAC$predicted_groups <- paste0(NK_ATAC$group,"_", NK_ATAC$predicted.id)
-NK_ATAC$predicted_groups <- factor(NK_ATAC$predicted_groups)
+NK_ATAC$predicted_NK_subtypes <- paste0(NK_ATAC$group,"_", NK_ATAC$predicted.id)
+NK_ATAC$predicted_NK_subtypes <- factor(NK_ATAC$predicted_NK_subtypes)
 
 candidate_genes <- c("ZNF471","DOCK1")
 
 for (gene in candidate_genes){
   CoveragePlot(peaks = TRUE,
-             group.by = "predicted_groups",
+             group.by = "predicted_NK_subtypes",
              window = 2000,
              object = NK_ATAC,
              region = gene,
@@ -924,9 +921,10 @@ for (gene in candidate_genes){
 
 ```
 
-## ___SingleR label transfer___
+## ___2. SingleR label transfer___
 
 ```{r}
+
 # Compute gene activity from peaks
 gene.activities <- GeneActivity(NK_ATAC)
 
@@ -1295,7 +1293,6 @@ barplot(percent_NK_group,
 data_percentage <- apply(percent_NK_group, 2, 
                          function(x){x*100/sum(x,na.rm=T)})
  
-
 data_percentage_sample <- apply(percent_NK_sample, 2, 
                          function(x){x*100/sum(x,na.rm=T)})
 
@@ -1348,28 +1345,15 @@ ggplot(percent_NK_group_trans, aes(x = Var2, y = value, fill = Var1)) +
 
 # all samples
 percent_NK_samples_trans <- reshape2::melt(data_percentage_sample) 
-
-# Step 1: Reshape the data into wide format for clustering
 data_wide <- t(data_percentage_sample)
-
-# Compute the Euclidean distance matrix
 d <- dist(data_wide, method = "euclidean")
-
-# Perform hierarchical clustering using complete linkage
 hc <- hclust(d, method = "complete")
-
-# Step 3: Reorder the samples based on clustering
 ordered_samples <- rownames(data_wide)[hc$order]
-
-# Arrange the data frame by the ordered Var2 column
 percent_NK_samples_trans <- percent_NK_samples_trans %>%
   arrange(Var2)
 
-# View the reordered data frame
 print(percent_NK_samples_trans)
 
-
-# Step 4: Plot the clustered bar plot
 ggplot(percent_NK_samples_trans, aes(x = Var2, y = value, fill = Var1)) + 
   geom_bar(stat = "identity", position = "stack") +
   theme_void() + 
@@ -1400,17 +1384,11 @@ ggplot(percent_NK_samples_trans, aes(x = Var2, y = value, fill = Var1)) +
   scale_fill_manual(values = COLOR_CODE_v2)
 
 
-
-# sort by alphabet
+# version 2
 ordered_samples <- sort(ordered_samples)
-
-# Step 1: Ensure Var2 is correctly converted into a factor with the desired order
 percent_NK_samples_trans$Var2 <- factor(percent_NK_samples_trans$Var2, levels = ordered_samples)
-
-# Arrange the data frame by the ordered Var2 column
 percent_NK_samples_trans <- percent_NK_samples_trans %>% 
   arrange(Var2,value)
-
 
 ggplot(percent_NK_samples_trans, aes(x = Var2, y = value, fill = Var1)) + 
   geom_bar(stat = "identity", position = "stack") +
@@ -1440,21 +1418,21 @@ ggplot(percent_NK_samples_trans, aes(x = Var2, y = value, fill = Var1)) +
         title = element_text(size = 20,
                                     color = "black")) +
   scale_fill_manual(values = COLOR_CODE_v2)
-
 ```
 
 ### ___Save predicted labels___
 
 ```{r eval=FALSE, include=FALSE}
 saveRDS(predicted_labels, 
-        file = paste0(params$out,"/Rds/NK_ATAC_predicted_NKclusters_without-cluster-NK4_RNAtoATAC_de.n=250.Rds"))
+        file = paste0(params$out,
+                      "/Rds/NK_ATAC_predicted_NKclusters_without-cluster-NK4_RNAtoATAC_de.n=250.Rds"))
 
 saveRDS(NK_ATAC, 
        file = paste0(params$out, "/Rds/NK_ATAC_wMatchedRNAcells_without-cluster-NK4_v2026-01_de.n=250.Rds"))
 ```
 
 
-## ___ArchR label transfer___
+## ___3. ArchR label transfer___
 
 ```{r}
 # devtools::install_github("GreenleafLab/ArchR", ref="master", repos = BiocManager::repositories())
@@ -1463,10 +1441,14 @@ library("ArchR")
 set.seed(2805)
 
 # archR params setup
+Sys.setenv(PATH = paste("/opt/conda/envs/atacseq/bin", 
+                        Sys.getenv("PATH"), sep = .Platform$path.sep))
+
 addArchRThreads(threads = 24) 
 addArchRGenome("hg38")
+macs2 <- "/opt/conda/envs/atacseq/bin/macs2"
 
-#frag_file <- paste0(params$out, "/Rds/feathu2023_ATAC_NKcells_fragments.tsv.gz")
+#frag_file <- paste0(params$out,"/Rds/feathu2023_ATAC_NKcells_fragments.tsv.gz")
 names(frag_file) <- "NK_ATAC"
 
 ArrowFiles <- createArrowFiles(
@@ -1646,7 +1628,14 @@ proj_filt <- addUMAP(
 proj_filt <- addGeneScoreMatrix(proj_filt,force = TRUE)
 ```
 
-label transfer RNA to ATAC
+### ___Label transfer___
+
+```{r}
+# LOAD SAVED FILE
+proj <- loadArchRProject(path  = "mnt_out/ArchR_filt/")
+proj_filt <- readRDS( "mnt_out/ArchR_filt/Save-ArchR-Project.rds")
+```
+
 
 ```{r}
 library(SingleCellExperiment)
@@ -1660,60 +1649,219 @@ proj_filt <- addGeneIntegrationMatrix(
   matrixName = "GeneIntegrationMatrix_v3",
   reducedDims = "IterativeLSI",
   seRNA = sceRNA,
-  addToArrow = FALSE,   # add to arrow file
+  addToArrow = TRUE,   # add to arrow file
   groupRNA = "predicted_NK_type_de.n350", 
-  nameCell = "predicted_NK_subset", # predicted cell ID
-  nameGroup = "predicted_group", # predicted label
-  nameScore = "predicted_score", # prediction score - higher score, higher confidence
+  nameCell = "predicted_cell", # predicted cell ID
+  nameGroup = "predicted_NK_subtype", # predicted label
+  nameScore = "prediction_score", # prediction score - higher score, higher confidence
   dimsToUse = 1:30,
-  force = TRUE
+  force = TRUE,
+  groupATAC = "group"
 )
 ```
 
-QC
+### ___Label transfer QC___
 
 ```{r}
 p1 <- plotEmbedding(
   ArchRProj = proj_filt,
   colorBy = "cellColData",
-  name = "predicted_group",
-  embedding = "UMAP"
+  name = "predicted_NK_subtype",
+  embedding = "UMAP",
+  baseSize = 14,
+  size = 2,
+  plotAs = "points"
 )
 
 p2 <- plotEmbedding(
   ArchRProj = proj_filt,
   colorBy = "cellColData",
-  name = "predicted_score",
-  embedding = "UMAP"
+  name = "prediction_score",
+  embedding = "UMAP",
+  baseSize = 14,
+  size = 2,
+  plotAs = "points"
 )
+
 
 p1
 p2
 ```
 
 ```{r}
-table(proj_filt$predicted_group)
+table(proj_filt$predicted_NK_subtype)
 
-proj_filt$predicted_group <- as.character(proj_filt$predicted_group)
-proj_filt$predicted_group <- as.factor(proj_filt$predicted_group)
+proj_filt$predicted_NK_subtype <- as.character(proj_filt$predicted_NK_subtype)
+proj_filt$predicted_NK_subtype <- as.factor(proj_filt$predicted_NK_subtype)
 
-validGroups <- setdiff(names(table(proj_filt$predicted_group)), "hNK_Bm4")
+#validGroups <- setdiff(names(table(proj_filt$predicted_NK_subtype)), "hNK_Bm4")
 
-maker_feat <- getMarkerFeatures(
-    ArchRProj = proj_filt,
-    useMatrix = "GeneIntegrationMatrix", # GeneIntegrationMatrix_v3
-    groupBy = "predicted_group",
-    useGroups = validGroups,
-    bias = c("TSSEnrichment", "log10(nFrags)")
-  )
-hm <- plotMarkerHeatmap(
-  seMarker = maker_feat,
-  cutOff = "FDR <= 0.1 & Log2FC >= 0.5",
-  labelMarkers = NK_functional_markers
+getFeatures(
+  ArchRProj = proj_filt,
+  useMatrix = "GeneScoreMatrix",
+  select = NULL,
+  ignoreCase = TRUE
 )
 
-hm
+plotEmbedding(ArchRProj = proj_filt, 
+              colorBy = "cellColData", 
+              name = "Clusters", 
+              embedding = "UMAP",
+              baseSize = 14,
+              size = 2,
+              plotAs = "points")
+
+plotEmbedding(ArchRProj = proj_filt, 
+              colorBy = "cellColData", 
+              name = "group", 
+              embedding = "UMAP",  
+              baseSize = 14,
+              size = 2,
+              plotAs = "points")
 ```
+
+```{r}
+# BARPLOT
+predict_NK_per_clust <- table(proj_filt$Clusters,proj_filt$predicted_NK_subtype)
+
+# Convert to proportions (per cluster/group)
+predict_NK_per_clust_prop <- prop.table(predict_NK_per_clust, margin = 1) * 100 
+
+input <- reshape2::melt(predict_NK_per_clust_prop)
+
+# Create the plot
+ggplot(input, aes(x = Var1, y = value, fill = Var2)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_void() + 
+  labs(x = "", y = "Percentage of NK cells", 
+       fill = "NK subsets") +
+  ggtitle("") +
+  theme(axis.text.x = element_text(angle = 45,
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 16),
+        axis.text.y = element_text(angle = 0, 
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 16),
+        legend.text = element_text(angle = 0, 
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 18),
+        axis.title.x = element_text(size = 16,
+                                    color = "black"),                        
+        axis.title.y = element_text(size = 16,
+                                    color = "black", angle = 90),                 
+        legend.title = element_text(size = 16,
+                                    color = "black"),
+        title = element_text(size = 20,
+                             color = "black")) +  
+  scale_fill_manual(values = COLOR_CODE_v2)
+```
+
+  C1  =  hNK_Bm2_hNK_Bm3 [transitioning]
+  C2  =  hNK_Bm3
+  C3  =  hNK_Bm3
+  C4  =  hNK_Bm3
+  C5  =  hNK_Bm1     
+  C6  =  hNK_Bm3
+  
+```{r}
+# BARPLOT
+predict_NK_per_group <- table(proj_filt$group,proj_filt$Clusters)
+
+# Convert to proportions (per cluster/group)
+predict_NK_per_group_prop <- prop.table(predict_NK_per_group, margin = 1) * 100 
+
+input <- reshape2::melt(predict_NK_per_group_prop)
+
+# Create the plot
+ggplot(input, aes(x = Var1, y = value, fill = Var2)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_void() + 
+  labs(x = "", y = "Percentage of NK cells", 
+       fill = "NK subsets") +
+  ggtitle("") +
+  theme(axis.text.x = element_text(angle = 45,
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 16),
+        axis.text.y = element_text(angle = 0, 
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 16),
+        legend.text = element_text(angle = 0, 
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 18),
+        axis.title.x = element_text(size = 16,
+                                    color = "black"),                        
+        axis.title.y = element_text(size = 16,
+                                    color = "black", angle = 90),                 
+        legend.title = element_text(size = 16,
+                                    color = "black"),
+        title = element_text(size = 20,
+                             color = "black")) 
+```
+
+
+```{r}
+head(names(proj_filt@cellColData))
+
+proj_filt <- addImputeWeights(proj_filt)
+
+genes_of_interest <- c("ID2","RUNX3","ETS1",
+                       "EOMES","TBX21","ZEB2"
+                       )
+
+p <- plotEmbedding(
+    ArchRProj = proj_filt, 
+    colorBy = "GeneScoreMatrix", 
+    name = genes_of_interest, 
+    embedding = "UMAP",
+    baseSize = 14,
+    size = 2,
+    plotAs = "points",
+    imputeWeights = getImputeWeights(proj_filt)
+)
+
+pdf("/home/rstudio/mnt_out/figures/snATAC_NKcells_UMAP_TF_geneActivity.pdf")
+p
+dev.off()
+
+
+# Add Tile Matrix
+proj_filt <- addTileMatrix(proj_filt, 
+                           force = TRUE, 
+                           tileSize = 1000)
+
+proj_filt <- getFeatures(proj_filt, 
+            select = genes_of_interest, 
+            useMatrix = "TileMatrix")
+
+
+a <- plotEmbedding(
+    ArchRProj = proj_filt, 
+    colorBy = "TileMatrix", 
+    name = genes_of_interest, 
+    embedding = "UMAP",
+    baseSize = 14,
+    size = 2,
+    plotAs = "points",
+    imputeWeights = getImputeWeights(proj_filt)
+)
+
+a
+```
+chr     start      end        name    strand
+chr2    8678845    8684461    ID2     +
+chr1    24899511   24965121   RUNX3   -
+chr11   128328656  128457501  ETS1    +
+chr3    27715949   27722711   EOMES   -
+chr17   47733236   47746126   TBX21   +
+chr2    144364364  144521057  ZEB2    -
+
+
 ### ___Add metadata___
 
 ```{r}
@@ -1772,44 +1920,89 @@ table(proj_filt$group,  useNA = "ifany")
 ```
 
 ```{r}
-tab <- table(proj_filt$group, proj_filt$predicted_group)
+tab <- table(proj_filt$group, proj_filt$predicted_NK_subtype)
 tab
 tab_prop <- prop.table(tab, margin = 1) 
+
+input <- reshape2::melt(tab_prop)
 
 barplot(
   tab_prop,
   beside = FALSE,
   las = 2,
-  ylab = "Fraction of NK cells",
-  xlab = "Group",
+  xlab = "Fraction of NK cells",
+  ylab = "Group",
   legend.text = TRUE,
   args.legend = list(x = "topright", bty = "n", cex = 0.9)
 )
+
+COLOR_CODE_GROUP <- c("control"   = "#7EA3AC",
+                      "ATRXmut"   = "#4f4e92",
+                      "MYCNamp"       = "#A7563C",
+                      "ATRXwtMYCNwt"  = "#FAA21B")
+
+ggplot(input, aes(x = Var1, y = value, fill = Var2)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_void() +
+  labs(x = "", y = "Percentage of NK cells",
+       fill = "NK subsets") +  
+  ggtitle("snATAC-seq of BM metastasis samples") +
+  theme(axis.text.x = element_text(angle = 45,
+                                   color = "black",
+                                   size = 16),
+        axis.text.y = element_text(angle = 0,
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 16),
+        legend.text = element_text(angle = 0,
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 18),
+        axis.title.x = element_text(size = 16,
+                                    color = "black",
+                                    angle = 45),
+        axis.title.y = element_text(size = 16,
+                                    color = "black", 
+                                    angle = 90),
+        legend.title = element_text(size = 16,
+                                    color = "black"),
+        title = element_text(size = 20,
+                             color = "black")) +
+  scale_fill_manual(values = COLOR_CODE_v2)   
+
+
 ```
 
 ```{r}
+# INSTALL MACS2 with PIP not CONDA ?!
+
 # Make pseudo-bulk coverages (often by cell state or sample)
 proj_filt <- addGroupCoverages(
   ArchRProj = proj_filt,
-  groupBy = "sample"   # or "predicted_group"
+  groupBy = "group"   # or "predicted_NK_subtype"  for NK subsets
 )
+
+#addArchRThreads(threads = 1) # set to run MACS2 on a single core ?!
+#options(mc.cores = 1)
 
 # Call peaks on those pseudo-bulks
 proj_filt <- addReproduciblePeakSet(
   ArchRProj = proj_filt,
-  groupBy = "sample",  # same as above
-  pathToMacs2 = "/path/to/macs2" # must be available in your environment
+  peakMethod = "Tiles", # using tiles instead of MACS2
+  method = "p",
+  groupBy = "group",  # same as above
+  #pathToMacs2 = macs2 
 )
 ```
 
 
 
 ```{r}
-celltypes <- levels(proj_filt$predicted_group)
+celltypes <- levels(proj_filt$predicted_NK_subtype)
 
 # differentially accesible regions
 marker_list <- lapply(celltypes, function(ct) {
-  cells_ct <- proj_filt$cellNames[proj_filt$predicted_group == ct]
+  cells_ct <- proj_filt$cellNames[proj_filt$predicted_NK_subtype == ct]
   proj_ct <- subsetArchRProject(
     ArchRProj = proj_filt,
     cells = cells_ct,
@@ -1845,14 +2038,13 @@ saveArchRProject(ArchRProj = proj_filt,
                  outputDirectory = paste0(params$out,"/ArchR_filt/"), 
                  load = FALSE)
 
-# LOAD SAVED FILE
-proj <- readRDS( "ArchR_QCfiltered/Save-ArchR-Project.rds")
-proj <- loadArchRProject(path  = paste0(params$out,"/ArchR"))
+
+saveRDS(proj_filt, file = paste0(params$out,"/ArchR_filt/ATAC_analysis_20260115.Rds"))
 ```
 
-
-
-
+```{r}
+save.image("~/archR_analysis_20260115.RData")
+```
 
 
 # ___The End___

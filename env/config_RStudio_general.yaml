@@ -2,11 +2,11 @@ project_name: single_cell
 project_docker: swernig/single_cell_env:v1.0
 
 # PATHS AS VISIBLE WITHIN RSTUDIO:
-project_root: /home/root/
-resource_root: /home/root/mnt_resources
-data_root: /home/root/mnt_data
-out_root: /home/root/mnt_out
-tmp_root: /home/root/mnt_tmp
+project_root: /home/rstudio/
+resource_root: /home/rstudio/mnt_resources
+data_root: /home/rstudio/mnt_data
+out_root: /home/rstudio/mnt_out
+tmp_root: /home/rstudio/mnt_tmp
 
 
 # access to local folders:

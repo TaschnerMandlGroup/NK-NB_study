@@ -685,3 +685,32 @@ PATIENTS_RENAME <- c("C1" = "ctrl_01",
                      "S2" = "sporadic_02",
                      "S3" = "sporadic_03",
                      "S5" = "sporadic_05")
+
+COLOR_CODE_perGROUP <- c( control = "#7EA3AC",
+                          ATRXmut = "#4f4e92",
+                          MYCNamp = "#A7563C",
+                          ATRXwtMYCNwt = "#FAA21B")
+
+COLOR_CODE_perCLUST <- c("C1" = "#264653", 
+                         "C2" = "#287271",
+                         "C3" = "#2a9d8f",
+                         "C4" = "#4f4e92",
+                         "C5" = "#e9c46a",
+                         "C6" = "#f4a261",
+                         "C7" = "#e76f51") 
+
+COLOR_CODE_perCLUST_v2 <- c("CD56bright 1" = "#264653", 
+                         "CD56bright 2" = "#287271",
+                         "CD56bright 3" = "#2a9d8f",
+                         "Intermediate 1" = "#4f4e92",
+                         "Intermediate 2" = "#e9c46a",
+                         "CD56dim 1" = "#f4a261",
+                         "CD56dim 2" = "#e76f51") 
+
+COLOR_CODE_perMETACLUST <- c("CD56bright" = "#264653", 
+                            "Intermediate" = "#4f4e92",
+                            "CD56dim" = "#e76f51") 
+
+
+
+heatmap_colors <- c("#9B59B6","#D7BDE2","#FFFFFF","#ABEBC6","#1E8449")

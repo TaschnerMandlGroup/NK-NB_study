@@ -1,12 +1,12 @@
 # RUN AS:
-# docker build --build-arg GITHUB_PAT=XXX -t docker.io/swernig/nk_project:v1.1 -f NK_project_v2026-01-14.Dockerfile .
+# docker build --build-arg GITHUB_PAT=XXX -t docker.io/swernig/nk_project:v1.0 -f NK_project_v2026-01-14.Dockerfile .
 
 FROM docker.io/rocker/tidyverse:4.4.2
 
 LABEL maintainer="Sara Wernig-Zorc <sara.wernig-zorc@ccri.at>"
 LABEL version="v1.1"
 
-# Ensure we run as root during setup 
+# Ensure we run as root during setup (rocker base already does this)
 USER root
 
 # Noninteractive apt
@@ -24,7 +24,7 @@ RUN apt-get update \
     libglpk-dev \
     libxt6 \
     libcurl4-openssl-dev \
-    libssl-dev \
+    which \
     libjq-dev \
     libprotobuf-dev \
     protobuf-compiler \
@@ -41,6 +41,8 @@ RUN apt-get update \
     python3-dev \
     python3-venv \
     python3-pip \
+    python2.7 \
+    python-pip \
     libncurses5-dev \
     libncursesw5-dev \
     dialog \
@@ -52,31 +54,15 @@ RUN apt-get update \
     nano \
     htop \
     wget \
-    bzip2 \
-    ca-certificates \
+    software-properties-common \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Install Miniconda
-ENV CONDA_DIR=/opt/conda
-ENV PATH=${CONDA_DIR}/bin:${PATH}
 
-RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh \
-    && bash /tmp/miniconda.sh -b -p ${CONDA_DIR} \
-    && rm /tmp/miniconda.sh \
-    && ${CONDA_DIR}/bin/conda clean -afy \
-    && ln -s ${CONDA_DIR}/etc/profile.d/conda.sh /etc/profile.d/conda.sh \
-    && echo ". ${CONDA_DIR}/etc/profile.d/conda.sh" >> ~/.bashrc \
-    && echo "conda activate base" >> ~/.bashrc
+RUN pip2 install MACS2
 
-# Initialize conda for bash
-RUN ${CONDA_DIR}/bin/conda init bash
-
-# Install MACS2 via conda
-RUN ${CONDA_DIR}/bin/conda install -c bioconda -y macs2 \
-    && ${CONDA_DIR}/bin/conda clean -afy
-
-# Make sure rstudio user owns its home and libraries
+# Install R packages
+# Use Ncpus for parallel install to speed up the build
 RUN chown -R rstudio:rstudio /home/rstudio \
     && chown -R rstudio:rstudio ${R_HOME}/site-library \
     && chown -R rstudio:rstudio ${R_HOME}/library
