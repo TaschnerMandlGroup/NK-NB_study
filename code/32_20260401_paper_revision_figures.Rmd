@@ -1,0 +1,770 @@
+---
+title: "NK project: Paper revision figures"
+author: "Dr. Sara Wernig-Zorc"
+date: "2026-04-01"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  out: "/home/rstudio/mnt_out/"
+  anno: "/home/rstudio/mnt_resources/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 80)
+options(future.globals.maxSize = 80 * 10^9)
+options(Seurat.object.assay.version = "v5")
+print(params)
+```
+
+# ___Project specific setup___
+
+```{r load project specific R packages and color code, echo = FALSE}
+source("/home/rstudio/00_NK_paper_setup.R")
+source("/home/rstudio/00_NK_paper_utils.R")
+library("ArchR")
+set.seed(2805)
+library("BSgenome.Hsapiens.UCSC.hg38")
+```
+
+# ___Load RNA data___
+
+```{r}
+fetahu2023 <- readRDS("~/mnt_out/Rds/fetahu2023_withNewMetadata.Rds")
+
+fetahu2023 <- fetahu2023 %>% 
+  NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000)
+
+unique(fetahu2023$orig.ident)
+
+fetahu2023$celltype  <-  fetahu2023$orig.ident
+
+
+ALL_NK <- readRDS("~/mnt_out/Rds/ALL_NK_cluster_withNewMetadata.Rds")
+
+ALL_NK <- ALL_NK %>% 
+  NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000)
+
+
+unique(ALL_NK$predicted_NK_type_de.n350)
+
+ALL_NB <- readRDS("~/mnt_out/Rds/ALL_NB_cluster_withNewMetadata.Rds")
+
+ALL_NB <- ALL_NB %>% 
+  NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000)
+
+```
+
+# ___CD6 expression per cell type___
+
+```{r}
+do_FeaturePlot(fetahu2023,
+            features = "CD6",
+            reduction = "UMAP",
+            pt.size = 0.05,
+            order = TRUE)
+
+VlnPlot(fetahu2023,
+         group.by = "celltype",
+         split.by = "group",
+         features = "CD6",
+         log = TRUE,
+         layer = "data")
+
+VlnPlot(fetahu2023,
+         group.by = "celltype",
+         features = "CD6",
+         log = TRUE,
+         layer = "data",
+        pt.size = 0,
+        cols = COLOR_CODE_UMAP_v2)
+
+VlnPlot(fetahu2023,
+        group.by = "celltype",
+        split.by = "group",
+        features = ALCAM_ligands,
+        log = TRUE,
+        layer = "data",
+        pt.size = 0,
+        cols = COLOR_CODE_GROUP_v1)
+```
+
+# ___ALCAM expression per cell type___
+
+```{r fig.height=3, fig.width=10}
+do_FeaturePlot(fetahu2023,
+            features = "ALCAM",
+            reduction = "UMAP",
+            pt.size = 0.05,
+            order = TRUE)
+
+VlnPlot(fetahu2023,
+         group.by = "cell_type",
+         split.by = "group",
+         features = "ALCAM",
+         log = TRUE,
+         layer = "data",
+        pt.size = 0.01)
+
+VlnPlot(fetahu2023,
+         group.by = "cell_type",
+         features = "ALCAM",
+         log = TRUE,
+         layer = "data",
+        pt.size = 0,
+        cols = COLOR_CODE_UMAP_v2)
+```
+
+# ___Other potential L-R pairs___
+
+```{r}
+new_candidates <- c("DLL3",  "NOTCH1", 
+                    "PRSS3", "F2R",
+                    "EPHA4", "FGFR1",
+                    "CD6",	"DAG1")
+
+new_candidates <- c("PRSS3", # on NB cells
+                    "F2R")   # on NK cells
+
+candidate_plot <- VlnPlot(fetahu2023,
+         group.by = "cell_type",
+        split.by = "group",
+         features = new_candidates,
+         log = TRUE,
+         layer = "data",
+        pt.size = 0,
+        cols = COLOR_CODE_GROUP_v1)
+
+candidate_plot
+```
+
+Explanation/interpretation: Tumor-derived DLL3 activates NOTCH1 on NK cells, and the downstream canonical effector (RBPJ) sits in the same module as your entire chromatin repression complex. The signaling cascade is directly wired into the epigenetic block: DLL3 -> NOTCH1 -> RBPJ (M4) -> HES/HEY targets -> ID2 upregulation -> maturation arrest. Notably, DLL1 is also in M5, raising the possibility of an autocrine/paracrine NK–NK NOTCH loop amplifying the tumor-initiated signal. This is the extrinsic trigger that could initiate or maintain the ATRXdel chromatin silencing axis.
+
+ATRXdel NK cells retain aberrant TGFB1 accessibility (M21/M22 not fully silenced, consistent with maturation failure) and likely produce TGF-β1 via NF-κB-driven transcription (M3/M4 axis) rather than via exhaustion. The PDCD1/TOX2/LAG3 co-accessibility in the same modules is chromatin priming rather than active exhaustion transcription — distinguishing ATRXdel TGFB1 production mechanistically from what would occur in MYCNamp cells. Immature NK cells failing to silence TGFB1 is a direct consequence of the maturation block, and the TGF-β they produce acts back on the tumor and potentially on neighboring NK cells in a way that perpetuates the immunosuppressive microenvironment.
+
+# ___Other ALCAM ligands___
+
+Addressing reviewer question regarding other ALCAM ligands [LILRB4, CD9, L1CAM, 
+SOSTDC1, S100B, LGALS1, LGALS3, LGALS8, SDCBP, EZR, ADAM17, MMP14]
+
+```{r fig.height=10, fig.width=10}
+ALCAM_ligands <- c("CD6","LILRB4", "CD9", "L1CAM", 
+                   "S100B", "LGALS1", "LGALS3", "LGALS8",
+                    "SDCBP", "EZR", "ADAM17", "MMP14")
+
+VlnPlot(ALL_NK,
+        group.by = "predicted_NK_type_de.n350",
+        split.by = "group",
+        features = ALCAM_ligands,
+        log = TRUE,
+        layer = "data",
+        pt.size = 0,
+        cols = COLOR_CODE_GROUP_v1)
+```
+
+# ___Other CD6 receptors___
+
+Addressing reviewer question regarding other CD6 receptors [CDCP1, CD44, GADS, LCP2]
+
+## ___On NK Cells___
+
+```{r  fig.height=3, fig.width=6}
+CD6_receptors <- c("CDCP1", "CD44", "LCP2")
+
+VlnPlot(ALL_NK,
+        group.by = "predicted_NK_type_de.n350",
+        split.by = "group",
+        features = CD6_receptors,
+        log = TRUE,
+        layer = "data",
+        pt.size = 0,
+        cols = COLOR_CODE_GROUP_v1)
+```
+
+## ___On TU cells___
+
+```{r fig.height=6, fig.width=6}
+CD6_receptors <- c("ALCAM","CDCP1", "CD44", "LCP2")
+
+VlnPlot(ALL_NB,
+        group.by = "group",
+        features = CD6_receptors,
+        log = TRUE,
+        layer = "data",
+        pt.size = 0,
+        cols = COLOR_CODE_GROUP_v1)
+```
+
+
+# ___CD39 expression___
+
+```{r  fig.height=3, fig.width=6}
+# CD39
+gene_of_interest <- "ENTPD1"
+
+VlnPlot(ALL_NK,
+        group.by = "predicted_NK_type_de.n350",
+        split.by = "group",
+        features = gene_of_interest,
+        log = TRUE,
+        layer = "data",
+        pt.size = 0,
+        cols = COLOR_CODE_GROUP_v1)
+```
+
+
+
+# ___NK cell gene modules___
+
+I defined 25 gene modules based on integrated ATAC and RNA data. Here I want to
+address the function of each modules. 
+
+```{r}
+proj_filt <- readRDS(file = paste0(params$out,"/ArchR_v20260203/ATAC_analysis_v20260203.Rds"))
+
+library(ArchR)
+library(SummarizedExperiment)
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+
+set.seed(42)
+
+# Resolve Bioconductor/plyr conflicts with dplyr
+filter    <- dplyr::filter
+select    <- dplyr::select
+mutate    <- dplyr::mutate
+summarise <- dplyr::summarise
+rename    <- dplyr::rename
+count     <- dplyr::count
+
+module_dir   <- "/home/rstudio/mnt_out/tables/NK_module_genes"    # dir containing module_N_genes.csv
+cluster_col  <- "Clusters_res1"          # cellColData column for C1–C7 
+# THIS IS THE FINAL CLUSTERING I AM USING
+group_col    <- "group"                  # cellColData column for ATRXdel etc.
+matrix_name  <- "GeneScoreMatrix"       # or "GeneIntegrationMatrix"
+n_ctrl_bins  <- 25L                      # expression bins for ctrl sampling
+n_ctrl_genes <- 100L                     # ctrl genes per module 
+z_cap        <- 2.0                      # cap z-scores for colour scale
+
+group_order   <- c("ATRXdel", "ATRXwtMYCNwt", "control", "MYCNamp")
+cluster_order <- paste0("C", 1:7)
+
+module_files <- list.files(module_dir,
+                           pattern  = "module_\\d+_genes\\.csv",
+                           full.names = TRUE)
+module_nums  <- as.integer(gsub(".*module_(\\d+)_genes\\.csv", "\\1",
+                                basename(module_files)))
+module_files <- module_files[order(module_nums)]
+
+module_genes <- lapply(module_files, function(f) read.csv(f)$gene)
+names(module_genes) <- paste0("M", sort(module_nums))
+message("Loaded ", length(module_genes), " modules")
+
+all_module_genes <- unique(unlist(module_genes))
+se <- getMatrixFromProject(proj_filt)
+
+# Confirm assay name
+avail_assays <- assayNames(se)
+avail_assays
+
+# Gene names 
+gene_names <- rowData(se)$name
+if (is.null(gene_names)) gene_names <- rownames(se)
+rownames(se) <- gene_names
+
+expr_mat   <- as.matrix(assay(se))
+
+message(sprintf("Matrix: %d genes × %d cells", nrow(expr_mat), ncol(expr_mat)))
+
+# For each module:
+#   1. Pool all genes present in matrix
+#   2. Bin ALL matrix genes by mean expression rank (25 bins)
+#   3. For each expression bin represented by module genes,
+#      sample n_ctrl_genes/n_bins control genes from the same bin
+#      (excluding module genes themselves)
+#   4. score = colMeans(module_genes) − colMeans(ctrl_genes)
+#
+# This mirrors Seurat::AddModuleScore 
+
+# Bin all genes in full matrix by mean expression rank
+full_gene_means <- rowMeans(as.matrix(assay(se)), na.rm = TRUE)
+gene_bins <- cut(rank(full_gene_means, ties.method = "average"),
+                 breaks = n_ctrl_bins,
+                 labels = FALSE)
+names(gene_bins) <- names(full_gene_means)
+
+full_expr <- as.matrix(assay(se))   # full matrix for ctrl sampling
+
+score_mat <- matrix(NA_real_,
+                    nrow     = ncol(expr_mat),
+                    ncol     = length(module_genes),
+                    dimnames = list(colnames(expr_mat), names(module_genes)))
+
+for (mod in names(module_genes)) {
+  genes_use <- intersect(module_genes[[mod]], rownames(expr_mat))
+  n_found   <- length(genes_use)
+  if (n_found == 0) {
+    warning(mod, ": no genes found in matrix — skipping")
+    next
+  }
+
+  # Bins occupied by module genes
+  mod_bins    <- gene_bins[genes_use]
+  bin_table   <- table(mod_bins)
+
+  # Sample ctrl genes proportional to bin representation
+  ctrl_genes <- c()
+  for (b in names(bin_table)) {
+    bin_pool    <- names(gene_bins)[gene_bins == as.integer(b)]
+    bin_pool    <- setdiff(bin_pool, genes_use)            # exclude module genes
+    n_from_bin  <- as.integer(bin_table[b]) *
+                   (n_ctrl_genes / n_found)
+    n_sample    <- min(ceiling(n_from_bin), length(bin_pool))
+    if (n_sample > 0)
+      ctrl_genes <- c(ctrl_genes, sample(bin_pool, n_sample))
+  }
+
+  mod_score  <- colMeans(full_expr[genes_use,  , drop = FALSE], na.rm = TRUE)
+  ctrl_score <- if (length(ctrl_genes) > 0)
+    colMeans(full_expr[ctrl_genes, , drop = FALSE], na.rm = TRUE)
+  else
+    rep(0, ncol(full_expr))
+
+  score_mat[, mod] <- mod_score - ctrl_score
+  message(sprintf("  %s: %d / %d genes scored", mod, n_found,
+                  length(module_genes[[mod]])))
+}
+
+cell_meta <- as.data.frame(
+  getCellColData(proj_filt, select = c(cluster_col, group_col))
+)
+colnames(cell_meta) <- c("cluster", "group")
+
+# ArchR cell names include "#" (SampleName#Barcode)
+score_df <- as.data.frame(score_mat)
+score_df$cell    <- rownames(score_df)
+cell_meta$cell   <- rownames(cell_meta)
+score_df <- left_join(score_df, cell_meta, by = "cell")
+
+stopifnot(sum(!is.na(score_df$cluster)) > 0)
+
+# AGGREGATE: MEAN PER CLUSTER × GROUP
+agg <- score_df %>%
+  pivot_longer(cols = all_of(names(module_genes)),
+               names_to  = "Module",
+               values_to = "Score") %>%
+  filter(!is.na(cluster), !is.na(group), !is.na(Score)) %>%
+  group_by(cluster, group, Module) %>%
+  summarise(MeanScore = mean(Score, na.rm = TRUE),
+            nCells    = dplyr::n(),
+            .groups   = "drop")
+
+# warn if any combination has very few cells
+sparse <- filter(agg, nCells < 10)
+if (nrow(sparse) > 0) {
+  message("Warning: ", nrow(sparse),
+          " cluster × group × module combos have <10 cells — interpret with caution!!")
+}
+
+# Z-SCORE PER MODULE ACROSS ALL CLUSTER×GROUP COMBOS
+agg <- agg %>%
+  group_by(Module) %>%
+  mutate(ZScore = as.numeric(scale(MeanScore))) %>%
+  ungroup() %>%
+  mutate(ZScore = pmax(pmin(ZScore, z_cap), -z_cap))   # cap extremes
+
+# FACTOR ORDERING
+agg$Module  <- factor(agg$Module,  levels = paste0("M", 1:25))
+agg$cluster <- factor(agg$cluster, levels = cluster_order)
+agg$group   <- factor(agg$group,   levels = group_order)
+
+# x-axis labels: "C1|ATRXdel", sorted cluster-first, group-second
+agg <- agg %>%
+  mutate(clust_group = paste0(cluster, "|", group))
+
+x_levels <- agg %>%
+  distinct(clust_group, cluster, group) %>%
+  arrange(cluster, group) %>%
+  pull(clust_group)
+
+agg$clust_group <- factor(agg$clust_group, levels = x_levels)
+
+mat <- agg %>%
+  select(Module, clust_group, ZScore) %>%
+  pivot_wider(names_from  = clust_group,
+              values_from = ZScore) %>%
+  column_to_rownames("Module") %>%
+  as.matrix()
+
+mat <- mat[paste0("M", 1:25), x_levels, drop = FALSE]
+
+# column anno
+col_meta <- agg %>%
+  distinct(clust_group, cluster, group) %>%
+  arrange(factor(clust_group, levels = x_levels))
+
+ha_top <- HeatmapAnnotation(
+  Cluster = col_meta$cluster,
+  Group   = col_meta$group,
+  col     = list(
+    Cluster = COLOR_CODE_perCLUST[levels(col_meta$cluster)],
+    Group   = COLOR_CODE_perGROUP[levels(col_meta$group)]
+  ),
+  annotation_name_side = "left",
+  annotation_name_gp   = gpar(fontsize = 8),
+  simple_anno_size     = unit(3, "mm"),
+  gap                  = unit(1, "mm")
+)
+
+# color scale
+col_fun <- colorRamp2(
+  c(-z_cap, 0, z_cap),
+  c("#9B59B6","#FFFFFF","#1E8449")
+)
+
+# plot heatmap
+# column_split by cluster creates visual separation between the 7 cluster blocks
+
+ht <- Heatmap(
+  mat,
+  name                  = "RNA Z-score",
+  col                   = col_fun,
+  top_annotation        = ha_top,
+
+  # Row order: fixed M1→M25 (change to TRUE to cluster modules)
+  cluster_rows          = FALSE,
+  row_names_side        = "left",
+  row_names_gp          = gpar(fontsize = 9),
+  row_title             = NULL,
+
+  # Column order: fixed, split by cluster
+  cluster_columns       = FALSE,
+  column_split          = col_meta$cluster,    # gap between clusters
+  column_gap            = unit(2, "mm"),
+  column_title_gp       = gpar(fontsize = 9, fontface = "bold"),
+  column_names_gp       = gpar(fontsize = 7),
+  column_names_rot      = 60,
+
+  # Visuals
+  border                = TRUE,
+  rect_gp               = gpar(col = "white", lwd = 0.3),
+
+  # Legend
+  heatmap_legend_param  = list(
+    title          = "Z-score",
+    at             = c(-2, -1, 0, 1, 2),
+    legend_height  = unit(3, "cm"),
+    title_gp       = gpar(fontsize = 9),
+    labels_gp      = gpar(fontsize = 8)
+  ),
+
+  width  = unit(22, "cm"),
+  height = unit(14, "cm")
+)
+
+# save
+pdf(paste0(params$out,"figures/module_activity_cluster_group.pdf"), 
+    width = 16, height = 9)
+draw(ht,
+     heatmap_legend_side   = "right",
+     annotation_legend_side = "right",
+     padding = unit(c(5, 5, 5, 5), "mm"))
+dev.off()
+
+# export the scored matrix as CSV
+write.csv(agg, paste0(params$out,"tables/module_scores_cluster_group_long.csv"), 
+                      row.names = FALSE)
+```
+
+# ___NK cell cluster annotation based on functional NK cell gene modules___
+
+Barplot with annotated ATAC clusters
+
+```{r}
+# rename clusters
+cluster_names <- c("C1" = "CD56bright 1",     # Immunomodulatory NK cells
+                   "C2" = "CD56bright 2",     # Immunomodulatory NK cells
+                   "C3" = "CD56bright 3",     # Immunomodulatory NK cells
+                   "C4" = "Intermediate 1",   # Transitional NK cells
+                   "C5" = "Intermediate 2",   # Transitional NK cells
+                   "C6" = "CD56dim 1",        # Cytotoxic NK cells
+                   "C7" = "CD56dim 2")        # Cytotoxic NK cells
+
+proj_filt$Cluster_names <- cluster_names[proj_filt$Clusters_res1]
+
+# metaclusters
+
+# rename clusters
+metacluster_names <- c("C1" = "CD56bright",     # Immunomodulatory NK cells
+                   "C2" = "CD56bright",     # Immunomodulatory NK cells
+                   "C3" = "CD56bright",     # Immunomodulatory NK cells
+                   "C4" = "Intermediate",   # Transitional NK cells
+                   "C5" = "Intermediate",   # Transitional NK cells
+                   "C6" = "CD56dim",        # Cytotoxic NK cells
+                   "C7" = "CD56dim")        # Cytotoxic NK cells
+
+proj_filt$Metacluster_names <- metacluster_names[proj_filt$Clusters_res1]
+
+
+# Rename sample ATRXdel to ATRXdel
+proj_filt$group <- ifelse(proj_filt$group == "ATRXdel", "ATRXdel", proj_filt$group)
+
+unique(proj_filt$Cluster_names)
+unique(proj_filt$group)
+```
+
+
+## ___Bar plot per cluster___
+
+```{r}
+meta <- as.data.frame(getCellColData(proj_filt, 
+                                     select = c("sample", "group", "Cluster_names")))
+
+cluster_order <- c(
+  "CD56bright 1", "CD56bright 2", "CD56bright 3",
+  "Intermediate 1", "Intermediate 2",
+  "CD56dim 1", "CD56dim 2")
+
+meta$Cluster_names <- factor(meta$Cluster_names, levels = cluster_order)
+meta$sample <- factor(meta$sample, levels = PATIENT_ORDER)
+meta$group <- factor(meta$group, levels = GROUP_ORDER)
+
+# per group
+df_group <- meta %>%
+  count(group, Cluster_names, name = "n_cells") %>%
+  group_by(group) %>%
+  mutate(pct = n_cells / sum(n_cells) * 100) %>%
+  ungroup()
+
+p_group <- ggplot(df_group, aes(x = group, y = pct, fill = Cluster_names)) +
+  geom_bar(stat = "identity", width = 0.7, colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = COLOR_CODE_perCLUST_v2, breaks = cluster_order) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(
+    title = "NK-cell cluster composition per group",
+    x     = NULL,
+    y     = "% of cells",
+    fill  = "Cluster"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x    = element_text(angle = 35, hjust = 1),
+    legend.position = "right",
+    plot.title     = element_text(face = "bold")
+  )
+
+# per sample
+df_sample <- meta %>%
+  count(sample, Cluster_names, name = "n_cells") %>%
+  group_by(sample) %>%
+  mutate(pct = n_cells / sum(n_cells) * 100) %>%
+  ungroup()
+
+p_sample <- ggplot(df_sample, aes(x = sample, y = pct, fill = Cluster_names)) +
+  geom_bar(stat = "identity", width = 0.7, colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = COLOR_CODE_perCLUST_v2, breaks = cluster_order) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(
+    title = "NK-cell cluster composition per sample",
+    x     = NULL,
+    y     = "% of cells",
+    fill  = "Cluster"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x    = element_text(angle = 35, hjust = 1),
+    legend.position = "right",
+    plot.title     = element_text(face = "bold")
+  )
+
+# plots
+library(patchwork)
+combined <- p_group | p_sample
+
+ggsave(paste0(params$out,"figures/NK_cluster_barplots.pdf"), combined,
+       width = 10, height = 4, device = cairo_pdf)
+ggsave(paste0(params$out,"figures/NK_cluster_barplots.png"), combined,
+       width = 10, height = 4, dpi = 300)
+```
+
+## ___Bar plot per metacluster___
+
+```{r}
+meta <- as.data.frame(getCellColData(proj_filt, 
+                                     select = c("sample", "group", "Metacluster_names")))
+
+cluster_order <- c(
+  "CD56bright",
+  "Intermediate",
+  "CD56dim")
+
+meta$Metacluster_names <- factor(meta$Metacluster_names, levels = cluster_order)
+meta$sample <- factor(meta$sample, levels = PATIENT_ORDER)
+meta$group <- factor(meta$group, levels = GROUP_ORDER)
+
+# per group
+df_group <- meta %>%
+  count(group, Metacluster_names, name = "n_cells") %>%
+  group_by(group) %>%
+  mutate(pct = n_cells / sum(n_cells) * 100) %>%
+  ungroup()
+
+p_group <- ggplot(df_group, aes(x = group, y = pct, fill = Metacluster_names)) +
+  geom_bar(stat = "identity", width = 0.7, colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = COLOR_CODE_perMETACLUST, breaks = cluster_order) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(
+    title = "NK-cell cluster composition per group",
+    x     = NULL,
+    y     = "% of cells",
+    fill  = "Cluster"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x    = element_text(angle = 35, hjust = 1),
+    legend.position = "right",
+    plot.title     = element_text(face = "bold")
+  )
+
+# per sample
+df_sample <- meta %>%
+  count(sample, Metacluster_names, name = "n_cells") %>%
+  group_by(sample) %>%
+  mutate(pct = n_cells / sum(n_cells) * 100) %>%
+  ungroup()
+
+p_sample <- ggplot(df_sample, aes(x = sample, y = pct, fill = Metacluster_names)) +
+  geom_bar(stat = "identity", width = 0.7, colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = COLOR_CODE_perMETACLUST, breaks = cluster_order) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(
+    title = "NK-cell cluster composition per sample",
+    x     = NULL,
+    y     = "% of cells",
+    fill  = "Cluster"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x    = element_text(angle = 35, hjust = 1),
+    legend.position = "right",
+    plot.title     = element_text(face = "bold")
+  )
+
+# plots
+library(patchwork)
+combined <- p_group | p_sample
+
+ggsave(paste0(params$out,"figures/NK_metacluster_barplots.pdf"), combined,
+       width = 10, height = 4, device = cairo_pdf)
+ggsave(paste0(params$out,"figures/NK_metacluster_barplots.png"), combined,
+       width = 10, height = 4, dpi = 300)
+```
+
+
+### ___with the label transfer from RNA___
+
+```{r}
+meta <- as.data.frame(getCellColData(proj_filt, 
+                                     select = c("sample", "group", "majority_vote_label")))
+
+cluster_order <- c(
+  "hNK_Bm1",
+  "hNK_Bm2",
+  "hNK_Bm3",
+  "hNK_Bm4")
+
+meta$majority_vote_label <- factor(meta$majority_vote_label, levels = cluster_order)
+meta$sample <- factor(meta$sample, levels = PATIENT_ORDER)
+meta$group <- factor(meta$group, levels = GROUP_ORDER)
+
+# per group
+df_group <- meta %>%
+  count(group, majority_vote_label, name = "n_cells") %>%
+  group_by(group) %>%
+  mutate(pct = n_cells / sum(n_cells) * 100) %>%
+  ungroup()
+
+p_group <- ggplot(df_group, aes(x = group, y = pct, fill = majority_vote_label)) +
+  geom_bar(stat = "identity", width = 0.7, colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = COLOR_CODE_v2, breaks = cluster_order) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(
+    title = "NK-cell cluster composition per group",
+    x     = NULL,
+    y     = "% of cells",
+    fill  = "Cluster"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x    = element_text(angle = 35, hjust = 1),
+    legend.position = "right",
+    plot.title     = element_text(face = "bold")
+  )
+
+# per sample
+df_sample <- meta %>%
+  count(sample, majority_vote_label, name = "n_cells") %>%
+  group_by(sample) %>%
+  mutate(pct = n_cells / sum(n_cells) * 100) %>%
+  ungroup()
+
+p_sample <- ggplot(df_sample, aes(x = sample, y = pct, fill = majority_vote_label)) +
+  geom_bar(stat = "identity", width = 0.7, colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = COLOR_CODE_v2, breaks = cluster_order) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(
+    title = "NK-cell cluster composition per sample",
+    x     = NULL,
+    y     = "% of cells",
+    fill  = "Cluster"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x    = element_text(angle = 35, hjust = 1),
+    legend.position = "right",
+    plot.title     = element_text(face = "bold")
+  )
+
+# plots
+library(patchwork)
+combined <- p_group | p_sample
+
+ggsave(paste0(params$out,"figures/NK_metacluster_labelTransfer_barplots.pdf"), combined,
+       width = 10, height = 4, device = cairo_pdf)
+ggsave(paste0(params$out,"figures/NK_metacluster_labelTransfer_barplots.png"), combined,
+       width = 10, height = 4, dpi = 300)
+```
+
+```{r}
+saveRDS(proj_filt, file = paste0(params$out,"/Rds/snATAC_NK_v20260401.Rds"))
+```
+
+# ___Adaptive NK cell signature: ModuleScore___
+
+The question we want to answer here is if we have any adaptive NK cells in the 
+ATAC data. When doing the label transfer from RNA data of matched patients,
+we saw a clear signature for adaptive NK cells in a small proportion of NK cells,
+however in the ATAC data, the label transfer did not identify any adaptive NK cells.
+
+```{r}
+
+```
+

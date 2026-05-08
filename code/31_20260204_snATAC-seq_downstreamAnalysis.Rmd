@@ -1,0 +1,154 @@
+---
+title: "NK project: snATAC-seq downstream analysis"
+author: "Dr. Sara Wernig-Zorc"
+date: "2026-02-04"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  out: "/home/rstudio/mnt_out/"
+  anno: "/home/rstudio/mnt_resources/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 80)
+options(future.globals.maxSize = 80 * 10^9)
+options(Seurat.object.assay.version = "v5")
+print(params)
+```
+
+# ___Project specific setup___
+
+```{r load project specific R packages and color code, echo = FALSE}
+source("/home/rstudio/00_NK_paper_setup.R")
+source("/home/rstudio/00_NK_paper_utils.R")
+library("ArchR")
+set.seed(2805)
+library("BSgenome.Hsapiens.UCSC.hg38")
+```
+
+```{r}
+load(paste0(params$out,"/Rds/archR_analysis_v20260204.RData"))
+```
+
+```{r eval=FALSE, include=FALSE}
+conda_path <- "/opt/conda/envs/macs2" # conda env to use
+macs2_path <- "/opt/conda/envs/macs2/bin/macs2" # path to MACS2 tool
+system2(macs2_path, args = "--version")
+
+library(reticulate)
+use_condaenv(conda_path, required = TRUE)
+```
+
+# ___Analysis___
+
+```{r}
+UMAP_final_clust <- plotEmbedding(
+              ArchRProj = proj_filt, 
+              colorBy = "cellColData", 
+              name = "Clusters_res1",
+              embedding = "UMAP",
+              baseSize = 14,
+              size = 2,
+              plotAs = "points",
+              pal = COLOR_CODE_perCLUST,
+              keepAxis = FALSE) + 
+  theme(legend.text = element_text(size = 10))
+
+UMAP_perGroup <- plotEmbedding(
+  ArchRProj = proj_filt,
+  colorBy = "cellColData",
+  name = "group",
+  embedding = "UMAP",
+  baseSize = 14,
+  size = 2,
+  plotAs = "points",
+  pal = COLOR_CODE_perGROUP,
+  keepAxis = FALSE) + 
+  theme(legend.text = element_text(size = 10))
+
+UMAP_final_clust + UMAP_perGroup
+
+pdf(paste0(params$out,"figures/snATAC_UMAP_perGroup.pdf"),
+    width = 5, height = 5)
+UMAP_perGroup
+dev.off()
+
+pdf(paste0(params$out,"figures/snATAC_UMAP_perCLust.pdf"),
+    width = 5, height = 5)
+UMAP_final_clust 
+dev.off()
+```
+
+
+```{r}
+table(proj_filt$majority_vote_label, proj_filt$group)
+table(proj_filt$Clusters_res1, proj_filt$group)
+```
+
+
+```{r barplot minor NK subtypes}
+tab <- table(proj_filt$Clusters_res1,
+             proj_filt$group)
+tab_prop <- prop.table(tab, margin = 2) 
+tab_prop
+
+input <- reshape2::melt(tab_prop)
+
+prop_plot <- ggplot(input, aes(x = Var2, y = value, fill = Var1)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_void() +
+  labs(x = "", y = "Percentage of NK cells",
+       fill = "NK subsets") +  
+  ggtitle("snATAC-seq of BM metastasis samples") +
+  theme(axis.text.x = element_text(angle = 45,
+                                   color = "black",
+                                   size = 16),
+        axis.text.y = element_text(angle = 0,
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 16),
+        legend.text = element_text(angle = 0,
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 18),
+        axis.title.x = element_text(size = 16,
+                                    color = "black",
+                                    angle = 45),
+        axis.title.y = element_text(size = 16,
+                                    color = "black", 
+                                    angle = 90),
+        legend.title = element_text(size = 16,
+                                    color = "black"),
+        title = element_text(size = 20,
+                             color = "black")) +
+  scale_fill_manual(values = COLOR_CODE_perCLUST)   
+
+prop_plot 
+
+
+pdf(paste0(params$out,"figures/snATAC_barplot_ClustPerGroup.pdf"))
+prop_plot 
+dev.off()
+```
+
+
+# ___The End___
+
+```{r}
+sessionInfo()
+```

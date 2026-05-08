@@ -1,0 +1,1105 @@
+---
+title: "NK project: snATAC-seq label transfer"
+author: "Dr. Sara Wernig-Zorc"
+date: "2026-01-26 - 2026-02-04"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  out: "/home/rstudio/mnt_out/"
+  anno: "/home/rstudio/mnt_resources/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 20)
+options(future.globals.maxSize = 80 * 10^9)
+options(Seurat.object.assay.version = "v5")
+print(params)
+```
+
+# ___Project specific setup___
+
+```{r load project specific R packages and color code, echo = FALSE}
+source("/home/rstudio/00_NK_paper_setup.R")
+source("/home/rstudio/00_NK_paper_utils.R")
+library("ArchR")
+set.seed(2805)
+
+conda_path <- "/opt/conda/envs/macs2" # conda env to use
+macs2_path <- "/opt/conda/envs/macs2/bin/macs2" # path to MACS2 tool
+system2(macs2_path, args = "--version")
+
+library(reticulate)
+use_condaenv(conda_path, required = TRUE)
+
+library("BSgenome.Hsapiens.UCSC.hg38")
+```
+
+
+### ___Load ATAC data___
+
+```{r}
+# LOAD SAVED FILE
+#proj_filt <- loadArchRProject(path  = "mnt_out/ArchR_filt/")
+proj_filt <- readRDS( "mnt_out/ArchR_filt/Save-ArchR-Project.rds")
+```
+
+### ___Load RNA data___
+
+```{r}
+NK_RNA <- readRDS(paste0(params$out, "/Rds/ALL_NK_cluster_withNewMetadata.Rds"))
+
+NK_RNA <- NormalizeData(NK_RNA)
+NK_RNA <- FindVariableFeatures(NK_RNA, nfeatures = 5000)
+NK_RNA <- ScaleData(NK_RNA)
+
+DefaultAssay(NK_RNA) <- "RNA"
+```
+
+I will test if the label transfer scores improve if i combine NK2+NK3 clusters,
+my hypothesis is that the scores are low for those because the two clusters are
+very similar to each other, thus combining them would make the algorithm more
+confident in the NK subset assignment,
+
+```{r}
+# 1. combine NK2+3 clusters
+NK_RNA$meta_clusters <- NK_RNA$predicted_NK_type_de.n350
+NK_RNA$meta_clusters <- case_when(
+  NK_RNA$predicted_NK_type_de.n350 %in% c("hNK_Bm2", "hNK_Bm3") ~ "immuno",
+  NK_RNA$predicted_NK_type_de.n350 == "hNK_Bm1" ~ "cyto"
+)
+
+NK_RNA$meta_clusters <- factor(NK_RNA$meta_clusters) 
+
+NK_RNA <- 
+  NK_RNA %>% 
+  NormalizeData(normalization.method = "LogNormalize",
+                scale.factor = 10000)
+
+Idents(NK_RNA) <- NK_RNA$meta_clusters
+```
+
+# ___NK_ATAC Seurat object: Differential peaks between all NK cells___
+
+```{r one gene, eval=FALSE, include=FALSE}
+library(ggpubr)
+
+DefaultAssay(NK_ATAC) <- "GeneActivity"
+gene_of_interest <- "PRDM1"
+
+VlnPlot(NK_ATAC, 
+        features = gene_of_interest, 
+        group.by = "group",
+        pt.size = 0.1) +
+  stat_compare_means(method = "wilcox.test") +
+  ggtitle("PRDM1 Gene Activity in NK cells") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+DefaultAssay(NK_ATAC) <- "peaks"
+
+CoveragePlot(peaks = TRUE,
+             group.by = "group",
+             window = 2000,
+             object = NK_ATAC,
+             region = gene_of_interest,
+             extend.upstream = 10000,
+             extend.downstream = 5000
+)
+
+# Get gene coordinates
+anno <- Annotation(NK_ATAC)
+gene_coords <- anno[anno$gene_name == gene_of_interest]
+
+# Extend the region (matching your coverage plot)
+region <- GRanges(
+  seqnames = seqnames(gene_coords),
+  ranges = IRanges(
+    start = start(gene_coords) - 10000,
+    end = end(gene_coords) + 5000
+  )
+)
+
+# Find peaks in this region
+peaks_in_region <- findOverlaps(StringToGRanges(rownames(NK_ATAC)), region)
+peak_names <- rownames(NK_ATAC)[queryHits(peaks_in_region)]
+
+# View peaks found
+peak_names
+
+# Extract counts for peaks in region
+peak_counts <- GetAssayData(NK_ATAC, 
+                            assay = "peaks", 
+                            slot = "counts")[peak_names, ]
+
+# Sum counts per cell
+total_accessibility <- colSums(peak_counts)
+
+# Add to metadata
+NK_ATAC$region_accessibility <- total_accessibility
+
+# Compare between groups
+VlnPlot(NK_ATAC,
+        features = "region_accessibility",
+        group.by = "group",
+        pt.size = 0,log = TRUE) +
+  stat_compare_means(method = "wilcox.test")
+```
+
+# ___ArchR analysis___
+
+## ___ATAC data pre-processing with archR___
+
+```{r}
+proj_filt <- addIterativeLSI(
+  ArchRProj = proj_filt,
+  useMatrix = "TileMatrix",
+  name = "IterativeLSI_20260203",
+  iterations = 2,
+  clusterParams = list(
+    resolution = c(0.1,0.2,0.3,0.4,0.5), 
+    n.start = 10),
+  varFeatures = 25000,
+  dimsToUse = 1:30)
+# resolution: re-selects variable features based on those clusters to refine the embedding
+
+# Test multiple resolutions
+for (res in c(0.2, 0.4, 0.6, 0.8, 1.0, 1.2)) {
+  proj_filt <- addClusters(
+    input = proj_filt,
+    reducedDims = "IterativeLSI_20260203",
+    method = "Seurat",
+    name = paste0("Clusters_res", res),
+    resolution = res,
+    force = TRUE
+  )
+}
+
+proj_filt <- addUMAP(
+  ArchRProj = proj_filt,
+  reducedDims = "IterativeLSI_20260203",
+  name = "UMAP",
+  nNeighbors = 30,
+  minDist = 0.5,
+  metric = "cosine", 
+  force = TRUE
+)
+
+# Gene activity-like matrix for integration
+proj_filt <- addGeneScoreMatrix(proj_filt,force = TRUE)
+```
+
+## ___clustering QC [Choosing best resolution parameter & number of clusters]___
+
+```{r}
+# QC Metrics 
+# 1. Cluster Stability / Silhouette Score
+# Are cells confidently assigned or sitting on boundaries?
+# Rough stability check - compare nearby resolutions
+library(pheatmap)
+confusionMatrix <- confusionMatrix(
+  getCellColData(proj_filt)$Clusters_res0.4,
+  getCellColData(proj_filt)$Clusters_res1
+)
+pheatmap(confusionMatrix)
+
+# 2. Cluster Size Distribution
+# Watch for very small clusters (could be noise) or one dominant cluster (under-clustering).
+# Check cluster sizes
+
+for (res in c(0.2, 0.4, 0.6, 0.8, 1.0, 1.2)) {
+  cluster_name <- paste0("Clusters_res", res)
+  cluster_data <- getCellColData(proj_filt)[[cluster_name]]
+  
+  cat("\n--- Resolution:", res, "---\n")
+  print(table(cluster_data))
+}
+
+# Or visualize
+UMAP_final_clust <- plotEmbedding(proj_filt, 
+              colorBy = "cellColData", 
+              name = "Clusters_res1",
+              baseSize = 14,
+              size = 2,
+              plotAs = "points")
+
+UMAP_final_clust
+
+# 3. Technical vs Biological Signal
+# Clusters shouldn't correlate strongly with technical artifacts.
+# Check for batch effects
+plotEmbedding(proj_filt, colorBy = "cellColData", name = "group")
+
+# QC metrics per cluster
+plotGroups(
+  ArchRProj = proj_filt,
+  groupBy = "Clusters_res1",
+  colorBy = "cellColData",
+  name = "TSSEnrichment"  # or nFrags, DoubletScore, etc.
+)
+
+plotGroups(
+  ArchRProj = proj_filt,
+  groupBy = "Clusters_res1",
+  colorBy = "cellColData",
+  name = "nFrags"  # or nFrags, DoubletScore, etc.
+)
+
+
+# Red flags:
+# Clusters driven by sample/batch rather than biology
+# Clusters with very low TSS enrichment (poor quality cells)
+# Clusters with high doublet scores
+
+# 4. Marker Gene/Peak Accessibility
+# Do clusters have biologically meaningful differences?
+# Find marker genes
+markersGS <- getMarkerFeatures(
+  ArchRProj = proj_filt,
+  useMatrix = "GeneScoreMatrix",
+  groupBy = "Clusters_res1",
+  bias = c("TSSEnrichment", "log10(nFrags)")
+)
+
+# Heatmap of top markers
+heatmapGS <- plotMarkerHeatmap(
+  seMarker = markersGS,
+  cutOff = "FDR <= 0.05 & Log2FC >= 0.5",
+  transpose = TRUE, 
+  #returnMatrix = TRUE, 
+  clusterCols = TRUE,
+  scaleRows = TRUE,
+  plotLog2FC = TRUE,
+  log2Norm = TRUE,
+  nLabel = 5,
+  pal = paletteContinuous(set = "greyMagma", n = 265, reverse = FALSE)
+)
+
+heatmapGS
+
+pdf(paste0(params$out,"/figures/snATAC_clusterMarkers_basedOnATACdata.pdf"),
+           height = 6,width = 7)
+heatmapGS
+dev.off()
+
+# 5. Known Marker Genes
+# Check if expected cell types appear in distinct clusters.
+# Plot known markers
+
+plotEmbedding(proj_filt, 
+              colorBy = "cellColData", 
+              name = "Clusters_res1",
+              )
+
+df <- getCellColData(proj_filt, select = c("log10(nFrags)", "TSSEnrichment"))
+df
+
+p <- ggPoint(
+    x = df[,1], 
+    y = df[,2], 
+    colorDensity = TRUE,
+    continuousSet = "sambaNight",
+    xlabel = "Log10 Unique Fragments",
+    ylabel = "TSS Enrichment",
+    xlim = c(log10(500), quantile(df[,1], probs = 0.99)),
+    ylim = c(0, quantile(df[,2], probs = 0.99))) + 
+  geom_hline(yintercept = 4, lty = "dashed") + 
+  geom_vline(xintercept = 3, lty = "dashed")
+
+p
+
+getCellColData(proj_filt)
+```
+
+## ___Asssign cluster labels___
+
+```{r}
+# Get cluster and group information
+cellData <- getCellColData(proj_filt)
+clusters <- cellData$Clusters_res1
+groups <- cellData$predicted_NK_subtype  
+
+# Create a table of cluster vs group proportions
+cluster_group_table <- table(clusters, groups)
+cluster_props <- prop.table(cluster_group_table, margin = 1)  # row proportions
+
+# Function to assign majority label with 60% threshold
+assign_majority_label <- function(props, threshold = 0.6) {
+  max_prop <- max(props)
+  if (max_prop > threshold) {
+    return(names(props)[which.max(props)])
+  } else {
+    return("Mixed")
+  }
+}
+
+# Apply to each cluster
+majority_labels <- apply(cluster_props, 1, assign_majority_label, threshold = 0.6)
+
+# View the assignments
+print(data.frame(
+  Cluster = names(majority_labels),
+  Majority_Label = majority_labels,
+  Max_Proportion = apply(cluster_props, 1, max)
+))
+
+# Create a mapping from cluster to majority label
+cluster_to_label <- setNames(majority_labels, names(majority_labels))
+
+# Add to ArchR project
+proj_filt$majority_vote_label <- cluster_to_label[as.character(proj_filt$Clusters_res1)]
+
+# Verify
+table(proj_filt$Clusters_res1, proj_filt$majority_vote_label)
+
+# Plot UMAP with new labels
+p <- plotEmbedding(
+  ArchRProj = proj_filt,
+  colorBy = "cellColData",
+  name = "majority_vote_label",
+  embedding = "UMAP"
+)
+p
+```
+
+
+## ___TF occupancy___
+
+```{r}
+proj_filt <- addImputeWeights(proj_filt,
+                              reducedDims = "IterativeLSI_20260203")
+
+ATAC_features <- getFeatures(proj_filt)
+
+# Multiple TFs at once
+genes_of_interest <- c("ETS-1", "PU.1", "Ikaros", "TOX", "E4BP4", "ID2", "GATA-3", 
+                       "IRF-2",   "MEF", "MITF" , "TBX21", "Eomes", "PRDM1")
+
+genes_for_plotting <- intersect(ATAC_features, genes_of_interest)
+
+inferred_gene_activity <- plotEmbedding(
+  ArchRProj = proj_filt,
+  colorBy = "GeneScoreMatrix",
+  name = genes_for_plotting,
+  embedding = "UMAP",
+  quantCut = c(0.01, 0.99),
+  imputeWeights = getImputeWeights(proj_filt), 
+  baseSize = 14,
+  size = 2,
+  plotAs = "points"
+)
+
+inferred_gene_activity
+
+combined_RNA_ATAC_gene_activity <- plotEmbedding(
+  ArchRProj = proj_filt,
+  colorBy = "GeneIntegrationMatrix_v3",
+  name = genes_for_plotting,
+  embedding = "UMAP",
+  quantCut = c(0.01, 0.99),
+  imputeWeights = getImputeWeights(proj_filt), 
+  baseSize = 14,
+  size = 2,
+  plotAs = "points"
+)
+
+combined_RNA_ATAC_gene_activity
+
+pdf(paste0(params$out,"figures/ATAC-NK_TF_gene_activity_wGeneScoreMatrix.pdf"),
+    height = 5,width = 7)
+inferred_gene_activity
+dev.off()
+
+pdf(paste0(params$out,"figures/ATAC-NK_TF_gene_activity_wGeneIntegrationMatrix.pdf"),
+    height = 5,width = 7)
+combined_RNA_ATAC_gene_activity
+dev.off()
+```
+
+
+## ___archR label transfer with 2 NK clusters, cytotoxic and immuno___
+
+```{r}
+library(SingleCellExperiment)
+library(Seurat)
+
+sceRNA <- as.SingleCellExperiment(NK_RNA)
+
+proj_filt <- addGeneIntegrationMatrix(
+  ArchRProj = proj_filt,
+  useMatrix = "GeneScoreMatrix",
+  matrixName = "GeneIntegrationMatrix_v3",
+  reducedDims = "IterativeLSI_20260203",
+  seRNA = sceRNA,
+  addToArrow = TRUE,   # add to arrow file
+  groupRNA = "meta_clusters",  # label transfer with 2 NK clusters, cytotoxic and immuno
+  nameCell = "predicted_cell", # predicted cell ID
+  nameGroup = "predicted_NK_group", # predicted label {using here two NK clusters}
+  nameScore = "prediction_score", # prediction score - higher score, higher confidence
+  dimsToUse = 1:30,
+  force = TRUE,
+  groupATAC = "group"
+)
+```
+
+
+# ---------2026.02.04---------
+
+```{r eval=FALSE, include=FALSE}
+proj_filt <- readRDS( "mnt_out/ArchR_v20260203/Save-ArchR-Project.rds")
+```
+
+```{r}
+# Maturation markers
+maturation_markers <- c("SELL", "TCF7", "LEF1",      # less mature / CD56bright / immunomodulatory NK
+                        "FCGR3A", "CX3CR1", "ZEB2")  # more mature / CD56dim / cytotoxic NK 
+
+# Cytotoxic vs immunomodulatory
+functional_markers <- c("PRF1", "GZMB", "GZMK", "IFNG", "TNF", "XCL1")
+
+# Compare matrices
+p_gs <- plotEmbedding(
+  ArchRProj = proj_filt,
+  colorBy = "GeneScoreMatrix",
+  name = "PRF1",
+  baseSize = 14,
+  size = 2,
+  plotAs = "points",
+  imputeWeights = getImputeWeights(proj_filt)
+) + ggtitle("PRF1 - Accessibility\n (may look similar across subsets)")
+
+p_gi <- plotEmbedding(ArchRProj = proj_filt,
+  colorBy = "GeneIntegrationMatrix_v3",
+  name = "PRF1",
+  baseSize = 14,
+  size = 2,
+  plotAs = "points",
+) + ggtitle("PRF1 - Expression\n (should distinguish CD56dim)")
+
+p_gs + p_gi
+
+# TCF7/LEF1 - should be high in less mature
+# ZEB2 - should be high in more mature (represses TCF7)
+
+# GeneScoreMatrix problem:
+# TCF7 locus may be accessible in all NK (poised)
+# Only GeneIntegrationMatrix shows actual TCF7 expression gradient
+
+markers_maturation <- c("TCF7", "LEF1", "ZEB2", "CX3CR1", "KLRG1")
+
+# Loop through both matrices
+for (m in markers_maturation) {
+  p1 <- plotEmbedding(proj_filt, colorBy = "GeneScoreMatrix", name = m,   
+                      baseSize = 14, size = 2, plotAs = "points") + 
+        ggtitle(paste(m, "- Accessibility"))
+  p2 <- plotEmbedding(proj_filt, colorBy = "GeneIntegrationMatrix_v3", name = m,
+                      baseSize = 14, size = 2, plotAs = "points") + 
+        ggtitle(paste(m, "- Expression"))
+  print(p1 + p2)
+}
+
+# GZMB/PRF1 - cytotoxic
+# GZMK/XCL1 - more immunomodulatory / CD56bright
+
+# The issue:
+# Both cytotoxic and immunomod NK have accessible PRF1/GZMB loci
+# But only cytotoxic subset actively transcribes them
+
+markers_function <- c("PRF1", "GZMB", "GZMK", "XCL1", "AREG")
+```
+
+```{r}
+p2g <- getPeak2GeneLinks(proj_filt,
+  corCutOff = 0.45,
+  FDRCutOff = 1e-04,
+  varCutOffATAC = 0.25, # increase cutoff?
+  varCutOffRNA = 0.25, # increase cutoff?
+  resolution = 1,
+  returnLoops = TRUE
+)
+
+# Plot tracks at key loci grouped by cluster
+plotBrowserTrack(ArchRProj = proj_filt,
+  groupBy = "Clusters_res1",
+  geneSymbol = "TCF7",
+  upstream = 50000,
+  downstream = 50000,
+  features = getPeakSet(proj_filt),
+  loops = getCoAccessibility(proj_filt),
+  baseSize = 12,
+  borderWidth = 0.4,
+  tickWidth = 0.4,
+  facetbaseSize = 10,
+  geneAnnotation = getGeneAnnotation(proj_filt),
+  title = "")
+
+
+
+# Compare multiple loci
+loci_to_check <- c("ZEB2", "SELL", "FCGR3A", "PRF1", "GZMB", "GZMK", "KLRC2")
+
+for (gene in loci_to_check) {
+  p <- plotBrowserTrack(proj_filt,
+    groupBy = "Clusters_res1",
+    geneSymbol = gene,
+    upstream = 50000,
+    downstream = 50000,
+    features = getPeakSet(proj_filt),
+    loops = getCoAccessibility(proj_filt),
+    baseSize = 12,
+    borderWidth = 0.4,
+  tickWidth = 0.4,
+  facetbaseSize = 10,
+  geneAnnotation = getGeneAnnotation(proj_filt),
+  title = ""
+  )
+  p
+}
+```
+
+# ___Label transfer QC___
+
+```{r}
+p1 <- plotEmbedding(
+  ArchRProj = proj_filt,
+  colorBy = "cellColData",
+  name = "predicted_NK_group",
+  embedding = "UMAP",
+  baseSize = 14,
+  size = 2,
+  plotAs = "points"
+)
+
+p2 <- plotEmbedding(
+  ArchRProj = proj_filt,
+  colorBy = "cellColData",
+  name = "prediction_score",
+  embedding = "UMAP",
+  baseSize = 14,
+  size = 2,
+  plotAs = "points"
+)
+
+
+p2 + p1
+
+pdf(paste0(params$out,"figures/2026-02_snATAC-seq_label_transfer_NK2+NK3_combined.pdf"),
+    width = 10,height = 5)
+p2 + p1
+dev.off()
+
+```
+
+# ___NK minor-subset [hNK_Bm1, hNK_Bm2, hNK_Bm3] barplot per group___
+
+```{r barplot minor NK subtypes}
+tab <- table(proj_filt$predicted_NK_subtype,
+             proj_filt$group)
+tab_prop <- prop.table(tab, margin = 2) 
+tab_prop
+
+input <- reshape2::melt(tab_prop)
+
+prop_plot <- ggplot(input, aes(x = Var2, y = value, fill = Var1)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_void() +
+  labs(x = "", y = "Percentage of NK cells",
+       fill = "NK subsets") +  
+  ggtitle("snATAC-seq of BM metastasis samples") +
+  theme(axis.text.x = element_text(angle = 45,
+                                   color = "black",
+                                   size = 16),
+        axis.text.y = element_text(angle = 0,
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 16),
+        legend.text = element_text(angle = 0,
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 18),
+        axis.title.x = element_text(size = 16,
+                                    color = "black",
+                                    angle = 45),
+        axis.title.y = element_text(size = 16,
+                                    color = "black", 
+                                    angle = 90),
+        legend.title = element_text(size = 16,
+                                    color = "black"),
+        title = element_text(size = 20,
+                             color = "black")) +
+  scale_fill_manual(values = COLOR_CODE_v2)   
+
+prop_plot 
+```
+
+```{r}
+plotEmbedding(
+  ArchRProj = proj_filt,
+  colorBy = "cellColData",
+  name = "predicted_NK_subtype",
+  embedding = "UMAP",
+  baseSize = 14,
+  size = 2,
+  plotAs = "points"
+)
+
+tab <- table(proj_filt$predicted_NK_subtype,proj_filt$Clusters_res1)
+
+tab_prop <- prop.table(tab, margin = 2) 
+tab_prop
+
+input <- reshape2::melt(tab_prop)
+
+prop_plot <- ggplot(input, aes(x = Var2, y = value, fill = Var1)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_void() +
+  labs(x = "", y = "Percentage of NK cells",
+       fill = "NK subsets") +  
+  ggtitle("snATAC-seq of BM metastasis samples") +
+  theme(axis.text.x = element_text(angle = 45,
+                                   color = "black",
+                                   size = 16),
+        axis.text.y = element_text(angle = 0,
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 16),
+        legend.text = element_text(angle = 0,
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 18),
+        axis.title.x = element_text(size = 16,
+                                    color = "black",
+                                    angle = 45),
+        axis.title.y = element_text(size = 16,
+                                    color = "black", 
+                                    angle = 90),
+        legend.title = element_text(size = 16,
+                                    color = "black"),
+        title = element_text(size = 20,
+                             color = "black")) +
+  scale_fill_manual(values = COLOR_CODE_v2)   
+
+prop_plot 
+
+```
+
+
+# ___NK major-subset [cyto, immuno] barplot per group___
+
+```{r barplot major NK subtypes}
+tab <- table(proj_filt$predicted_NK_group,
+             proj_filt$group)
+tab_prop <- prop.table(tab, margin = 2) 
+tab_prop
+
+input <- reshape2::melt(tab_prop)
+
+COLOR_CODE_NK_TYPES <- c("immuno"   = "#7EA3AC",
+                         "cyto"   = "#4f4e92")
+
+prop_plot <- ggplot(input, aes(x = Var2, y = value, fill = Var1)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_void() +
+  labs(x = "", y = "Percentage of NK cells",
+       fill = "NK subsets") +  
+  ggtitle("snATAC-seq of BM metastasis samples") +
+  theme(axis.text.x = element_text(angle = 45,
+                                   color = "black",
+                                   size = 16),
+        axis.text.y = element_text(angle = 0,
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 16),
+        legend.text = element_text(angle = 0,
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 18),
+        axis.title.x = element_text(size = 16,
+                                    color = "black",
+                                    angle = 45),
+        axis.title.y = element_text(size = 16,
+                                    color = "black", 
+                                    angle = 90),
+        legend.title = element_text(size = 16,
+                                    color = "black"),
+        title = element_text(size = 20,
+                             color = "black")) +
+  scale_fill_manual(values = COLOR_CODE_NK_TYPES)   
+
+prop_plot 
+```
+
+```{r}
+plotEmbedding(
+  ArchRProj = proj_filt,
+  colorBy = "cellColData",
+  name = "Clusters_res1",
+  embedding = "UMAP",
+  baseSize = 14,
+  size = 2,
+  plotAs = "points"
+)
+
+tab <- table(proj_filt$predicted_NK_group,proj_filt$Clusters_res1)
+
+tab_prop <- prop.table(tab, margin = 2) 
+tab_prop
+
+input <- reshape2::melt(tab_prop)
+
+COLOR_CODE_NK_TYPES <- c("immuno"   = "#7EA3AC",
+                         "cyto"   = "#4f4e92")
+
+prop_plot <- ggplot(input, aes(x = Var2, y = value, fill = Var1)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_void() +
+  labs(x = "", y = "Percentage of NK cells",
+       fill = "NK subsets") +  
+  ggtitle("snATAC-seq of BM metastasis samples") +
+  theme(axis.text.x = element_text(angle = 45,
+                                   color = "black",
+                                   size = 16),
+        axis.text.y = element_text(angle = 0,
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 16),
+        legend.text = element_text(angle = 0,
+                                   hjust = 1,
+                                   color = "black",
+                                   size = 18),
+        axis.title.x = element_text(size = 16,
+                                    color = "black",
+                                    angle = 45),
+        axis.title.y = element_text(size = 16,
+                                    color = "black", 
+                                    angle = 90),
+        legend.title = element_text(size = 16,
+                                    color = "black"),
+        title = element_text(size = 20,
+                             color = "black")) +
+  scale_fill_manual(values = COLOR_CODE_NK_TYPES)   
+
+prop_plot 
+
+```
+
+
+
+# ___RNA+ATAC network analysis___
+
+```{r}
+# Add group coverages
+proj_filt <- addGroupCoverages(
+  ArchRProj = proj_filt,
+  groupBy = "Clusters_res1", 
+  minCells = 40,
+  force = TRUE
+)
+
+# Call peaks using MACS2
+proj_filt <- addReproduciblePeakSet(
+  ArchRProj = proj_filt,
+  groupBy = "Clusters_res1",
+  pathToMacs2 = macs2_path
+)
+
+proj_filt <- addPeakMatrix(proj_filt)
+getAvailableMatrices(proj_filt)
+getPeakSet(proj_filt)
+
+
+# run Peak2GeneLinks
+proj_filt <- addPeak2GeneLinks(
+  ArchRProj = proj_filt,
+  reducedDims = "IterativeLSI_20260203",
+  useMatrix = "GeneIntegrationMatrix_v3",
+  maxDist = 50000,        
+  corCutOff = 0.45     # increase correlation?
+)
+
+# retrieve Peak2GeneLinks above thresholds
+p2g <- getPeak2GeneLinks(
+  ArchRProj = proj_filt,
+  corCutOff = 0.45,
+  FDRCutOff = 0.01
+)
+
+```
+
+```{r}
+gene_of_interest <- "CD6"
+
+# Visualize at a genomic locus
+track <- plotBrowserTrack(
+  ArchRProj = proj_filt,
+  groupBy = "Clusters_res1",
+  geneSymbol = gene_of_interest,
+  upstream = 100000,
+  downstream = 100000,
+  loops = p2g
+)
+
+grid::grid.newpage()
+grid::grid.draw(track$CD6) # change depending on the gene
+
+# Plot peak-to-gene heatmap
+clustering_data <- plotPeak2GeneHeatmap(proj_filt, 
+                          groupBy = "Clusters_res1",
+                          seed = 2805,
+                          returnMatrices = TRUE)
+
+p <- plotPeak2GeneHeatmap(proj_filt, 
+                          groupBy = "Clusters_res1",
+                          seed = 2805)
+
+p
+
+pdf(paste0(params$out,"figures/snATAC_p2g_heatmap.pdf"),
+    height = 8, width = 10)
+p
+dev.off()
+
+# per Group
+# c("group", "Clusters_res1", "predicted_NK_subtype", "predicted_NK_group")
+perGroup_p2g <- plotPeak2GeneHeatmap(proj_filt, 
+                          groupBy = "group",
+                          seed = 2805)
+
+perGroup_p2g
+
+pdf(paste0(params$out,"figures/snATAC_p2g_perGroup_heatmap.pdf"),
+    height = 10, width = 10)
+perGroup_p2g
+dev.off()
+```
+
+```{r}
+# Explore the structure
+str(clustering_data)
+names(clustering_data)
+
+# Extract k-means cluster assignments
+kmeans_clusters <- clustering_data$KmeansAssignment
+
+# This gives you which module (1-25) each peak-to-gene link belongs to
+head(kmeans_clusters)
+
+# Extract k-means cluster assignments (module IDs)
+kmeans_clusters <- clustering_data$ATAC$kmeansId
+
+# Get the peak-to-gene link information
+p2g_df <- as.data.frame(clustering_data$Peak2GeneLinks)
+
+# Add module assignments
+p2g_df$module <- kmeans_clusters
+
+# View the data
+head(p2g_df)
+
+# Check number of links per module
+table(p2g_df$module)
+
+# Get unique genes per module
+genes_by_module <- split(p2g_df$gene, p2g_df$module)
+module_gene_list <- lapply(genes_by_module, unique)
+
+# Count genes per module
+sapply(module_gene_list, length)
+
+# View top genes in each module
+lapply(module_gene_list, head, 10)
+
+# Create summary table
+module_summary <- do.call(rbind, lapply(sort(unique(kmeans_clusters)), function(i) {
+  sub_df <- p2g_df[p2g_df$module == i, ]
+  genes <- unique(sub_df$gene)
+  data.frame(
+    module = i,
+    n_links = nrow(sub_df),
+    n_genes = length(genes),
+    mean_correlation = mean(sub_df$Correlation),
+    top_genes = paste(head(genes, 5), collapse = ", ")
+  )
+}))
+
+print(module_summary)
+
+# Save genes by module for downstream analysis (GO enrichment, etc.)
+for (mod in sort(unique(kmeans_clusters))) {
+  genes <- unique(p2g_df$gene[p2g_df$module == mod])
+  write.csv(
+    data.frame(gene = genes),
+    paste0(params$out,"tables/module_", mod, "_genes.csv"),
+    row.names = FALSE
+  )
+}
+
+# Calculate Module Activity Per Cluster
+# Extract matrices
+atac_mat <- clustering_data$ATAC$matrix
+rna_mat <- clustering_data$RNA$matrix
+col_data <- as.data.frame(clustering_data$ATAC$colData)
+
+# Calculate mean z-score per module per cluster
+clusters <- unique(col_data$groupBy)
+
+module_activity <- sapply(sort(unique(kmeans_clusters)), function(mod) {
+  # Get rows belonging to this module
+  mod_idx <- which(kmeans_clusters == mod)
+  
+  # Calculate mean per cluster
+  sapply(clusters, function(cl) {
+    cell_idx <- which(col_data$groupBy == cl)
+    mean(rna_mat[mod_idx, cell_idx])
+  })
+})
+
+colnames(module_activity) <- paste0("M", sort(unique(kmeans_clusters)))
+rownames(module_activity) <- clusters
+
+# Heatmap of module activity by cluster
+library(pheatmap)
+
+moduleScores_ByCluster <- pheatmap(
+  t(module_activity),
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  color = colorRampPalette(c("#592e83", "white", "#80aea0"))(100),
+  main = "Module Activity by Cluster (RNA Z-scores)"
+)
+
+moduleScores_ByCluster
+
+pdf(paste0(params$out,"figures/snATAC_moduleScores_ByCluster.pdf"),
+    height = 8, width = 10)
+moduleScores_ByCluster
+dev.off()
+
+# Identify cluster-enriched modules
+# Find modules where C6 (hNK_Bm1) has highest activity
+C6_enriched <- which(apply(module_activity, 2, which.max) == which(clusters == "C6"))
+print(paste("Modules enriched in C6 (hNK_Bm1):", paste(names(C6_enriched), collapse = ", ")))
+
+# Get genes from C6-enriched modules
+hNK_Bm1_genes <- unique(p2g_df$gene[p2g_df$module %in% as.numeric(gsub("M", "", names(C6_enriched)))])
+print(paste("Number of hNK_Bm1-enriched genes:", length(hNK_Bm1_genes)))
+head(hNK_Bm1_genes, 20)
+```
+
+```{r}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# Run GO enrichment for each module
+module_GO_results <- lapply(sort(unique(kmeans_clusters)), function(mod) {
+  genes <- unique(p2g_df$gene[p2g_df$module == mod])
+  
+  if (length(genes) < 10) return(NULL)
+  
+  tryCatch({
+    enrichGO(
+      gene = genes,
+      universe = 
+      OrgDb = org.Hs.eg.db,
+      keyType = "SYMBOL",
+      ont = "BP",
+      pAdjustMethod = "BH",
+      pvalueCutoff = 0.05,
+      qvalueCutoff = 0.1
+    )
+  }, error = function(e) NULL)
+})
+
+names(module_GO_results) <- paste0("Module_", sort(unique(kmeans_clusters)))
+
+# View results for a specific module
+module_GO_results$Module_7
+
+# Plot top terms
+dotplot(module_GO_results$Module_7, 
+        showCategory = 10, 
+        title = "Module 7 GO Enrichment")
+
+# Combine top terms from all modules into summary
+GO_summary <- do.call(rbind, lapply(names(module_GO_results), function(mod) {
+  res <- module_GO_results[[mod]]
+  if (!is.null(res) && nrow(as.data.frame(res)) > 0) {
+    df <- head(as.data.frame(res), 3)
+    df$module <- mod
+    df[, c("module", "Description", "pvalue", "p.adjust", "Count")]
+  }
+}))
+
+print(GO_summary)
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+# 3. Look at specific genes in modules of interest
+# For example, genes high in C6 (hNK_Bm1-specific):
+
+markerGenes <- getMarkerFeatures(
+  ArchRProj = proj_filt,
+  useMatrix = "GeneIntegrationMatrix_v3",
+  groupBy = "Clusters_res1",
+  useGroups = "C6",
+  bgdGroups = c("C1", "C2", "C3", "C4", "C5", "C7")
+)
+
+# 4. Check NK-relevant TF activity differences between C6 vs others
+plotEmbedding(proj_filt, 
+              colorBy = "MotifMatrix", 
+              name = "z:TBX21_789", 
+              embedding = "UMAP")
+```
+
+# ___Browser output___
+
+```{r}
+ArchRBrowser(ArchRProj = proj_filt)
+```
+
+```{r}
+plotFragmentSizes(ArchRProj = proj_filt)
+plotTSSEnrichment(ArchRProj = proj_filt)
+```
+
+
+# ___Save & exit___
+
+```{r}
+# Save archR project
+saveArchRProject(ArchRProj = proj_filt, 
+                 outputDirectory = paste0(params$out,"/ArchR_v20260203/"), 
+                 load = FALSE)
+
+saveRDS(proj_filt, file = paste0(params$out,"/ArchR_v20260203/ATAC_analysis_v20260203.Rds"))
+```
+
+```{r}
+save.image(paste0(params$out,"/Rds/archR_analysis_v20260204.RData"))
+```
+
+# ___The End___
+
+```{r}
+sessionInfo()
+```

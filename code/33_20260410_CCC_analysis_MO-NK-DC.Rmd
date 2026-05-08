@@ -1,0 +1,1208 @@
+---
+title: "CCC analysis: NB-NK-MO-DC axis"
+author: "Dr. Sara Wernig-Zorc"
+date: "2026-04-10"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  input_scRNA: "/home/rstudio/mnt_out/Rds/fetahu2023_withNewMetadata.Rds"
+  out: "/home/rstudio/mnt_out/"
+  GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
+  markers: "/home/rstudio/mnt_resources/MES_ADRN/"
+  metadata: "/home/rstudio/scRNA.NB.integration/metadata/"
+  nicheNetDB: "/home/rstudio/mnt_resources/L-R_database/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 80)
+options(future.globals.maxSize = 80 * 10^9)
+
+print(params)
+```
+
+```{r load project specific R packages and color code}
+library(nichenetr)
+library(multinichenetr)
+library(igraph)
+
+source("/home/rstudio/00_NK_paper_setup.R")
+source("/home/rstudio/00_NK_paper_utils.R")
+```
+
+# ___Input_data___
+
+```{r load Rds}
+ALL_NK <- readRDS(file = paste0(params$out,"Rds/ALL_NK_cluster_withNewMetadata.Rds"))
+fetahu2023 <- readRDS(file = paste0(params$input_scRNA))
+```
+
+```{r define comparison groups and clusters of interest}
+# STEP 1
+#Idents(ALL_NK) <- ALL_NK$predicted_NK_type_de.n350
+fetahu2023$orig.ident <- factor(fetahu2023$orig.ident)
+fetahu2023$cell_type <- fetahu2023$orig.ident
+#fetahu2023$predicted_NK_type_de.n350 <- ALL_NK$predicted_NK_type_de.n350 
+Idents(fetahu2023) <- fetahu2023$cell_type
+
+# define which clusters to compare
+clusters_of_interest <- c("NK (4)",
+                          "M (1)",
+                          "M (2)",
+                          "M (10)",
+                          "M (15)",
+                          "pDC (12)",
+                          "NB (8)") 
+# Remove M (15)?
+
+table(fetahu2023@meta.data$cell_type)
+table(fetahu2023@meta.data$cell_type,fetahu2023@meta.data$group)
+
+
+fetahu2023_CCC <- subset(fetahu2023, idents = clusters_of_interest)
+
+fetahu2023_CCC$cell_type <- factor(fetahu2023$cell_type)
+fetahu2023_CCC$cell_type <- droplevels(fetahu2023_CCC$cell_type)
+```
+
+```{r Add NK subclusters}
+# add NK sub-cluster information to the Seurat object
+# set cell type annotation of the tumor cell object to the new seurat clusters
+Idents(ALL_NK) <- ALL_NK@meta.data$predicted_NK_type_de.n350
+
+# identify cell IDs associated with each cluster
+cluster1 <- WhichCells(ALL_NK, ident = "hNK_Bm1")
+cluster2 <- WhichCells(ALL_NK, ident = "hNK_Bm2")
+cluster3 <- WhichCells(ALL_NK, ident = "hNK_Bm3")
+cluster4 <- WhichCells(ALL_NK, ident = "hNK_Bm4")
+
+
+fetahu2023_CCC@active.ident <- fetahu2023_CCC$cell_type 
+
+# re-label the NK cells to the corresponding predicted sub-clusters 
+Idents(object = fetahu2023_CCC, cells = cluster1) <- "NK (hNK_Bm1)"
+Idents(object = fetahu2023_CCC, cells = cluster2) <- "NK (hNK_Bm2)"
+Idents(object = fetahu2023_CCC, cells = cluster3) <- "NK (hNK_Bm3)"
+Idents(object = fetahu2023_CCC, cells = cluster4) <- "NK (hNK_Bm4)"
+
+fetahu2023_CCC@meta.data
+
+# Add actATRXwtMYCNwte identities to metadata column new_clusters
+fetahu2023_CCC$new_cell_annotation <- fetahu2023_CCC@active.ident
+
+fetahu2023_CCC$new_cell_annotation <- factor(fetahu2023_CCC$new_cell_annotation)
+```
+
+# ___CCC analysis: MO - NK - DC axis___
+
+```{r LR database}
+# 0. prepare db
+organism = "human"
+lr_network_all = 
+    readRDS(paste0(params$nicheNetDB,"lr_network_human_allInfo_30112033.rds")) %>% 
+    mutate(
+      ligand = convert_alias_to_symbols(ligand, organism = organism), 
+      receptor = convert_alias_to_symbols(receptor, organism = organism))
+  lr_network_all = lr_network_all  %>% 
+    mutate(ligand = make.names(ligand), receptor = make.names(receptor)) 
+  lr_network = lr_network_all %>% 
+    distinct(ligand, receptor)
+  
+ligand_target_matrix = readRDS(paste0(params$nicheNetDB,
+                                      "ligand_target_matrix_nsga2r_final.rds"))
+  colnames(ligand_target_matrix) = colnames(ligand_target_matrix) %>% 
+    convert_alias_to_symbols(organism = organism) %>% make.names()
+  rownames(ligand_target_matrix) = rownames(ligand_target_matrix) %>% 
+    convert_alias_to_symbols(organism = organism) %>% make.names()
+  lr_network = lr_network %>% filter(ligand %in% colnames(ligand_target_matrix))
+  ligand_target_matrix = ligand_target_matrix[, lr_network$ligand %>% unique()]
+```
+
+```{r get_lfc_celltype function}
+# rewrite the "get_lfc_celltype" function, as the select function from dplyr R package is causing issues (i explicitly write the name of the package in the function, otherwise i get an error that select cannot be applied to this object)
+get_lfc_celltype <- function(celltype_oi, seurat_obj, 
+                              condition_colname, condition_oi, 
+                              condition_reference, celltype_col = "celltype", ...) {
+  seuratObj_sender = subset(seurat_obj, idents = celltype_oi)
+  seuratObj_sender = SetIdent(seuratObj_sender, 
+                              value = seuratObj_sender[[condition_colname, 
+                                                        drop = TRUE]])
+  DE_table_sender = FindMarkers(object = seuratObj_sender, 
+    ident.1 = condition_oi, ident.2 = condition_reference, random.seed = 28,
+    min.cells.group = 50, logfc.threshold = logfc.threshold, min.pct = min.pct) %>% rownames_to_column("gene")
+  DE_table_sender = DE_table_sender %>% as_tibble() %>% 
+    dplyr::select(-p_val) %>% dplyr::select(gene, avg_log2FC)
+  return(DE_table_sender)
+}
+```
+
+```{r visualize_network function}
+visualize_network <- function (network, colors) {
+  requireNamespace("dplyr")
+  requireNamespace("ggplot2")
+  requireNamespace("ggraph")
+  nodes = network$nodes %>% data.frame() %>% magrittr::set_rownames(network$nodes$node)
+  colors_regulation = NULL
+  colors_regulation["up"] = "#50C878"
+  colors_regulation["down"] = "#C70039"
+  network_igraph = igraph::graph_from_data_frame(d = network$links %>% 
+    dplyr::filter(type == "Ligand-Target"), vertices = nodes, 
+    directed = T)
+  network_tidygraph = tidygraph::as_tbl_graph(network_igraph)
+  set.seed(2805)
+  plot = ggraph::ggraph(network_tidygraph, layout = "dh") + 
+    ggraph::geom_edge_fan(aes(color = direction_regulation), 
+      edge_width = 1, arrow = arrow(length = unit(3, "mm")), 
+      end_cap = ggraph::circle(5.5, "mm"), start_cap = ggraph::circle(3, 
+        "mm")) + ggraph::geom_node_label(aes(label = gene, 
+    fill = celltype), fontface = "bold", size = 3.5, nudge_x = 0, 
+    nudge_y = 0, color = "whitesmoke") + ggraph::theme_graph(foreground = "black", 
+    fg_text_colour = "white", base_family = "Helvetica") + 
+    facet_grid(. ~ group) + ggraph::scale_edge_color_manual(values = colors_regulation) + 
+    scale_fill_manual(values = colors)
+  return(list(plot = plot, network_igraph = network_igraph, 
+    network_tidygraph = network_tidygraph))
+}
+```
+
+## ___ATRXdel vs ATRXwt____
+
+ATRXwt = MYCNamp and ATRXwtMYCNwt
+
+```{r MultiNicheNet analysis: ARTXdel vs. ATRXwt}
+fetahu2023_CCC@meta.data$new_groups <- NA
+fetahu2023_CCC@meta.data <- fetahu2023_CCC@meta.data %>% 
+  mutate(new_groups = ifelse(fetahu2023_CCC$group == "ATRXdel", "ATRXdel",
+                        ifelse(fetahu2023_CCC$group == "control", "control", "ATRXwt")))
+
+fetahu2023_CCC@meta.data$new_groups <- factor(fetahu2023_CCC@meta.data$new_groups)
+fetahu2023_CCC@meta.data$new_groups <- droplevels(fetahu2023_CCC@meta.data$new_group)
+
+# Get the cell IDs present in the Seurat object (cell barcodes in counts)
+cells_present <- colnames(fetahu2023_CCC[['RNA']]$counts)
+
+# Filter the metadata to keep only the rows corresponding to cells in the current Seurat object
+filtered_metadata <- fetahu2023_CCC@meta.data %>%
+  rownames_to_column(var = "cell_id") %>%    # Convert rownames to a column
+  filter(cell_id %in% cells_present) %>%     # Filter out cells not present in the object
+  column_to_rownames(var = "cell_id")        # Convert cell_id back to rownames
+
+# Update the Seurat object with the filtered metadata
+fetahu2023_CCC@meta.data <- filtered_metadata
+
+# Check the filtered metadata
+head(fetahu2023_CCC@meta.data)
+
+# 1. Change to the new group identitites
+Idents(fetahu2023_CCC) <- fetahu2023_CCC@meta.data$new_groups
+  
+# 2.
+sce = Seurat::as.SingleCellExperiment(fetahu2023_CCC, assay = "RNA")
+
+# 3. Define which columns in the metadata contain the neccessary information
+SummarizedExperiment::colData(sce)$rados_et_al_2025 = SummarizedExperiment::colData(sce)$rados_et_al_2025 %>% make.names()
+SummarizedExperiment::colData(sce)$new_groups = SummarizedExperiment::colData(sce)$new_groups %>% make.names()
+SummarizedExperiment::colData(sce)$new_cell_annotation = SummarizedExperiment::colData(sce)$new_cell_annotation %>% make.names()
+
+sample_id = "rados_et_al_2025"
+group_id = "new_groups" 
+celltype_id = "new_cell_annotation"
+
+# 4. Set covariates and batches
+covariates = NA
+batches = NA 
+ 
+# 5. Set comparison groups
+contrasts_oi = c("'ATRXdel-ATRXwt','ATRXwt-ATRXdel'")
+
+# Note the format to indicate the contrasts! This formatting should be adhered to very strictly, and white spaces are not allowed! Check ?get_DE_info for explanation about how to define this well. The most important points are that: *each contrast is surrounded by single quotation marks *contrasts are separated by a comma without any white space *all contrasts together are surrounded by double quotation marks.
+
+contrast_tbl = tibble(contrast =  c("ATRXdel-ATRXwt","ATRXwt-ATRXdel"), 
+                      group = c("ATRXdel","ATRXwt"))
+
+# 6. Define the sender and receiver cell types of interest
+# In our case all clusters
+senders_oi = SummarizedExperiment::colData(sce)[,celltype_id] %>% unique()
+receivers_oi = SummarizedExperiment::colData(sce)[,celltype_id] %>% unique()
+sce = sce[, SummarizedExperiment::colData(sce)[,celltype_id] %in% 
+            c(senders_oi, receivers_oi)]
+
+# 6. Define which conditions to use for the analysis
+conditions_keep = c("ATRXdel","ATRXwt") # in this case we keep all samples except controls
+sce = sce[, SummarizedExperiment::colData(sce)[,group_id] %in% 
+            conditions_keep]
+
+# 7. MultiNicheNet analysis
+
+# parameters
+min_cells = 50
+min_sample_prop = 0.50 # genes should be expressed in at least 50% of the samples in the group
+fraction_cutoff = 0.15 # genes should show non-zero expression values in at least 15% of cells in a sample
+empirical_pval = FALSE
+logFC_threshold = 0.50      # set based on the histogram distribution
+p_val_threshold = 0.05
+p_val_adj = TRUE 
+top_n_target = 250
+verbose = TRUE
+n.cores = 1
+scenario = "regular" 
+ligand_activity_down = TRUE 
+save = TRUE
+
+# core analysis
+multinichenet_output = multi_nichenet_analysis(
+  sce = sce, 
+  celltype_id = celltype_id, sample_id = sample_id, group_id = group_id, 
+  batches = batches, covariates = covariates, 
+  lr_network = lr_network, ligand_target_matrix = ligand_target_matrix, 
+  contrasts_oi = contrasts_oi, contrast_tbl = contrast_tbl, 
+  senders_oi = senders_oi, receivers_oi = receivers_oi,
+  min_cells = min_cells, 
+  fraction_cutoff = fraction_cutoff, 
+  min_sample_prop = min_sample_prop,
+  scenario = scenario, 
+  ligand_activity_down = ligand_activity_down,
+  logFC_threshold = logFC_threshold, 
+  p_val_threshold = p_val_threshold, 
+  p_val_adj = p_val_adj, 
+  empirical_pval = empirical_pval, 
+  top_n_target = top_n_target, 
+  n.cores = n.cores, 
+  verbose = TRUE
+  )
+
+if(save == TRUE){
+  saveRDS(multinichenet_output, paste0(params$out,"Rds/multiNicheNet_ATRXdel-vs-ATRXwt_v2026-04-10.Rds"))
+}
+```
+
+```{r MultiNicheNet figures: ATRXdel vs ATRXwt, fig.height=15, fig.width=15}
+#multinichenet_output <- readRDS(paste0(params$out,"Rds/multiNicheNet_ATRXdel-vs-ATRXwt_v2026-04-10.Rds"))
+
+# Visualization of differential cell-cell interactions
+prioritized_tbl_oi_all = get_top_n_lr_pairs(
+  multinichenet_output$prioritization_tables, 
+  top_n = 100, 
+  rank_per_group = TRUE
+  )
+
+prioritized_tbl_oi = 
+  multinichenet_output$prioritization_tables$group_prioritization_tbl %>%
+  filter(id %in% prioritized_tbl_oi_all$id) %>%
+  distinct(id, sender, receiver, ligand, receptor, group) %>% 
+  left_join(prioritized_tbl_oi_all)
+prioritized_tbl_oi$prioritization_score[is.na(prioritized_tbl_oi$prioritization_score)] = 0
+
+# save results
+output_ATRXdelvsATRXwt <- as.data.frame(prioritized_tbl_oi)
+write.table(output_ATRXdelvsATRXwt, 
+            file = paste0(params$out,"tables/multiNicheNet_LR_TOP100_ATRXdel-vs-ATRXwt.csv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+senders_receivers = union(prioritized_tbl_oi$sender %>% unique(), 
+                          prioritized_tbl_oi$receiver %>% unique()) %>% sort()
+
+prioritized_tbl_oi_filtered <- prioritized_tbl_oi %>%
+  filter(sender != receiver) # removing CCC within the same group
+
+table(prioritized_tbl_oi_filtered$group)
+
+colors_sender = NULL
+colors_receiver = NULL
+
+sender_oi <- c("NK..hNK_Bm1.","NK..hNK_Bm2.","NK..hNK_Bm3.","NK..hNK_Bm4.",
+               "M..1.","M..2.","M..10.","M..15.",
+               "pDC..12.",
+               "NB..8.")
+
+receiver_oi <- c("NK..hNK_Bm1.","NK..hNK_Bm2.","NK..hNK_Bm3.","NK..hNK_Bm4.",
+               "M..1.","M..2.","M..10.","M..15.",
+               "pDC..12.",
+               "NB..8.")
+
+# COLOR_CODE_v4
+colors_sender["NK..hNK_Bm1."]  = "#161B33"
+colors_sender["NK..hNK_Bm2."]  = "#419D78"
+colors_sender["NK..hNK_Bm3."]  = "#AF1B3F"
+colors_sender["NK..hNK_Bm4."]  = "#E88873"
+colors_sender["M..1."]    = "#520c61"
+colors_sender["M..2."]    = "#871F78"
+colors_sender["M..10."]   = "#ac87c1"
+colors_sender["M..15."]   = "#cd8ec0"
+colors_sender["pDC..12."] = "#efa26e"
+colors_sender["NB..8."] = "#006400"
+
+colors_receiver["NK..hNK_Bm1."]  = "#161B33"
+colors_receiver["NK..hNK_Bm2."]  = "#419D78"
+colors_receiver["NK..hNK_Bm3."]  = "#AF1B3F"
+colors_receiver["NK..hNK_Bm4."]  = "#E88873"
+colors_receiver["M..1."]    = "#520c61"
+colors_receiver["M..2."]    = "#871F78"
+colors_receiver["M..10."]   = "#ac87c1"
+colors_receiver["M..15."]   = "#cd8ec0"
+colors_receiver["pDC..12."] = "#efa26e"
+colors_receiver["NB..8."] = "#006400"
+
+circos_list = make_circos_group_comparison(prioritized_tbl_oi, 
+                                           colors_sender, 
+                                           colors_receiver)
+
+pdf(paste0(params$out,"figures/MultiNicheNet_circos_plot_ATRXdel-vs-ATRXwt_top50.pdf"),
+    height = 8, width = 8)
+circos_list$ATRXdel
+circos_list$ATRXwt
+dev.off()
+
+
+####################### ATRXwt patient group #################################
+group_oi = "ATRXwt" 
+
+# R-L expression
+prioritized_tbl_oi_M_50 = get_top_n_lr_pairs(
+  multinichenet_output$prioritization_tables, 
+  top_n = 100, 
+  rank_per_group = TRUE,
+  groups_oi = group_oi)
+
+filter_group <- prioritized_tbl_oi_filtered$group == "ATRXwt"
+prioritized_ATRXwt_filtered <- prioritized_tbl_oi_filtered[filter_group,]
+
+prioritized_ATRXwt_filtered <- prioritized_ATRXwt_filtered %>%
+  filter(sender != receiver) # removing CCC within the same group
+
+prioritized_ATRXwt_filtered <- head(prioritized_ATRXwt_filtered, n = 50)
+
+plot_oi_ATRXwt = make_sample_lr_prod_activity_plots(
+  multinichenet_output$prioritization_tables, 
+  prioritized_ATRXwt_filtered)
+
+plot_oi_ATRXwt 
+# Samples that were left out of the DE analysis are indicated with a smaller dot 
+# (this helps to indicate the samples that did not contribute to the calculation 
+# of the logFC, and thus not contributed to the final prioritization)
+
+# save plots
+pdf(paste0(params$out,"figures/multiNicheNet_ATRXwt_top50.pdf"),
+    height = 12, width = 14,pointsize = 1)
+plot_oi_ATRXwt
+dev.off()
+
+png(paste0(params$out,"figures/multiNicheNet_ATRXwt_top50.png"),
+   height = 1700, width = 2000, units = "px", pointsize = 1, res = 150)
+plot_oi_ATRXwt 
+dev.off()
+
+tiff(paste0(params$out,"figures/multiNicheNet_ATRXwt_top50.tiff"),
+    height = 1700, width = 2000, units = "px", res = 150, pointsize = 1)
+plot_oi_ATRXwt 
+dev.off() 
+
+############################## ATRXdel patient group #############################
+group_oi = "ATRXdel"
+
+prioritized_tbl_oi_M_50 = get_top_n_lr_pairs(
+  multinichenet_output$prioritization_tables, 
+  top_n = 100,  
+  rank_per_group = TRUE,
+  groups_oi = group_oi,
+  receivers_oi = clusters_of_interest,
+  senders_oi = clusters_of_interest)
+
+#prioritized_tbl_oi_M_50 <- prioritized_tbl_oi_M_50 %>%
+#  filter(sender != receiver) # removing CCC within the same group
+
+#plot_oi_ATRXdel = make_sample_lr_prod_activity_plots(
+#  multinichenet_output$prioritization_tables, 
+#  prioritized_tbl_oi_M_50)
+
+filter_group <- prioritized_tbl_oi_filtered$group == "ATRXdel"
+prioritized_ATRXdel_filtered <- prioritized_tbl_oi_filtered[filter_group,]
+
+prioritized_ATRXdel_filtered <- prioritized_ATRXdel_filtered %>%
+  filter(sender != receiver) # removing CCC within the same group
+
+prioritized_ATRXdel_filtered <- head(prioritized_ATRXdel_filtered, n = 50)
+
+plot_oi_ATRXdel = make_sample_lr_prod_activity_plots(
+  multinichenet_output$prioritization_tables, 
+  prioritized_ATRXdel_filtered)
+
+plot_oi_ATRXdel
+
+# save plots
+pdf(paste0(params$out,"figures/multiNicheNet_ATRXdel_top50.pdf"),
+    height = 12,width = 14,pointsize = 1)
+plot_oi_ATRXdel
+dev.off()
+
+png(paste0(params$out,"figures/multiNicheNet_ATRXdel_top50.png"),
+   height = 1700, width = 2000, units = "px", pointsize = 1, res = 150)
+plot_oi_ATRXdel 
+dev.off()
+
+tiff(paste0(params$out,"figures/multiNicheNet_ATRXdel_top50.tiff"),
+    height = 1700, width = 2000, units = "px", res = 150, pointsize = 1)
+plot_oi_ATRXdel 
+dev.off() 
+
+
+# Filtering of target genes based on LR-target expression correlation
+top_n_target = 300
+
+contrast_tbl = tibble(contrast =  c("ATRXdel-ATRXwt","ATRXdel-ATRXwt"), 
+                      group = c("ATRXdel","ATRXwt"))
+
+lr_target_prior_cor_filtered = 
+  multinichenet_output$prioritization_tables$group_prioritization_tbl$group %>% unique() %>% 
+  lapply(function(group_oi){
+    lr_target_prior_cor_filtered = multinichenet_output$lr_target_prior_cor %>%
+      inner_join(
+        multinichenet_output$ligand_activities_targets_DEgenes$ligand_activities %>%
+          distinct(ligand, target, direction_regulation, contrast)
+        ) %>% 
+      inner_join(contrast_tbl) %>% filter(group == group_oi)
+    
+    lr_target_prior_cor_filtered_up = lr_target_prior_cor_filtered %>% 
+      filter(direction_regulation == "up") %>% 
+      filter( (rank_of_target < top_n_target) & (pearson > 0.5))
+    
+    lr_target_prior_cor_filtered_down = lr_target_prior_cor_filtered %>% 
+      filter(direction_regulation == "down") %>% 
+      filter( (rank_of_target < top_n_target) & (pearson < -0.5))
+    lr_target_prior_cor_filtered = bind_rows(
+      lr_target_prior_cor_filtered_up, 
+      lr_target_prior_cor_filtered_down
+      )
+}) %>% bind_rows()
+
+# Network plot
+lr_target_df = lr_target_prior_cor_filtered %>% 
+  distinct(group, sender, receiver, ligand, receptor, id, target, direction_regulation) 
+
+# increase the top CCC
+prioritized_tbl_oi_all = get_top_n_lr_pairs(
+  multinichenet_output$prioritization_tables, 
+  top_n = 150, 
+  rank_per_group = TRUE 
+  )
+
+network = infer_intercellular_regulatory_network(lr_target_df, prioritized_tbl_oi_all)
+network$links %>% head()
+
+network_graph = visualize_network(network, colors_sender)
+
+final_network <- network_graph$plot
+final_network
+
+pdf(paste0(params$out,"figures/multiNicheNet_networkGraph_ATRXdel-vs-ATRXwt.pdf"),
+    height = 8, width = 12)
+final_network
+dev.off()
+
+tiff(paste0(params$out,"figures/multiNicheNet_networkGraph_ATRXdel-vs-ATRXwt.tiff"),
+     width = 265.9449, height = 265.9449,units = "in", res = 100)
+final_network
+dev.off()
+
+output_ATRXdelvsATRXwt <- as.data.frame(prioritized_tbl_oi)
+write.table(output_ATRXdelvsATRXwt, 
+            file = paste0(params$out,"tables/multiNicheNet_output_ATRXdel-vs-ATRXwt.csv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+## ___ATRXdel vs ATRXwtMYCNwt____
+
+```{r MultiNicheNet analysis: ARTXdel vs. ATRXwtMYCNwt}
+fetahu2023_CCC@meta.data$group <- factor(fetahu2023_CCC@meta.data$group)
+fetahu2023_CCC@meta.data$group <- droplevels(fetahu2023_CCC@meta.data$group)
+
+# Get the cell IDs present in the Seurat object (cell barcodes in counts)
+cells_present <- colnames(fetahu2023_CCC[['RNA']]$counts)
+
+# Filter the metadata to keep only the rows corresponding to cells in the current Seurat object
+filtered_metadata <- fetahu2023_CCC@meta.data %>%
+  rownames_to_column(var = "cell_id") %>%    # Convert rownames to a column
+  filter(cell_id %in% cells_present) %>%     # Filter out cells not present in the object
+  column_to_rownames(var = "cell_id")        # Convert cell_id back to rownames
+
+# Update the Seurat object with the filtered metadata
+fetahu2023_CCC@meta.data <- filtered_metadata
+
+# Check the filtered metadata
+head(fetahu2023_CCC@meta.data)
+
+# 1. Change to the new group identitites
+Idents(fetahu2023_CCC) <- fetahu2023_CCC@meta.data$group
+  
+# 2.
+sce = Seurat::as.SingleCellExperiment(fetahu2023_CCC, assay = "RNA")
+
+# 3. Define which columns in the metadata contain the neccessary information
+SummarizedExperiment::colData(sce)$rados_et_al_2025 = SummarizedExperiment::colData(sce)$rados_et_al_2025 %>% make.names()
+SummarizedExperiment::colData(sce)$group = SummarizedExperiment::colData(sce)$group %>% make.names()
+SummarizedExperiment::colData(sce)$new_cell_annotation = SummarizedExperiment::colData(sce)$new_cell_annotation %>% make.names()
+
+sample_id = "rados_et_al_2025"
+group_id = "group" 
+celltype_id = "new_cell_annotation"
+
+# 4. Set covariates and batches
+covariates = NA
+batches = NA 
+ 
+# 5. Set comparison groups
+contrasts_oi = c("'ATRXdel-ATRXwtMYCNwt','ATRXwtMYCNwt-ATRXdel'")
+
+# Note the format to indicate the contrasts! This formatting should be adhered to very strictly, and white spaces are not allowed! Check ?get_DE_info for explanation about how to define this well. The most important points are that: *each contrast is surrounded by single quotation marks *contrasts are separated by a comma without any white space *all contrasts together are surrounded by double quotation marks.
+
+contrast_tbl = tibble(contrast =  c("ATRXdel-ATRXwtMYCNwt","ATRXwtMYCNwt-ATRXdel"), 
+                      group = c("ATRXdel","ATRXwtMYCNwt"))
+
+# 6. Define the sender and receiver cell types of interest
+# In our case all clusters
+senders_oi = SummarizedExperiment::colData(sce)[,celltype_id] %>% unique()
+receivers_oi = SummarizedExperiment::colData(sce)[,celltype_id] %>% unique()
+sce = sce[, SummarizedExperiment::colData(sce)[,celltype_id] %in% 
+            c(senders_oi, receivers_oi)]
+
+# 6. Define which conditions to use for the analysis
+conditions_keep = c("ATRXdel","ATRXwtMYCNwt") # in this case we keep all samples except controls
+sce = sce[, SummarizedExperiment::colData(sce)[,group_id] %in% 
+            conditions_keep]
+
+# 7. MultiNicheNet analysis
+
+# parameters
+min_cells = 10         # If i set it to 10 cells min. than tumor cells are excluded fromt he analysis!!
+min_sample_prop = 0.50 # genes should be expressed in at least 50% of the samples in the group
+fraction_cutoff = 0.05 # genes should show non-zero expression values in at least 5% of cells in a sample
+empirical_pval = FALSE
+logFC_threshold = 0.50      # set based on the histogram distribution
+p_val_threshold = 0.05
+p_val_adj = TRUE 
+top_n_target = 500
+verbose = TRUE
+n.cores = 20
+scenario = "regular" 
+ligand_activity_down = TRUE 
+save = TRUE
+
+# core analysis
+multinichenet_output = multi_nichenet_analysis(
+  sce = sce, 
+  celltype_id = celltype_id, sample_id = sample_id, group_id = group_id, 
+  batches = batches, covariates = covariates, 
+  lr_network = lr_network, ligand_target_matrix = ligand_target_matrix, 
+  contrasts_oi = contrasts_oi, contrast_tbl = contrast_tbl, 
+  senders_oi = senders_oi, receivers_oi = receivers_oi,
+  min_cells = min_cells, 
+  fraction_cutoff = fraction_cutoff, 
+  min_sample_prop = min_sample_prop,
+  scenario = scenario, 
+  ligand_activity_down = ligand_activity_down,
+  logFC_threshold = logFC_threshold, 
+  p_val_threshold = p_val_threshold, 
+  p_val_adj = p_val_adj, 
+  empirical_pval = empirical_pval, 
+  top_n_target = top_n_target, 
+  n.cores = n.cores, 
+  verbose = TRUE
+  )
+
+if(save == TRUE){
+  saveRDS(multinichenet_output, paste0(params$out,"Rds/multiNicheNet_ATRXdel-vs-ATRXwtMYCNwt_v2026-04-10.Rds"))
+}
+```
+
+```{r MultiNicheNet figures: ATRXdel vs ATRXwtMYCNwt, fig.height=15, fig.width=15}
+#multinichenet_output <- readRDS(paste0(params$out,"Rds/multiNicheNet_ATRXdel-vs-ATRXwtMYCNwt_v2026-04-10.Rds"))
+
+# Visualization of differential cell-cell interactions
+prioritized_tbl_oi_all = get_top_n_lr_pairs(
+  multinichenet_output$prioritization_tables, 
+  top_n = 500, 
+  rank_per_group = TRUE
+  )
+
+prioritized_tbl_oi = 
+  multinichenet_output$prioritization_tables$group_prioritization_tbl %>%
+  filter(id %in% prioritized_tbl_oi_all$id) %>%
+  distinct(id, sender, receiver, ligand, receptor, group) %>% 
+  left_join(prioritized_tbl_oi_all)
+prioritized_tbl_oi$prioritization_score[is.na(prioritized_tbl_oi$prioritization_score)] = 0
+
+# save results
+output_ATRXdelvsATRXwtMYCNwt <- as.data.frame(prioritized_tbl_oi)
+write.table(output_ATRXdelvsATRXwtMYCNwt, 
+            file = paste0(params$out,"tables/multiNicheNet_LR_TOP100_ATRXdel-vs-ATRXwtMYCNwt.csv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+senders_receivers = union(prioritized_tbl_oi$sender %>% unique(), 
+                          prioritized_tbl_oi$receiver %>% unique()) %>% sort()
+
+prioritized_tbl_oi_filtered <- prioritized_tbl_oi %>%
+  filter(sender != receiver) # removing CCC within the same group
+
+table(prioritized_tbl_oi_filtered$group)
+
+colors_sender = NULL
+colors_receiver = NULL
+
+sender_oi <- c("NK..hNK_Bm1.","NK..hNK_Bm2.","NK..hNK_Bm3.","NK..hNK_Bm4.",
+               "M..1.","M..2.","M..10.","M..15.",
+               "pDC..12.",
+               "NB..8.")
+
+receiver_oi <- c("NK..hNK_Bm1.","NK..hNK_Bm2.","NK..hNK_Bm3.","NK..hNK_Bm4.",
+               "M..1.","M..2.","M..10.","M..15.",
+               "pDC..12.",
+               "NB..8.")
+
+# COLOR_CODE_v4
+colors_sender["NK..hNK_Bm1."]  = "#161B33"
+colors_sender["NK..hNK_Bm2."]  = "#419D78"
+colors_sender["NK..hNK_Bm3."]  = "#AF1B3F"
+colors_sender["NK..hNK_Bm4."]  = "#E88873"
+colors_sender["M..1."]    = "#520c61"
+colors_sender["M..2."]    = "#871F78"
+colors_sender["M..10."]   = "#ac87c1"
+colors_sender["M..15."]   = "#cd8ec0"
+colors_sender["pDC..12."] = "#efa26e"
+colors_sender["NB..8."] = "#006400"
+
+colors_receiver["NK..hNK_Bm1."]  = "#161B33"
+colors_receiver["NK..hNK_Bm2."]  = "#419D78"
+colors_receiver["NK..hNK_Bm3."]  = "#AF1B3F"
+colors_receiver["NK..hNK_Bm4."]  = "#E88873"
+colors_receiver["M..1."]    = "#520c61"
+colors_receiver["M..2."]    = "#871F78"
+colors_receiver["M..10."]   = "#ac87c1"
+colors_receiver["M..15."]   = "#cd8ec0"
+colors_receiver["pDC..12."] = "#efa26e"
+colors_receiver["NB..8."] = "#006400"
+
+circos_list = make_circos_group_comparison(prioritized_tbl_oi, 
+                                           colors_sender, 
+                                           colors_receiver)
+
+pdf(paste0(params$out,"figures/MultiNicheNet_circos_plot_ATRXdel-vs-ATRXwtMYCNwt_top50.pdf"),
+    height = 8, width = 8)
+circos_list$ATRXdel
+circos_list$ATRXwtMYCNwt
+dev.off()
+
+
+####################### ATRXwtMYCNwt patient group #################################
+group_oi = "ATRXwtMYCNwt" 
+
+# R-L expression
+prioritized_tbl_oi_M_50 = get_top_n_lr_pairs(
+  multinichenet_output$prioritization_tables, 
+  top_n = 500, 
+  rank_per_group = TRUE,
+  groups_oi = group_oi)
+
+filter_group <- prioritized_tbl_oi_filtered$group == "ATRXwtMYCNwt"
+prioritized_ATRXwtMYCNwt_filtered <- prioritized_tbl_oi_filtered[filter_group,]
+
+prioritized_ATRXwtMYCNwt_filtered <- prioritized_ATRXwtMYCNwt_filtered %>%
+  filter(sender != receiver) # removing CCC within the same group
+
+prioritized_ATRXwtMYCNwt_filtered <- head(prioritized_ATRXwtMYCNwt_filtered, n = 50)
+
+plot_oi_ATRXwtMYCNwt = make_sample_lr_prod_activity_plots(
+  multinichenet_output$prioritization_tables, 
+  prioritized_ATRXwtMYCNwt_filtered)
+
+plot_oi_ATRXwtMYCNwt 
+# Samples that were left out of the DE analysis are indicated with a smaller dot 
+# (this helps to indicate the samples that did not contribute to the calculation 
+# of the logFC, and thus not contributed to the final prioritization)
+
+# save plots
+pdf(paste0(params$out,"figures/multiNicheNet_ATRXwtMYCNwt_top50.pdf"),
+    height = 12, width = 14,pointsize = 1)
+plot_oi_ATRXwtMYCNwt
+dev.off()
+
+png(paste0(params$out,"figures/multiNicheNet_ATRXwtMYCNwt_top50.png"),
+   height = 1700, width = 2000, units = "px", pointsize = 1, res = 150)
+plot_oi_ATRXwtMYCNwt 
+dev.off()
+
+tiff(paste0(params$out,"figures/multiNicheNet_ATRXwtMYCNwt_top50.tiff"),
+    height = 1700, width = 2000, units = "px", res = 150, pointsize = 1)
+plot_oi_ATRXwtMYCNwt 
+dev.off() 
+
+############################## ATRXdel patient group #############################
+group_oi = "ATRXdel"
+
+prioritized_tbl_oi_M_50 = get_top_n_lr_pairs(
+  multinichenet_output$prioritization_tables, 
+  top_n = 500,  
+  rank_per_group = TRUE,
+  groups_oi = group_oi,
+  receivers_oi = clusters_of_interest,
+  senders_oi = clusters_of_interest)
+
+#prioritized_tbl_oi_M_50 <- prioritized_tbl_oi_M_50 %>%
+#  filter(sender != receiver) # removing CCC within the same group
+
+#plot_oi_ATRXdel = make_sample_lr_prod_activity_plots(
+#  multinichenet_output$prioritization_tables, 
+#  prioritized_tbl_oi_M_50)
+
+filter_group <- prioritized_tbl_oi_filtered$group == "ATRXdel"
+prioritized_ATRXdel_filtered <- prioritized_tbl_oi_filtered[filter_group,]
+
+prioritized_ATRXdel_filtered <- prioritized_ATRXdel_filtered %>%
+  filter(sender != receiver) # removing CCC within the same group
+
+prioritized_ATRXdel_filtered <- head(prioritized_ATRXdel_filtered, n = 50)
+
+plot_oi_ATRXdel = make_sample_lr_prod_activity_plots(
+  multinichenet_output$prioritization_tables, 
+  prioritized_ATRXdel_filtered)
+
+plot_oi_ATRXdel
+
+# save plots
+pdf(paste0(params$out,"figures/multiNicheNet_ATRXdel_top50.pdf"),
+    height = 12,width = 14,pointsize = 1)
+plot_oi_ATRXdel
+dev.off()
+
+png(paste0(params$out,"figures/multiNicheNet_ATRXdel_top50.png"),
+   height = 1700, width = 2000, units = "px", pointsize = 1, res = 150)
+plot_oi_ATRXdel 
+dev.off()
+
+tiff(paste0(params$out,"figures/multiNicheNet_ATRXdel_top50.tiff"),
+    height = 1700, width = 2000, units = "px", res = 150, pointsize = 1)
+plot_oi_ATRXdel 
+dev.off() 
+
+
+# Filtering of target genes based on LR-target expression correlation
+top_n_target = 300
+
+contrast_tbl = tibble(contrast =  c("ATRXdel-ATRXwtMYCNwt","ATRXdel-ATRXwtMYCNwt"), 
+                      group = c("ATRXdel","ATRXwtMYCNwt"))
+
+lr_target_prior_cor_filtered = 
+  multinichenet_output$prioritization_tables$group_prioritization_tbl$group %>% unique() %>% 
+  lapply(function(group_oi){
+    lr_target_prior_cor_filtered = multinichenet_output$lr_target_prior_cor %>%
+      inner_join(
+        multinichenet_output$ligand_activities_targets_DEgenes$ligand_activities %>%
+          distinct(ligand, target, direction_regulation, contrast)
+        ) %>% 
+      inner_join(contrast_tbl) %>% filter(group == group_oi)
+    
+    lr_target_prior_cor_filtered_up = lr_target_prior_cor_filtered %>% 
+      filter(direction_regulation == "up") %>% 
+      filter( (rank_of_target < top_n_target) & (pearson > 0.5))
+    
+    lr_target_prior_cor_filtered_down = lr_target_prior_cor_filtered %>% 
+      filter(direction_regulation == "down") %>% 
+      filter( (rank_of_target < top_n_target) & (pearson < -0.5))
+    lr_target_prior_cor_filtered = bind_rows(
+      lr_target_prior_cor_filtered_up, 
+      lr_target_prior_cor_filtered_down
+      )
+}) %>% bind_rows()
+
+# Network plot
+lr_target_df = lr_target_prior_cor_filtered %>% 
+  distinct(group, sender, receiver, ligand, receptor, id, target, direction_regulation) 
+
+# increase the top CCC
+prioritized_tbl_oi_all = get_top_n_lr_pairs(
+  multinichenet_output$prioritization_tables, 
+  top_n = 500, 
+  rank_per_group = TRUE 
+  )
+
+network = infer_intercellular_regulatory_network(lr_target_df, prioritized_tbl_oi_all)
+network$links %>% head()
+
+network_graph = visualize_network(network, colors_sender)
+
+final_network <- network_graph$plot
+final_network
+
+pdf(paste0(params$out,"figures/multiNicheNet_networkGraph_ATRXdel-vs-ATRXwtMYCNwt.pdf"),
+    height = 8, width = 12)
+final_network
+dev.off()
+
+tiff(paste0(params$out,"figures/multiNicheNet_networkGraph_ATRXdel-vs-ATRXwtMYCNwt.tiff"),
+     width = 265.9449, height = 265.9449,units = "in", res = 100)
+final_network
+dev.off()
+
+output_ATRXdelvsATRXwtMYCNwt <- as.data.frame(prioritized_tbl_oi)
+write.table(output_ATRXdelvsATRXwtMYCNwt, 
+            file = paste0(params$out,"tables/multiNicheNet_output_ATRXdel-vs-ATRXwtMYCNwt.csv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+## ___ATRXdel vs MYCNamp____
+
+```{r MultiNicheNet analysis: ARTXdel vs. MYCNamp}
+fetahu2023_CCC@meta.data$group <- factor(fetahu2023_CCC@meta.data$group)
+fetahu2023_CCC@meta.data$group <- droplevels(fetahu2023_CCC@meta.data$group)
+
+# Get the cell IDs present in the Seurat object (cell barcodes in counts)
+cells_present <- colnames(fetahu2023_CCC[['RNA']]$counts)
+
+# Filter the metadata to keep only the rows corresponding to cells in the current Seurat object
+filtered_metadata <- fetahu2023_CCC@meta.data %>%
+  rownames_to_column(var = "cell_id") %>%    # Convert rownames to a column
+  filter(cell_id %in% cells_present) %>%     # Filter out cells not present in the object
+  column_to_rownames(var = "cell_id")        # Convert cell_id back to rownames
+
+# Update the Seurat object with the filtered metadata
+fetahu2023_CCC@meta.data <- filtered_metadata
+
+# Check the filtered metadata
+head(fetahu2023_CCC@meta.data)
+
+# 1. Change to the new group identitites
+Idents(fetahu2023_CCC) <- fetahu2023_CCC@meta.data$group
+  
+# 2.
+sce = Seurat::as.SingleCellExperiment(fetahu2023_CCC, assay = "RNA")
+
+# 3. Define which columns in the metadata contain the neccessary information
+SummarizedExperiment::colData(sce)$rados_et_al_2025 = SummarizedExperiment::colData(sce)$rados_et_al_2025 %>% make.names()
+SummarizedExperiment::colData(sce)$group = SummarizedExperiment::colData(sce)$group %>% make.names()
+SummarizedExperiment::colData(sce)$new_cell_annotation = SummarizedExperiment::colData(sce)$new_cell_annotation %>% make.names()
+
+sample_id = "rados_et_al_2025"
+group_id = "group" 
+celltype_id = "new_cell_annotation"
+
+# 4. Set covariates and batches
+covariates = NA
+batches = NA 
+ 
+# 5. Set comparison groups
+contrasts_oi = c("'ATRXdel-MYCNamp','MYCNamp-ATRXdel'")
+
+# Note the format to indicate the contrasts! This formatting should be adhered to very strictly, and white spaces are not allowed! Check ?get_DE_info for explanation about how to define this well. The most important points are that: *each contrast is surrounded by single quotation marks *contrasts are separated by a comma without any white space *all contrasts together are surrounded by double quotation marks.
+
+contrast_tbl = tibble(contrast =  c("ATRXdel-MYCNamp","MYCNamp-ATRXdel"), 
+                      group = c("ATRXdel","MYCNamp"))
+
+# 6. Define the sender and receiver cell types of interest
+# In our case all clusters
+senders_oi = SummarizedExperiment::colData(sce)[,celltype_id] %>% unique()
+receivers_oi = SummarizedExperiment::colData(sce)[,celltype_id] %>% unique()
+sce = sce[, SummarizedExperiment::colData(sce)[,celltype_id] %in% 
+            c(senders_oi, receivers_oi)]
+
+# 6. Define which conditions to use for the analysis
+conditions_keep = c("ATRXdel","MYCNamp") # in this case we keep all samples except controls
+sce = sce[, SummarizedExperiment::colData(sce)[,group_id] %in% 
+            conditions_keep]
+
+# 7. MultiNicheNet analysis
+
+# parameters
+min_cells = 10         # If i set it to 10 cells min. than tumor cells are excluded fromt he analysis!!
+min_sample_prop = 0.50 # genes should be expressed in at least 50% of the samples in the group
+fraction_cutoff = 0.05 # genes should show non-zero expression values in at least 5% of cells in a sample
+empirical_pval = FALSE
+logFC_threshold = 0.50      # set based on the histogram distribution
+p_val_threshold = 0.05
+p_val_adj = TRUE 
+top_n_target = 500
+verbose = TRUE
+n.cores = 20
+scenario = "regular" 
+ligand_activity_down = TRUE 
+save = TRUE
+
+# core analysis
+multinichenet_output = multi_nichenet_analysis(
+  sce = sce, 
+  celltype_id = celltype_id, sample_id = sample_id, group_id = group_id, 
+  batches = batches, covariates = covariates, 
+  lr_network = lr_network, ligand_target_matrix = ligand_target_matrix, 
+  contrasts_oi = contrasts_oi, contrast_tbl = contrast_tbl, 
+  senders_oi = senders_oi, receivers_oi = receivers_oi,
+  min_cells = min_cells, 
+  fraction_cutoff = fraction_cutoff, 
+  min_sample_prop = min_sample_prop,
+  scenario = scenario, 
+  ligand_activity_down = ligand_activity_down,
+  logFC_threshold = logFC_threshold, 
+  p_val_threshold = p_val_threshold, 
+  p_val_adj = p_val_adj, 
+  empirical_pval = empirical_pval, 
+  top_n_target = top_n_target, 
+  n.cores = n.cores, 
+  verbose = TRUE
+  )
+
+if(save == TRUE){
+  saveRDS(multinichenet_output, paste0(params$out,"Rds/multiNicheNet_ATRXdel-vs-MYCNamp_v2026-04-10.Rds"))
+}
+```
+
+```{r MultiNicheNet figures: ATRXdel vs MYCNamp, fig.height=15, fig.width=15}
+#multinichenet_output <- readRDS(paste0(params$out,"Rds/multiNicheNet_ATRXdel-vs-MYCNamp_v2026-04-10.Rds"))
+
+# Visualization of differential cell-cell interactions
+prioritized_tbl_oi_all = get_top_n_lr_pairs(
+  multinichenet_output$prioritization_tables, 
+  top_n = 500, 
+  rank_per_group = TRUE
+  )
+
+prioritized_tbl_oi = 
+  multinichenet_output$prioritization_tables$group_prioritization_tbl %>%
+  filter(id %in% prioritized_tbl_oi_all$id) %>%
+  distinct(id, sender, receiver, ligand, receptor, group) %>% 
+  left_join(prioritized_tbl_oi_all)
+prioritized_tbl_oi$prioritization_score[is.na(prioritized_tbl_oi$prioritization_score)] = 0
+
+# save results
+output_ATRXdelvsMYCNamp <- as.data.frame(prioritized_tbl_oi)
+write.table(output_ATRXdelvsMYCNamp, 
+            file = paste0(params$out,"tables/multiNicheNet_LR_TOP100_ATRXdel-vs-MYCNamp.csv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+senders_receivers = union(prioritized_tbl_oi$sender %>% unique(), 
+                          prioritized_tbl_oi$receiver %>% unique()) %>% sort()
+
+prioritized_tbl_oi_filtered <- prioritized_tbl_oi %>%
+  filter(sender != receiver) # removing CCC within the same group
+
+table(prioritized_tbl_oi_filtered$group)
+
+colors_sender = NULL
+colors_receiver = NULL
+
+sender_oi <- c("NK..hNK_Bm1.","NK..hNK_Bm2.","NK..hNK_Bm3.","NK..hNK_Bm4.",
+               "M..1.","M..2.","M..10.","M..15.",
+               "pDC..12.",
+               "NB..8.")
+
+receiver_oi <- c("NK..hNK_Bm1.","NK..hNK_Bm2.","NK..hNK_Bm3.","NK..hNK_Bm4.",
+               "M..1.","M..2.","M..10.","M..15.",
+               "pDC..12.",
+               "NB..8.")
+
+# COLOR_CODE_v4
+colors_sender["NK..hNK_Bm1."]  = "#161B33"
+colors_sender["NK..hNK_Bm2."]  = "#419D78"
+colors_sender["NK..hNK_Bm3."]  = "#AF1B3F"
+colors_sender["NK..hNK_Bm4."]  = "#E88873"
+colors_sender["M..1."]    = "#520c61"
+colors_sender["M..2."]    = "#871F78"
+colors_sender["M..10."]   = "#ac87c1"
+colors_sender["M..15."]   = "#cd8ec0"
+colors_sender["pDC..12."] = "#efa26e"
+colors_sender["NB..8."] = "#006400"
+
+colors_receiver["NK..hNK_Bm1."]  = "#161B33"
+colors_receiver["NK..hNK_Bm2."]  = "#419D78"
+colors_receiver["NK..hNK_Bm3."]  = "#AF1B3F"
+colors_receiver["NK..hNK_Bm4."]  = "#E88873"
+colors_receiver["M..1."]    = "#520c61"
+colors_receiver["M..2."]    = "#871F78"
+colors_receiver["M..10."]   = "#ac87c1"
+colors_receiver["M..15."]   = "#cd8ec0"
+colors_receiver["pDC..12."] = "#efa26e"
+colors_receiver["NB..8."] = "#006400"
+
+circos_list = make_circos_group_comparison(prioritized_tbl_oi, 
+                                           colors_sender, 
+                                           colors_receiver)
+
+pdf(paste0(params$out,"figures/MultiNicheNet_circos_plot_ATRXdel-vs-MYCNamp_top50.pdf"),
+    height = 8, width = 8)
+circos_list$ATRXdel
+circos_list$MYCNamp
+dev.off()
+
+
+####################### MYCNamp patient group #################################
+group_oi = "MYCNamp" 
+
+# R-L expression
+prioritized_tbl_oi_M_50 = get_top_n_lr_pairs(
+  multinichenet_output$prioritization_tables, 
+  top_n = 500, 
+  rank_per_group = TRUE,
+  groups_oi = group_oi)
+
+filter_group <- prioritized_tbl_oi_filtered$group == "MYCNamp"
+prioritized_MYCNamp_filtered <- prioritized_tbl_oi_filtered[filter_group,]
+
+prioritized_MYCNamp_filtered <- prioritized_MYCNamp_filtered %>%
+  filter(sender != receiver) # removing CCC within the same group
+
+prioritized_MYCNamp_filtered <- head(prioritized_MYCNamp_filtered, n = 50)
+
+plot_oi_MYCNamp = make_sample_lr_prod_activity_plots(
+  multinichenet_output$prioritization_tables, 
+  prioritized_MYCNamp_filtered)
+
+plot_oi_MYCNamp 
+# Samples that were left out of the DE analysis are indicated with a smaller dot 
+# (this helps to indicate the samples that did not contribute to the calculation 
+# of the logFC, and thus not contributed to the final prioritization)
+
+# save plots
+pdf(paste0(params$out,"figures/multiNicheNet_MYCNamp_top50.pdf"),
+    height = 12, width = 14,pointsize = 1)
+plot_oi_MYCNamp
+dev.off()
+
+png(paste0(params$out,"figures/multiNicheNet_MYCNamp_top50.png"),
+   height = 1700, width = 2000, units = "px", pointsize = 1, res = 150)
+plot_oi_MYCNamp 
+dev.off()
+
+tiff(paste0(params$out,"figures/multiNicheNet_MYCNamp_top50.tiff"),
+    height = 1700, width = 2000, units = "px", res = 150, pointsize = 1)
+plot_oi_MYCNamp 
+dev.off() 
+
+############################## ATRXdel patient group #############################
+group_oi = "ATRXdel"
+
+prioritized_tbl_oi_M_50 = get_top_n_lr_pairs(
+  multinichenet_output$prioritization_tables, 
+  top_n = 500,  
+  rank_per_group = TRUE,
+  groups_oi = group_oi,
+  receivers_oi = clusters_of_interest,
+  senders_oi = clusters_of_interest)
+
+#prioritized_tbl_oi_M_50 <- prioritized_tbl_oi_M_50 %>%
+#  filter(sender != receiver) # removing CCC within the same group
+
+#plot_oi_ATRXdel = make_sample_lr_prod_activity_plots(
+#  multinichenet_output$prioritization_tables, 
+#  prioritized_tbl_oi_M_50)
+
+filter_group <- prioritized_tbl_oi_filtered$group == "ATRXdel"
+prioritized_ATRXdel_filtered <- prioritized_tbl_oi_filtered[filter_group,]
+
+prioritized_ATRXdel_filtered <- prioritized_ATRXdel_filtered %>%
+  filter(sender != receiver) # removing CCC within the same group
+
+prioritized_ATRXdel_filtered <- head(prioritized_ATRXdel_filtered, n = 50)
+
+plot_oi_ATRXdel = make_sample_lr_prod_activity_plots(
+  multinichenet_output$prioritization_tables, 
+  prioritized_ATRXdel_filtered)
+
+plot_oi_ATRXdel
+
+# save plots
+pdf(paste0(params$out,"figures/multiNicheNet_ATRXdel_top50.pdf"),
+    height = 12,width = 14,pointsize = 1)
+plot_oi_ATRXdel
+dev.off()
+
+png(paste0(params$out,"figures/multiNicheNet_ATRXdel_top50.png"),
+   height = 1700, width = 2000, units = "px", pointsize = 1, res = 150)
+plot_oi_ATRXdel 
+dev.off()
+
+tiff(paste0(params$out,"figures/multiNicheNet_ATRXdel_top50.tiff"),
+    height = 1700, width = 2000, units = "px", res = 150, pointsize = 1)
+plot_oi_ATRXdel 
+dev.off() 
+
+
+# Filtering of target genes based on LR-target expression correlation
+top_n_target = 300
+
+contrast_tbl = tibble(contrast =  c("ATRXdel-MYCNamp","ATRXdel-MYCNamp"), 
+                      group = c("ATRXdel","MYCNamp"))
+
+lr_target_prior_cor_filtered = 
+  multinichenet_output$prioritization_tables$group_prioritization_tbl$group %>% unique() %>% 
+  lapply(function(group_oi){
+    lr_target_prior_cor_filtered = multinichenet_output$lr_target_prior_cor %>%
+      inner_join(
+        multinichenet_output$ligand_activities_targets_DEgenes$ligand_activities %>%
+          distinct(ligand, target, direction_regulation, contrast)
+        ) %>% 
+      inner_join(contrast_tbl) %>% filter(group == group_oi)
+    
+    lr_target_prior_cor_filtered_up = lr_target_prior_cor_filtered %>% 
+      filter(direction_regulation == "up") %>% 
+      filter( (rank_of_target < top_n_target) & (pearson > 0.5))
+    
+    lr_target_prior_cor_filtered_down = lr_target_prior_cor_filtered %>% 
+      filter(direction_regulation == "down") %>% 
+      filter( (rank_of_target < top_n_target) & (pearson < -0.5))
+    lr_target_prior_cor_filtered = bind_rows(
+      lr_target_prior_cor_filtered_up, 
+      lr_target_prior_cor_filtered_down
+      )
+}) %>% bind_rows()
+
+# Network plot
+lr_target_df = lr_target_prior_cor_filtered %>% 
+  distinct(group, sender, receiver, ligand, receptor, id, target, direction_regulation) 
+
+# increase the top CCC
+prioritized_tbl_oi_all = get_top_n_lr_pairs(
+  multinichenet_output$prioritization_tables, 
+  top_n = 500, 
+  rank_per_group = TRUE 
+  )
+
+network = infer_intercellular_regulatory_network(lr_target_df, prioritized_tbl_oi_all)
+network$links %>% head()
+
+network_graph = visualize_network(network, colors_sender)
+
+final_network <- network_graph$plot
+final_network
+
+pdf(paste0(params$out,"figures/multiNicheNet_networkGraph_ATRXdel-vs-MYCNamp.pdf"),
+    height = 8, width = 12)
+final_network
+dev.off()
+
+tiff(paste0(params$out,"figures/multiNicheNet_networkGraph_ATRXdel-vs-MYCNamp.tiff"),
+     width = 265.9449, height = 265.9449,units = "in", res = 100)
+final_network
+dev.off()
+
+output_ATRXdelvsMYCNamp <- as.data.frame(prioritized_tbl_oi)
+write.table(output_ATRXdelvsMYCNamp, 
+            file = paste0(params$out,"tables/multiNicheNet_output_ATRXdel-vs-MYCNamp.csv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+# ___Session info___
+
+```{r}
+sessionInfo()
+```
+
