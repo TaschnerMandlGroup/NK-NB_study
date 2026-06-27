@@ -73,18 +73,18 @@ crinier_et_al_genes <- list(adaptive_NK = adaptive_NK_genes,
 
 library(readr)
 CD56bright_CD16neg_NK_vs_CD56dim_CD16pos_NK_genes <- 
-  read_delim("~/mnt_resources/NK_genes/CD56bright_CD16neg_NK_vs_CD56dim_CD16pos_NK_genes.csv",
+  read_delim("/home/rstudio/mnt_resources/NK_genes/CD56bright_CD16neg_NK_vs_CD56dim_CD16pos_NK_genes.csv",
              delim = "\t", escape_double = FALSE, 
              col_names = FALSE, trim_ws = TRUE, skip = 2)
 
 
 activated_CD16pos_NK_vs_CD56dim_CD16pos_NK_genes <- 
-  read_delim("~/mnt_resources/NK_genes/activated_CD16pos_NK_vs_CD56dim_CD16pos_NK_genes.csv",
+  read_delim("/home/rstudio/mnt_resources/NK_genes/activated_CD16pos_NK_vs_CD56dim_CD16pos_NK_genes.csv",
              delim = "\t", escape_double = FALSE,
              col_names = FALSE, trim_ws = TRUE, skip = 2)
 
 activated_CD16pos_NK_vs_CD56bright_CD16neg_NK_genes <- 
-  read_delim("~/mnt_resources/NK_genes/activated_CD16pos_NK_vs_CD56bright_CD16neg_NK_genes.csv",
+  read_delim("/home/rstudio/mnt_resources/NK_genes/activated_CD16pos_NK_vs_CD56bright_CD16neg_NK_genes.csv",
              delim = "\t", escape_double = FALSE,
              col_names = FALSE, trim_ws = TRUE, skip = 2)
 
@@ -101,7 +101,7 @@ activated_CD16pos_NK_vs_CD56dim_CD16pos_NK_genes <- rbind(activated_CD16pos_NK_v
 
 ## ____NK functional markers from: Blanquart et al., 2024___
 
-inflammed_NK_genes <- read_delim("~/mnt_resources/NK_genes/inflammed_NK_genes.csv",
+inflammed_NK_genes <- read_delim("/home/rstudio/mnt_resources/NK_genes/inflammed_NK_genes.csv",
                                  delim = "\t", escape_double = FALSE,
                                  col_names = FALSE, trim_ws = TRUE, skip = 2)
 

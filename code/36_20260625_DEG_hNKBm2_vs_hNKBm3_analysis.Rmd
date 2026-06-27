@@ -1,0 +1,1256 @@
+---
+title: "NK project: DEG analysis - hNK_Bm2 vs. hNK_Bm3 per genetic group"
+author: "Dr. Sara Wernig-Zorc"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  input_NK: "/home/rstudio/mnt_out/NK_project/Rds/ALL_NK_cluster_withNewMetadata.Rds"
+  out: "/home/rstudio/mnt_out/NK_project/"
+  GO_db: "/home/rstudio/mnt_resources/GSEA_GeneSetEnrichments/"
+---
+
+PROJECT DESCRIPTION
+
+Do hNK_Bm2 and hNK_Bm3 differ from each other in terms of gene expression, and does the
+nature or extent of their difference change across genetic contexts (control, ATRXdel,
+MYCNamp, ATRXwtMYCNwt)?
+
+Strategy: for each genetic group separately, run pseudobulk DEG between hNK_Bm2 and hNK_Bm3
+using DElegate, then overlay significant genes across groups with Venn diagrams to identify
+context-shared vs. context-specific differences.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE,
+                      error = FALSE,
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 20)
+options(future.globals.maxSize = 8 * 10^9)
+
+print(params)
+```
+
+```{r include=FALSE}
+source("/home/rstudio/00_NK_paper_setup.R")
+source("/home/rstudio/00_NK_paper_utils.R")
+```
+
+# ___Load data___
+
+```{r include=FALSE}
+suppressPackageStartupMessages(library('pheatmap'))
+suppressPackageStartupMessages(library("DOSE"))
+suppressPackageStartupMessages(library("enrichplot"))
+suppressPackageStartupMessages(library("ggupset"))
+suppressPackageStartupMessages(library("EnhancedVolcano"))
+suppressPackageStartupMessages(library("ggVennDiagram"))
+suppressPackageStartupMessages(library("ggbeeswarm"))
+```
+
+```{r include=FALSE}
+ALL_NK <- readRDS(file = params$input_NK)
+```
+
+```{r}
+counts_matrix <- GetAssayData(ALL_NK, slot = "counts")
+
+hist(Matrix::rowSums(counts_matrix), breaks = 100000000, xlim = (c(0, 100)))
+abline(v = 2)
+hist(log(Matrix::rowSums(counts_matrix)), breaks = 1000)
+abline(v = 3)
+
+geneUniverse <- rownames(counts_matrix)[Matrix::rowSums(counts_matrix) > 1]
+length(geneUniverse)
+
+geneUniverse_entrezIDs <- map_gene_to_entrez(geneUniverse)
+
+hallmark_genes_H <- msigdbr(species = "human", category = "H") %>%
+  dplyr::select(gs_name, entrez_gene)
+```
+
+Publication theme and shared helpers.
+
+```{r}
+# Publication-quality ggplot2 theme
+pub_theme <- theme_classic(base_size = 10) +
+  theme(
+    axis.line        = element_line(linewidth = 0.4, color = "black"),
+    axis.ticks       = element_line(linewidth = 0.4, color = "black"),
+    axis.text        = element_text(size = 8,  color = "black"),
+    axis.title       = element_text(size = 9,  color = "black"),
+    plot.title       = element_text(size = 10, face = "bold"),
+    plot.subtitle    = element_text(size = 8),
+    legend.key.size  = unit(3,  "mm"),
+    legend.text      = element_text(size = 8),
+    legend.title     = element_text(size = 9),
+    strip.background = element_blank(),
+    strip.text       = element_text(size = 9)
+  )
+theme_set(pub_theme)
+
+# Cluster and group colors (from 00_NK_paper_setup.R)
+COL_BM2   <- COLOR_CODE_v2["hNK_Bm2"]   # "#679F8F"
+COL_BM3   <- COLOR_CODE_v2["hNK_Bm3"]   # "#BF4E4E"
+COL_CLUST <- COLOR_CODE_v2[c("hNK_Bm2", "hNK_Bm3")]
+
+# Directional volcano colors: up in Bm3 = COL_BM3, up in Bm2 = COL_BM2
+volcano_colors <- function(df, padj_cut = 0.05, fc_cut = 0.5) {
+  col_vec <- rep("gray70", nrow(df))
+  col_vec[!is.na(df$padj) & df$padj < padj_cut & df$log_fc >  fc_cut] <- COL_BM3
+  col_vec[!is.na(df$padj) & df$padj < padj_cut & df$log_fc < -fc_cut] <- COL_BM2
+  names(col_vec) <- rownames(df)
+  col_vec
+}
+
+# Enrichment helpers
+run_enrichment <- function(gene_symbols,
+                           type = c("BP", "MF", "CC", "KEGG", "HALLMARK"),
+                           term2gene = NULL,
+                           label = "") {
+  type <- match.arg(type)
+  if (length(gene_symbols) == 0) {
+    message(label, ": no input genes - skipping"); return(invisible(NULL))
+  }
+  entrez_ids <- na.omit(map_gene_to_entrez(gene_symbols))
+  if (length(entrez_ids) == 0) {
+    message(label, ": no valid Entrez IDs - skipping"); return(invisible(NULL))
+  }
+  tryCatch(
+    {
+      if (type %in% c("BP", "MF", "CC")) {
+        enrichGO(gene = entrez_ids, ont = type, OrgDb = "org.Hs.eg.db",
+                 readable = TRUE, pAdjustMethod = "bonferroni",
+                 pvalueCutoff = 0.05)
+      } else if (type == "KEGG") {
+        enrichKEGG(gene = entrez_ids, organism = "hsa", keyType = "kegg",
+                   pAdjustMethod = "bonferroni", pvalueCutoff = 0.05)
+      } else if (type == "HALLMARK") {
+        enricher(gene = entrez_ids, TERM2GENE = term2gene,
+                 pAdjustMethod = "bonferroni", pvalueCutoff = 0.05)
+      }
+    },
+    error = function(e) {
+      message(label, " (", type, ") error: ", conditionMessage(e)); NULL
+    }
+  )
+}
+
+# Show enrichment dotplot inline; save PDF when out_path provided
+show_enrichment <- function(result, label = "", out_path = NULL,
+                            out_w = 5, out_h = 4.5) {
+  if (is.null(result) || nrow(result@result) == 0) {
+    print(paste0("0 enriched terms - ", label)); return(invisible(NULL))
+  }
+  signif_rows <- result@result[result@result$p.adjust < 0.05, ]
+  if (nrow(signif_rows) == 0) {
+    print(paste0("0 terms with bonferroni p.adjust < 0.05 - ", label))
+    return(invisible(NULL))
+  }
+  p <- dotplot(result, showCategory = 20) +
+    ggtitle(label) + pub_theme +
+    theme(axis.text.y = element_text(size = 7))
+  print(p)
+  if (!is.null(out_path)) {
+    pdf(out_path, height = out_h, width = out_w, useDingbats = FALSE)
+    print(p); dev.off()
+  }
+}
+
+run_treeplot <- function(result, label = "", n_cluster = 5, n_words = 1,
+                         show_cat = 15, out_path = NULL, out_w = 9, out_h = 4) {
+  if (is.null(result) || nrow(result@result) == 0) {
+    message("treeplot skipped (no enriched terms): ", label); return(invisible(NULL))
+  }
+  signif_rows <- result@result[result@result$p.adjust < 0.05, ]
+  if (nrow(signif_rows) < 2) {
+    message("treeplot skipped (< 2 significant terms): ", label); return(invisible(NULL))
+  }
+  p <- tryCatch(
+    {
+      enrichres2 <- pairwise_termsim(result)
+      treeplot(enrichres2, showCategory = show_cat, color = "p.adjust",
+               offset = 10, offset_tiplab = 0.5,
+               nCluster = min(n_cluster, nrow(signif_rows)),
+               nWords = n_words, split = "subcategory")
+    },
+    error = function(e) { message("treeplot error: ", conditionMessage(e)); NULL }
+  )
+  if (!is.null(p)) {
+    print(p)
+    if (!is.null(out_path)) {
+      pdf(out_path, height = out_h, width = out_w, useDingbats = FALSE)
+      print(p); dev.off()
+    }
+  }
+}
+
+# Top-DEG violin + boxplot + jitter
+# top_n genes per direction (up in Bm3, up in Bm2) ranked by |log_fc|.
+# Violins coloured by cluster; boxplot shows median/IQR; points are individual cells.
+plot_top_deg_violins <- function(seurat_obj, deg_df,
+                                 group_col = "predicted_NK_type_de.n350",
+                                 top_n = 12, out_path = NULL,
+                                 out_w = 9, out_h = 5) {
+  if (nrow(deg_df) == 0) {
+    message("no DEGs - skipping violin plot"); return(invisible(NULL))
+  }
+  top_genes <- deg_df %>%
+    mutate(abs_lfc   = abs(log_fc),
+           direction = ifelse(log_fc > 0, "up in hNK_Bm3", "up in hNK_Bm2")) %>%
+    group_by(direction) %>%
+    slice_max(abs_lfc, n = top_n) %>%
+    ungroup() %>%
+    arrange(desc(log_fc)) %>%
+    mutate(feature = factor(feature, levels = unique(feature)))
+
+  genes <- levels(top_genes$feature)
+  genes <- intersect(genes, rownames(seurat_obj))
+  if (length(genes) == 0) {
+    message("no genes found in object - skipping violin plot"); return(invisible(NULL))
+  }
+
+  expr <- as.data.frame(
+    t(as.matrix(GetAssayData(seurat_obj, slot = "data")[genes, , drop = FALSE]))
+  )
+  expr$cluster <- seurat_obj@meta.data[[group_col]]
+  expr_long <- expr %>%
+    pivot_longer(-cluster, names_to = "gene", values_to = "expr") %>%
+    mutate(gene = factor(gene, levels = genes)) %>%
+    left_join(top_genes %>% dplyr::select(feature, direction, log_fc),
+              by = c("gene" = "feature"))
+
+  p <- ggplot(expr_long, aes(x = cluster, y = expr,
+                              fill = cluster, color = cluster)) +
+    geom_violin(scale = "width", trim = TRUE, linewidth = 0.3, alpha = 0.6) +
+    geom_boxplot(width = 0.15, outlier.shape = NA, fill = "white",
+                 color = "black", linewidth = 0.35) +
+    geom_quasirandom(size = 0.25, alpha = 0.35, color = "black",
+                     groupOnX = TRUE, bandwidth = 0.5) +
+    facet_wrap(~ gene, nrow = 2, scales = "free_y") +
+    scale_fill_manual(values  = COL_CLUST, guide = "none") +
+    scale_color_manual(values = COL_CLUST, guide = "none") +
+    labs(x = NULL, y = "log-normalised expression",
+         subtitle = paste0("top ", top_n, " DEGs per direction (|log_fc| ranked)")) +
+    theme(
+      axis.text.x   = element_text(size = 7, angle = 30, hjust = 1),
+      axis.text.y   = element_text(size = 7),
+      strip.text    = element_text(size = 7, face = "italic"),
+      panel.spacing = unit(2, "mm")
+    )
+
+  print(p)
+  if (!is.null(out_path)) {
+    pdf(out_path, height = out_h, width = out_w, useDingbats = FALSE)
+    print(p); dev.off()
+  }
+}
+```
+
+# ___DEG: hNK_Bm2 vs. hNK_Bm3 per genetic group___
+
+*Replicates:* patient ID (`rados_et_al_2025`).
+*Comparison:* hNK_Bm2 (reference) vs. hNK_Bm3 - **positive log_fc = higher in hNK_Bm3**.
+*Cutoffs:* padj < 0.05 & |log_fc| > 0.5.
+*Volcano colors:* hNK_Bm3-high = `r COL_BM3`, hNK_Bm2-high = `r COL_BM2`.
+
+```{r}
+Idents(ALL_NK) <- ALL_NK@meta.data$predicted_NK_type_de.n350
+
+hNK_Bm2_Bm3 <- subset(ALL_NK, idents = c("hNK_Bm2", "hNK_Bm3"), invert = FALSE)
+hNK_Bm2_Bm3
+table(hNK_Bm2_Bm3$predicted_NK_type_de.n350, hNK_Bm2_Bm3$group)
+```
+
+## ___1. control___
+
+```{r}
+Idents(hNK_Bm2_Bm3) <- hNK_Bm2_Bm3$group
+hNK_Bm2_Bm3_ctrl <- subset(hNK_Bm2_Bm3, idents = "control")
+table(hNK_Bm2_Bm3_ctrl$predicted_NK_type_de.n350)
+```
+
+```{r}
+DEG_ctrl <- DElegate::findDE(hNK_Bm2_Bm3_ctrl,
+                             group_column = "predicted_NK_type_de.n350",
+                             order_results = TRUE, compare_is_ref = TRUE,
+                             replicate_column = "rados_et_al_2025", compare = "hNK_Bm2")
+
+DEG_ctrl_signif <- subset(DEG_ctrl, padj < 0.1)
+DEG_ctrl_up     <- subset(DEG_ctrl_signif, log_fc >  0.5 & padj < 0.05)
+DEG_ctrl_down   <- subset(DEG_ctrl_signif, log_fc < -0.5 & padj < 0.05)
+
+cat("Total (padj<0.1):", nrow(DEG_ctrl_signif),
+    "| up Bm3:", nrow(DEG_ctrl_up), "| up Bm2:", nrow(DEG_ctrl_down), "\n")
+DEG_ctrl_signif
+
+write.table(DEG_ctrl, sep = "\t", row.names = FALSE, quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNKBm2-vs-hNKBm3_control_2026-06-25.csv"))
+```
+
+### ___Volcano - control___
+
+```{r fig.height=5, fig.width=3.5}
+rownames(DEG_ctrl) <- DEG_ctrl$feature
+
+p_volcano_ctrl <- EnhancedVolcano(
+  DEG_ctrl, lab = rownames(DEG_ctrl), x = "log_fc", y = "padj",
+  title = "control", subtitle = "hNK_Bm2 (ref) vs. hNK_Bm3",
+  pCutoff = 0.05, FCcutoff = 0.5,
+  ylim = c(0, ceiling(-log10(min(DEG_ctrl$padj[DEG_ctrl$padj > 0], na.rm = TRUE))) + 0.5),
+  pointSize = 1.5, labSize = 3, colCustom = volcano_colors(DEG_ctrl), colAlpha = 0.7,
+  legendLabSize = 8, legendIconSize = 3, titleLabSize = 10, subtitleLabSize = 8,
+  axisLabSize = 9, boxedLabels = TRUE, drawConnectors = TRUE,
+  widthConnectors = 0.5, colConnectors = "black", legendPosition = "right"
+) + pub_theme
+
+p_volcano_ctrl
+
+pdf(paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_control_volcano.pdf"),
+    height = 5, width = 3.5, useDingbats = FALSE)
+p_volcano_ctrl; dev.off()
+```
+
+### ___Top DEG expression - control___
+
+```{r fig.height=5, fig.width=9}
+plot_top_deg_violins(hNK_Bm2_Bm3_ctrl, deg_df = bind_rows(DEG_ctrl_up, DEG_ctrl_down),
+  top_n = 12, out_path = paste0(params$out,
+    "figures/DEG_hNKBm2-vs-hNKBm3_control_topDEG_violins.pdf"))
+```
+
+### ___Pathway enrichment - control (up in hNK_Bm3)___
+
+```{r fig.height=4.5, fig.width=5}
+genes <- DEG_ctrl_up$feature
+show_enrichment(run_enrichment(genes, "BP",       label = "ctrl Bm3 up: GO-BP"), "ctrl Bm3 up: GO-BP")
+show_enrichment(run_enrichment(genes, "MF",       label = "ctrl Bm3 up: GO-MF"), "ctrl Bm3 up: GO-MF")
+show_enrichment(run_enrichment(genes, "CC",       label = "ctrl Bm3 up: GO-CC"), "ctrl Bm3 up: GO-CC")
+show_enrichment(run_enrichment(genes, "KEGG",     label = "ctrl Bm3 up: KEGG"),  "ctrl Bm3 up: KEGG")
+show_enrichment(run_enrichment(genes, "HALLMARK", label = "ctrl Bm3 up: HALLMARK",
+                               term2gene = hallmark_genes_H), "ctrl Bm3 up: HALLMARK")
+```
+
+### ___Pathway enrichment - control (up in hNK_Bm2)___
+
+```{r fig.height=4.5, fig.width=5}
+genes <- DEG_ctrl_down$feature
+show_enrichment(run_enrichment(genes, "BP",       label = "ctrl Bm2 up: GO-BP"), "ctrl Bm2 up: GO-BP")
+show_enrichment(run_enrichment(genes, "MF",       label = "ctrl Bm2 up: GO-MF"), "ctrl Bm2 up: GO-MF")
+show_enrichment(run_enrichment(genes, "CC",       label = "ctrl Bm2 up: GO-CC"), "ctrl Bm2 up: GO-CC")
+show_enrichment(run_enrichment(genes, "KEGG",     label = "ctrl Bm2 up: KEGG"),  "ctrl Bm2 up: KEGG")
+show_enrichment(run_enrichment(genes, "HALLMARK", label = "ctrl Bm2 up: HALLMARK",
+                               term2gene = hallmark_genes_H), "ctrl Bm2 up: HALLMARK")
+```
+
+
+## ___2. ATRXdel___
+
+```{r}
+Idents(hNK_Bm2_Bm3) <- hNK_Bm2_Bm3$group
+hNK_Bm2_Bm3_ATRXdel <- subset(hNK_Bm2_Bm3, idents = "ATRXdel")
+table(hNK_Bm2_Bm3_ATRXdel$predicted_NK_type_de.n350)
+```
+
+```{r}
+DEG_ATRXdel <- DElegate::findDE(hNK_Bm2_Bm3_ATRXdel,
+                                group_column = "predicted_NK_type_de.n350",
+                                order_results = TRUE, compare_is_ref = TRUE,
+                                replicate_column = "rados_et_al_2025", compare = "hNK_Bm2")
+
+DEG_ATRXdel_signif <- subset(DEG_ATRXdel, padj < 0.1)
+DEG_ATRXdel_up     <- subset(DEG_ATRXdel_signif, log_fc >  0.5 & padj < 0.05)
+DEG_ATRXdel_down   <- subset(DEG_ATRXdel_signif, log_fc < -0.5 & padj < 0.05)
+
+cat("Total (padj<0.1):", nrow(DEG_ATRXdel_signif),
+    "| up Bm3:", nrow(DEG_ATRXdel_up), "| up Bm2:", nrow(DEG_ATRXdel_down), "\n")
+DEG_ATRXdel_signif
+
+write.table(DEG_ATRXdel, sep = "\t", row.names = FALSE, quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNKBm2-vs-hNKBm3_ATRXdel_2026-06-25.csv"))
+```
+
+### ___Volcano - ATRXdel___
+
+```{r fig.height=5, fig.width=3.5}
+rownames(DEG_ATRXdel) <- DEG_ATRXdel$feature
+
+p_volcano_ATRXdel <- EnhancedVolcano(
+  DEG_ATRXdel, lab = rownames(DEG_ATRXdel), x = "log_fc", y = "padj",
+  title = "ATRXdel", subtitle = "hNK_Bm2 (ref) vs. hNK_Bm3",
+  pCutoff = 0.05, FCcutoff = 0.5,
+  ylim = c(0, ceiling(-log10(min(DEG_ATRXdel$padj[DEG_ATRXdel$padj > 0], na.rm = TRUE))) + 0.5),
+  pointSize = 1.5, labSize = 3, colCustom = volcano_colors(DEG_ATRXdel), colAlpha = 0.7,
+  legendLabSize = 8, legendIconSize = 3, titleLabSize = 10, subtitleLabSize = 8,
+  axisLabSize = 9, boxedLabels = TRUE, drawConnectors = TRUE,
+  widthConnectors = 0.5, colConnectors = "black", legendPosition = "right"
+) + pub_theme
+
+p_volcano_ATRXdel
+
+pdf(paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_ATRXdel_volcano.pdf"),
+    height = 5, width = 3.5, useDingbats = FALSE)
+p_volcano_ATRXdel; dev.off()
+```
+
+### ___Top DEG expression - ATRXdel___
+
+```{r fig.height=5, fig.width=9}
+plot_top_deg_violins(hNK_Bm2_Bm3_ATRXdel, deg_df = bind_rows(DEG_ATRXdel_up, DEG_ATRXdel_down),
+  top_n = 12, out_path = paste0(params$out,
+    "figures/DEG_hNKBm2-vs-hNKBm3_ATRXdel_topDEG_violins.pdf"))
+```
+
+### ___Pathway enrichment - ATRXdel (up in hNK_Bm3)___
+
+```{r fig.height=4.5, fig.width=5}
+genes <- DEG_ATRXdel_up$feature
+show_enrichment(run_enrichment(genes, "BP",       label = "ATRXdel Bm3 up: GO-BP"), "ATRXdel Bm3 up: GO-BP")
+show_enrichment(run_enrichment(genes, "MF",       label = "ATRXdel Bm3 up: GO-MF"), "ATRXdel Bm3 up: GO-MF")
+show_enrichment(run_enrichment(genes, "CC",       label = "ATRXdel Bm3 up: GO-CC"), "ATRXdel Bm3 up: GO-CC")
+show_enrichment(run_enrichment(genes, "KEGG",     label = "ATRXdel Bm3 up: KEGG"),  "ATRXdel Bm3 up: KEGG")
+show_enrichment(run_enrichment(genes, "HALLMARK", label = "ATRXdel Bm3 up: HALLMARK",
+                               term2gene = hallmark_genes_H), "ATRXdel Bm3 up: HALLMARK")
+```
+
+### ___Pathway enrichment - ATRXdel (up in hNK_Bm2)___
+
+```{r fig.height=4.5, fig.width=5}
+genes <- DEG_ATRXdel_down$feature
+show_enrichment(run_enrichment(genes, "BP",       label = "ATRXdel Bm2 up: GO-BP"), "ATRXdel Bm2 up: GO-BP")
+show_enrichment(run_enrichment(genes, "MF",       label = "ATRXdel Bm2 up: GO-MF"), "ATRXdel Bm2 up: GO-MF")
+show_enrichment(run_enrichment(genes, "CC",       label = "ATRXdel Bm2 up: GO-CC"), "ATRXdel Bm2 up: GO-CC")
+show_enrichment(run_enrichment(genes, "KEGG",     label = "ATRXdel Bm2 up: KEGG"),  "ATRXdel Bm2 up: KEGG")
+show_enrichment(run_enrichment(genes, "HALLMARK", label = "ATRXdel Bm2 up: HALLMARK",
+                               term2gene = hallmark_genes_H), "ATRXdel Bm2 up: HALLMARK")
+```
+
+
+## ___3. MYCNamp___
+
+```{r}
+Idents(hNK_Bm2_Bm3) <- hNK_Bm2_Bm3$group
+hNK_Bm2_Bm3_MYCNamp <- subset(hNK_Bm2_Bm3, idents = "MYCNamp")
+table(hNK_Bm2_Bm3_MYCNamp$predicted_NK_type_de.n350)
+```
+
+```{r}
+DEG_MYCNamp <- DElegate::findDE(hNK_Bm2_Bm3_MYCNamp,
+                                group_column = "predicted_NK_type_de.n350",
+                                order_results = TRUE, compare_is_ref = TRUE,
+                                replicate_column = "rados_et_al_2025", compare = "hNK_Bm2")
+
+DEG_MYCNamp_signif <- subset(DEG_MYCNamp, padj < 0.1)
+DEG_MYCNamp_up     <- subset(DEG_MYCNamp_signif, log_fc >  0.5 & padj < 0.05)
+DEG_MYCNamp_down   <- subset(DEG_MYCNamp_signif, log_fc < -0.5 & padj < 0.05)
+
+cat("Total (padj<0.1):", nrow(DEG_MYCNamp_signif),
+    "| up Bm3:", nrow(DEG_MYCNamp_up), "| up Bm2:", nrow(DEG_MYCNamp_down), "\n")
+DEG_MYCNamp_signif
+
+write.table(DEG_MYCNamp, sep = "\t", row.names = FALSE, quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNKBm2-vs-hNKBm3_MYCNamp_2026-06-25.csv"))
+```
+
+### ___Volcano - MYCNamp___
+
+```{r fig.height=5, fig.width=3.5}
+rownames(DEG_MYCNamp) <- DEG_MYCNamp$feature
+
+p_volcano_MYCNamp <- EnhancedVolcano(
+  DEG_MYCNamp, lab = rownames(DEG_MYCNamp), x = "log_fc", y = "padj",
+  title = "MYCNamp", subtitle = "hNK_Bm2 (ref) vs. hNK_Bm3",
+  pCutoff = 0.05, FCcutoff = 0.5,
+  ylim = c(0, ceiling(-log10(min(DEG_MYCNamp$padj[DEG_MYCNamp$padj > 0], na.rm = TRUE))) + 0.5),
+  pointSize = 1.5, labSize = 3, colCustom = volcano_colors(DEG_MYCNamp), colAlpha = 0.7,
+  legendLabSize = 8, legendIconSize = 3, titleLabSize = 10, subtitleLabSize = 8,
+  axisLabSize = 9, boxedLabels = TRUE, drawConnectors = TRUE,
+  widthConnectors = 0.5, colConnectors = "black", legendPosition = "right"
+) + pub_theme
+
+p_volcano_MYCNamp
+
+pdf(paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_MYCNamp_volcano.pdf"),
+    height = 5, width = 3.5, useDingbats = FALSE)
+p_volcano_MYCNamp; dev.off()
+```
+
+### ___Top DEG expression - MYCNamp___
+
+```{r fig.height=5, fig.width=9}
+plot_top_deg_violins(hNK_Bm2_Bm3_MYCNamp, deg_df = bind_rows(DEG_MYCNamp_up, DEG_MYCNamp_down),
+  top_n = 12, out_path = paste0(params$out,
+    "figures/DEG_hNKBm2-vs-hNKBm3_MYCNamp_topDEG_violins.pdf"))
+```
+
+### ___Pathway enrichment - MYCNamp (up in hNK_Bm3)___
+
+```{r fig.height=4.5, fig.width=5}
+genes <- DEG_MYCNamp_up$feature
+show_enrichment(run_enrichment(genes, "BP",       label = "MYCNamp Bm3 up: GO-BP"), "MYCNamp Bm3 up: GO-BP")
+show_enrichment(run_enrichment(genes, "MF",       label = "MYCNamp Bm3 up: GO-MF"), "MYCNamp Bm3 up: GO-MF")
+show_enrichment(run_enrichment(genes, "CC",       label = "MYCNamp Bm3 up: GO-CC"), "MYCNamp Bm3 up: GO-CC")
+show_enrichment(run_enrichment(genes, "KEGG",     label = "MYCNamp Bm3 up: KEGG"),  "MYCNamp Bm3 up: KEGG")
+show_enrichment(run_enrichment(genes, "HALLMARK", label = "MYCNamp Bm3 up: HALLMARK",
+                               term2gene = hallmark_genes_H), "MYCNamp Bm3 up: HALLMARK")
+```
+
+### ___Pathway enrichment - MYCNamp (up in hNK_Bm2)___
+
+```{r fig.height=4.5, fig.width=5}
+genes <- DEG_MYCNamp_down$feature
+show_enrichment(run_enrichment(genes, "BP",       label = "MYCNamp Bm2 up: GO-BP"), "MYCNamp Bm2 up: GO-BP")
+show_enrichment(run_enrichment(genes, "MF",       label = "MYCNamp Bm2 up: GO-MF"), "MYCNamp Bm2 up: GO-MF")
+show_enrichment(run_enrichment(genes, "CC",       label = "MYCNamp Bm2 up: GO-CC"), "MYCNamp Bm2 up: GO-CC")
+show_enrichment(run_enrichment(genes, "KEGG",     label = "MYCNamp Bm2 up: KEGG"),  "MYCNamp Bm2 up: KEGG")
+show_enrichment(run_enrichment(genes, "HALLMARK", label = "MYCNamp Bm2 up: HALLMARK",
+                               term2gene = hallmark_genes_H), "MYCNamp Bm2 up: HALLMARK")
+```
+
+
+## ___4. ATRXwtMYCNwt___
+
+```{r}
+Idents(hNK_Bm2_Bm3) <- hNK_Bm2_Bm3$group
+hNK_Bm2_Bm3_ATRXwtMYCNwt <- subset(hNK_Bm2_Bm3, idents = "ATRXwtMYCNwt")
+table(hNK_Bm2_Bm3_ATRXwtMYCNwt$predicted_NK_type_de.n350)
+```
+
+```{r}
+DEG_ATRXwtMYCNwt <- DElegate::findDE(hNK_Bm2_Bm3_ATRXwtMYCNwt,
+                                     group_column = "predicted_NK_type_de.n350",
+                                     order_results = TRUE, compare_is_ref = TRUE,
+                                     replicate_column = "rados_et_al_2025", compare = "hNK_Bm2")
+
+DEG_ATRXwtMYCNwt_signif <- subset(DEG_ATRXwtMYCNwt, padj < 0.1)
+DEG_ATRXwtMYCNwt_up     <- subset(DEG_ATRXwtMYCNwt_signif, log_fc >  0.5 & padj < 0.05)
+DEG_ATRXwtMYCNwt_down   <- subset(DEG_ATRXwtMYCNwt_signif, log_fc < -0.5 & padj < 0.05)
+
+cat("Total (padj<0.1):", nrow(DEG_ATRXwtMYCNwt_signif),
+    "| up Bm3:", nrow(DEG_ATRXwtMYCNwt_up), "| up Bm2:", nrow(DEG_ATRXwtMYCNwt_down), "\n")
+DEG_ATRXwtMYCNwt_signif
+
+write.table(DEG_ATRXwtMYCNwt, sep = "\t", row.names = FALSE, quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNKBm2-vs-hNKBm3_ATRXwtMYCNwt_2026-06-25.csv"))
+```
+
+### ___Volcano - ATRXwtMYCNwt___
+
+```{r fig.height=5, fig.width=3.5}
+rownames(DEG_ATRXwtMYCNwt) <- DEG_ATRXwtMYCNwt$feature
+
+p_volcano_ATRXwtMYCNwt <- EnhancedVolcano(
+  DEG_ATRXwtMYCNwt, lab = rownames(DEG_ATRXwtMYCNwt), x = "log_fc", y = "padj",
+  title = "ATRXwtMYCNwt", subtitle = "hNK_Bm2 (ref) vs. hNK_Bm3",
+  pCutoff = 0.05, FCcutoff = 0.5,
+  ylim = c(0, ceiling(-log10(min(DEG_ATRXwtMYCNwt$padj[DEG_ATRXwtMYCNwt$padj > 0], na.rm = TRUE))) + 0.5),
+  pointSize = 1.5, labSize = 3, colCustom = volcano_colors(DEG_ATRXwtMYCNwt), colAlpha = 0.7,
+  legendLabSize = 8, legendIconSize = 3, titleLabSize = 10, subtitleLabSize = 8,
+  axisLabSize = 9, boxedLabels = TRUE, drawConnectors = TRUE,
+  widthConnectors = 0.5, colConnectors = "black", legendPosition = "right"
+) + pub_theme
+
+p_volcano_ATRXwtMYCNwt
+
+pdf(paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_ATRXwtMYCNwt_volcano.pdf"),
+    height = 5, width = 3.5, useDingbats = FALSE)
+p_volcano_ATRXwtMYCNwt; dev.off()
+```
+
+### ___Top DEG expression - ATRXwtMYCNwt___
+
+```{r fig.height=5, fig.width=9}
+plot_top_deg_violins(hNK_Bm2_Bm3_ATRXwtMYCNwt,
+  deg_df = bind_rows(DEG_ATRXwtMYCNwt_up, DEG_ATRXwtMYCNwt_down),
+  top_n = 12, out_path = paste0(params$out,
+    "figures/DEG_hNKBm2-vs-hNKBm3_ATRXwtMYCNwt_topDEG_violins.pdf"))
+```
+
+### ___Pathway enrichment - ATRXwtMYCNwt (up in hNK_Bm3)___
+
+```{r fig.height=4.5, fig.width=5}
+genes <- DEG_ATRXwtMYCNwt_up$feature
+show_enrichment(run_enrichment(genes, "BP",       label = "ATRXwtMYCNwt Bm3 up: GO-BP"), "ATRXwtMYCNwt Bm3 up: GO-BP")
+show_enrichment(run_enrichment(genes, "MF",       label = "ATRXwtMYCNwt Bm3 up: GO-MF"), "ATRXwtMYCNwt Bm3 up: GO-MF")
+show_enrichment(run_enrichment(genes, "CC",       label = "ATRXwtMYCNwt Bm3 up: GO-CC"), "ATRXwtMYCNwt Bm3 up: GO-CC")
+show_enrichment(run_enrichment(genes, "KEGG",     label = "ATRXwtMYCNwt Bm3 up: KEGG"),  "ATRXwtMYCNwt Bm3 up: KEGG")
+show_enrichment(run_enrichment(genes, "HALLMARK", label = "ATRXwtMYCNwt Bm3 up: HALLMARK",
+                               term2gene = hallmark_genes_H), "ATRXwtMYCNwt Bm3 up: HALLMARK")
+```
+
+### ___Pathway enrichment - ATRXwtMYCNwt (up in hNK_Bm2)___
+
+```{r fig.height=4.5, fig.width=5}
+genes <- DEG_ATRXwtMYCNwt_down$feature
+show_enrichment(run_enrichment(genes, "BP",       label = "ATRXwtMYCNwt Bm2 up: GO-BP"), "ATRXwtMYCNwt Bm2 up: GO-BP")
+show_enrichment(run_enrichment(genes, "MF",       label = "ATRXwtMYCNwt Bm2 up: GO-MF"), "ATRXwtMYCNwt Bm2 up: GO-MF")
+show_enrichment(run_enrichment(genes, "CC",       label = "ATRXwtMYCNwt Bm2 up: GO-CC"), "ATRXwtMYCNwt Bm2 up: GO-CC")
+show_enrichment(run_enrichment(genes, "KEGG",     label = "ATRXwtMYCNwt Bm2 up: KEGG"),  "ATRXwtMYCNwt Bm2 up: KEGG")
+show_enrichment(run_enrichment(genes, "HALLMARK", label = "ATRXwtMYCNwt Bm2 up: HALLMARK",
+                               term2gene = hallmark_genes_H), "ATRXwtMYCNwt Bm2 up: HALLMARK")
+```
+
+
+## ___Combined 4-panel volcano (publication figure)___
+
+```{r fig.height=10, fig.width=7}
+p_volcano_4panel <- (p_volcano_ctrl | p_volcano_ATRXdel) /
+                    (p_volcano_MYCNamp | p_volcano_ATRXwtMYCNwt) +
+  plot_annotation(title = "hNK_Bm2 vs. hNK_Bm3 - DEG by genetic group",
+                  theme = theme(plot.title = element_text(size = 11, face = "bold")))
+
+p_volcano_4panel
+
+pdf(paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_allGroups_volcano_4panel.pdf"),
+    height = 10, width = 7, useDingbats = FALSE)
+p_volcano_4panel; dev.off()
+```
+
+
+# ___Summary: number of significant DEGs per group___
+
+```{r}
+summary_DEGs <- data.frame(
+  group = c("control", "ATRXdel", "MYCNamp", "ATRXwtMYCNwt"),
+  n_up_in_Bm3 = c(nrow(DEG_ctrl_up),   nrow(DEG_ATRXdel_up),
+                  nrow(DEG_MYCNamp_up), nrow(DEG_ATRXwtMYCNwt_up)),
+  n_up_in_Bm2 = c(nrow(DEG_ctrl_down),   nrow(DEG_ATRXdel_down),
+                  nrow(DEG_MYCNamp_down), nrow(DEG_ATRXwtMYCNwt_down))
+)
+summary_DEGs
+```
+
+```{r fig.height=3.5, fig.width=4.5}
+summary_DEGs_long <- summary_DEGs %>%
+  pivot_longer(cols = c(n_up_in_Bm3, n_up_in_Bm2),
+               names_to = "direction", values_to = "n_genes") %>%
+  mutate(group = factor(group, levels = c("control","ATRXdel","MYCNamp","ATRXwtMYCNwt")),
+         direction = factor(direction, levels = c("n_up_in_Bm3","n_up_in_Bm2"),
+                            labels = c("up in hNK_Bm3", "up in hNK_Bm2")))
+
+p_summary <- ggplot(summary_DEGs_long, aes(x = group, y = n_genes, fill = direction)) +
+  geom_col(position = "dodge", width = 0.7) +
+  scale_fill_manual(values = c("up in hNK_Bm3" = COL_BM3, "up in hNK_Bm2" = COL_BM2)) +
+  scale_x_discrete(labels = function(x) sub("ATRXwtMYCNwt", "ATRXwt\nMYCNwt", x)) +
+  labs(title = "Significant DEGs per genetic group", subtitle = "|log_fc| > 0.5, padj < 0.05",
+       x = NULL, y = "Number of genes", fill = NULL) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1, size = 8), legend.position = "top")
+
+p_summary
+
+pdf(paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_summary_barplot.pdf"),
+    height = 3.5, width = 4.5, useDingbats = FALSE)
+p_summary; dev.off()
+```
+
+
+# ___Overlap of DEGs across genetic groups___
+
+## ___Genes higher in hNK_Bm3___
+
+```{r fig.height=4.5, fig.width=4.5}
+up_Bm3_lists <- list(control = DEG_ctrl_up$feature, ATRXdel = DEG_ATRXdel_up$feature,
+                     MYCNamp = DEG_MYCNamp_up$feature, ATRXwtMYCNwt = DEG_ATRXwtMYCNwt_up$feature)
+
+p_venn_Bm3 <- ggVennDiagram(up_Bm3_lists, set_size = 3.5, label_alpha = 0, label_size = 3.5,
+  category.names = c("control","ATRXdel","MYCNamp","ATRXwtMYCNwt"),
+  edge_size = 0.5, label_percent_digit = 1, label_color = "white") +
+  scale_fill_gradient(low = "#D9C97A", high = COL_BM3, name = "n genes") +
+  labs(title = "up in hNK_Bm3 - overlap across groups") +
+  theme(plot.title = element_text(size = 10, face = "bold"),
+        legend.text = element_text(size = 8), legend.title = element_text(size = 9)) +
+  scale_x_continuous(expand = expansion(mult = .2))
+
+p_venn_Bm3
+
+pdf(paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_Venn_upInBm3.pdf"),
+    height = 4.5, width = 4.5, useDingbats = FALSE)
+p_venn_Bm3; dev.off()
+
+common_up_Bm3_all4 <- Reduce(intersect, up_Bm3_lists)
+cat("Genes higher in hNK_Bm3 in ALL 4 groups:\n"); print(common_up_Bm3_all4)
+common_up_Bm3_3of4 <- names(which(table(unlist(up_Bm3_lists)) >= 3))
+cat("\nGenes higher in hNK_Bm3 in >= 3 of 4 groups:\n"); print(common_up_Bm3_3of4)
+```
+
+## ___Genes higher in hNK_Bm2___
+
+```{r fig.height=4.5, fig.width=4.5}
+up_Bm2_lists <- list(control = DEG_ctrl_down$feature, ATRXdel = DEG_ATRXdel_down$feature,
+                     MYCNamp = DEG_MYCNamp_down$feature, ATRXwtMYCNwt = DEG_ATRXwtMYCNwt_down$feature)
+
+p_venn_Bm2 <- ggVennDiagram(up_Bm2_lists, set_size = 3.5, label_alpha = 0, label_size = 3.5,
+  category.names = c("control","ATRXdel","MYCNamp","ATRXwtMYCNwt"),
+  edge_size = 0.5, label_percent_digit = 1, label_color = "white") +
+  scale_fill_gradient(low = "#C8DDD9", high = COL_BM2, name = "n genes") +
+  labs(title = "up in hNK_Bm2 - overlap across groups") +
+  theme(plot.title = element_text(size = 10, face = "bold"),
+        legend.text = element_text(size = 8), legend.title = element_text(size = 9)) +
+  scale_x_continuous(expand = expansion(mult = .2))
+
+p_venn_Bm2
+
+pdf(paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_Venn_upInBm2.pdf"),
+    height = 4.5, width = 4.5, useDingbats = FALSE)
+p_venn_Bm2; dev.off()
+
+common_up_Bm2_all4 <- Reduce(intersect, up_Bm2_lists)
+cat("Genes higher in hNK_Bm2 in ALL 4 groups:\n"); print(common_up_Bm2_all4)
+common_up_Bm2_3of4 <- names(which(table(unlist(up_Bm2_lists)) >= 3))
+cat("\nGenes higher in hNK_Bm2 in >= 3 of 4 groups:\n"); print(common_up_Bm2_3of4)
+```
+
+## ___Enrichment on consistently different genes___
+
+### ___Consistently higher in hNK_Bm3 (>= 3 of 4 groups)___
+
+```{r fig.height=4.5, fig.width=5}
+genes <- common_up_Bm3_3of4; print(genes)
+show_enrichment(run_enrichment(genes, "BP", label = "consistent Bm3 up: GO-BP"),
+  "consistent Bm3 up: GO-BP",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_consistent_Bm3up_GO-BP_dotplot.pdf"))
+show_enrichment(run_enrichment(genes, "KEGG", label = "consistent Bm3 up: KEGG"),
+  "consistent Bm3 up: KEGG",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_consistent_Bm3up_KEGG_dotplot.pdf"))
+show_enrichment(run_enrichment(genes, "HALLMARK", label = "consistent Bm3 up: HALLMARK",
+                               term2gene = hallmark_genes_H),
+  "consistent Bm3 up: HALLMARK",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_consistent_Bm3up_HALLMARK_dotplot.pdf"))
+```
+
+### ___Consistently higher in hNK_Bm2 (>= 3 of 4 groups)___
+
+```{r fig.height=4.5, fig.width=5}
+genes <- common_up_Bm2_3of4; print(genes)
+show_enrichment(run_enrichment(genes, "BP", label = "consistent Bm2 up: GO-BP"),
+  "consistent Bm2 up: GO-BP",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_consistent_Bm2up_GO-BP_dotplot.pdf"))
+show_enrichment(run_enrichment(genes, "KEGG", label = "consistent Bm2 up: KEGG"),
+  "consistent Bm2 up: KEGG",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_consistent_Bm2up_KEGG_dotplot.pdf"))
+show_enrichment(run_enrichment(genes, "HALLMARK", label = "consistent Bm2 up: HALLMARK",
+                               term2gene = hallmark_genes_H),
+  "consistent Bm2 up: HALLMARK",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_consistent_Bm2up_HALLMARK_dotplot.pdf"))
+```
+
+
+# ___Pairwise group logFC correlations___
+
+```{r fig.height=3, fig.width=9}
+all_DEG_merged <- DEG_ctrl %>%
+  dplyr::select(feature, log_fc, padj) %>% dplyr::rename(log_fc_ctrl = log_fc, padj_ctrl = padj) %>%
+  full_join(DEG_ATRXdel %>% dplyr::select(feature, log_fc, padj) %>%
+              dplyr::rename(log_fc_ATRXdel = log_fc, padj_ATRXdel = padj), by = "feature") %>%
+  full_join(DEG_MYCNamp %>% dplyr::select(feature, log_fc, padj) %>%
+              dplyr::rename(log_fc_MYCNamp = log_fc, padj_MYCNamp = padj), by = "feature") %>%
+  full_join(DEG_ATRXwtMYCNwt %>% dplyr::select(feature, log_fc, padj) %>%
+              dplyr::rename(log_fc_ATRXwtMYCNwt = log_fc, padj_ATRXwtMYCNwt = padj), by = "feature")
+
+sc_opts <- list(geom_point(size = 0.5, alpha = 0.3, color = "gray50"),
+                geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.6, fill = "gray80"),
+                geom_hline(yintercept = 0, linetype = "dashed", color = "gray60", linewidth = 0.3),
+                geom_vline(xintercept = 0, linetype = "dashed", color = "gray60", linewidth = 0.3))
+
+p_sc1 <- ggplot(all_DEG_merged, aes(x = log_fc_ctrl, y = log_fc_ATRXdel)) + sc_opts +
+  labs(title = "control vs. ATRXdel", x = "log_fc (control)", y = "log_fc (ATRXdel)")
+p_sc2 <- ggplot(all_DEG_merged, aes(x = log_fc_ctrl, y = log_fc_MYCNamp)) + sc_opts +
+  labs(title = "control vs. MYCNamp", x = "log_fc (control)", y = "log_fc (MYCNamp)")
+p_sc3 <- ggplot(all_DEG_merged, aes(x = log_fc_ctrl, y = log_fc_ATRXwtMYCNwt)) + sc_opts +
+  labs(title = "control vs. ATRXwtMYCNwt", x = "log_fc (control)", y = "log_fc (ATRXwtMYCNwt)")
+
+p_sc1 + p_sc2 + p_sc3
+
+pdf(paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_logFC_correlation_across_groups.pdf"),
+    height = 3, width = 9, useDingbats = FALSE)
+p_sc1 + p_sc2 + p_sc3; dev.off()
+```
+
+```{r}
+cat("Spearman r of log_fc between groups:\n")
+cat("ctrl vs ATRXdel:       r =", round(cor(all_DEG_merged$log_fc_ctrl, all_DEG_merged$log_fc_ATRXdel, use="complete.obs", method="spearman"), 3), "\n")
+cat("ctrl vs MYCNamp:       r =", round(cor(all_DEG_merged$log_fc_ctrl, all_DEG_merged$log_fc_MYCNamp, use="complete.obs", method="spearman"), 3), "\n")
+cat("ctrl vs ATRXwtMYCNwt:  r =", round(cor(all_DEG_merged$log_fc_ctrl, all_DEG_merged$log_fc_ATRXwtMYCNwt, use="complete.obs", method="spearman"), 3), "\n")
+cat("ATRXdel vs MYCNamp:    r =", round(cor(all_DEG_merged$log_fc_ATRXdel, all_DEG_merged$log_fc_MYCNamp, use="complete.obs", method="spearman"), 3), "\n")
+cat("ATRXdel vs ATRXwtMYCNwt: r =", round(cor(all_DEG_merged$log_fc_ATRXdel, all_DEG_merged$log_fc_ATRXwtMYCNwt, use="complete.obs", method="spearman"), 3), "\n")
+cat("MYCNamp vs ATRXwtMYCNwt: r =", round(cor(all_DEG_merged$log_fc_MYCNamp, all_DEG_merged$log_fc_ATRXwtMYCNwt, use="complete.obs", method="spearman"), 3), "\n")
+```
+
+
+# ___DEG: hNK_Bm2 vs. hNK_Bm3 - all groups pooled, paired by patient___
+
+All 16 patients pooled. The pseudobulk DESeq2 model includes patient as a blocking factor
+(replicate_column creates design ~ patient + cluster), so the Bm2-Bm3 comparison is made
+within each patient before averaging across patients.
+
+```{r}
+table(hNK_Bm2_Bm3$predicted_NK_type_de.n350, hNK_Bm2_Bm3$rados_et_al_2025)
+```
+
+```{r}
+DEG_paired_all <- DElegate::findDE(hNK_Bm2_Bm3,
+                                   group_column = "predicted_NK_type_de.n350",
+                                   order_results = TRUE, compare_is_ref = TRUE,
+                                   replicate_column = "rados_et_al_2025", compare = "hNK_Bm2")
+
+DEG_paired_all_signif <- subset(DEG_paired_all, padj < 0.1)
+DEG_paired_all_up     <- subset(DEG_paired_all_signif, log_fc >  0.5 & padj < 0.05)
+DEG_paired_all_down   <- subset(DEG_paired_all_signif, log_fc < -0.5 & padj < 0.05)
+
+cat("Total (padj<0.1):", nrow(DEG_paired_all_signif),
+    "| up Bm3 (|logFC|>0.5, p<0.05):", nrow(DEG_paired_all_up),
+    "| up Bm2:", nrow(DEG_paired_all_down), "\n")
+DEG_paired_all_signif
+
+write.table(DEG_paired_all, sep = "\t", row.names = FALSE, quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNKBm2-vs-hNKBm3_allGroups_paired_2026-06-25.csv"))
+```
+
+## ___Volcano - all groups, paired___
+
+```{r fig.height=5, fig.width=3.5}
+rownames(DEG_paired_all) <- DEG_paired_all$feature
+
+p_volcano_paired <- EnhancedVolcano(
+  DEG_paired_all, lab = rownames(DEG_paired_all), x = "log_fc", y = "padj",
+  title = "all groups - paired by patient", subtitle = "hNK_Bm2 (ref) vs. hNK_Bm3",
+  pCutoff = 0.05, FCcutoff = 0.5,
+  ylim = c(0, ceiling(-log10(min(DEG_paired_all$padj[DEG_paired_all$padj > 0], na.rm = TRUE))) + 0.5),
+  pointSize = 1.5, labSize = 3, colCustom = volcano_colors(DEG_paired_all), colAlpha = 0.7,
+  legendLabSize = 8, legendIconSize = 3, titleLabSize = 10, subtitleLabSize = 8,
+  axisLabSize = 9, boxedLabels = TRUE, drawConnectors = TRUE,
+  widthConnectors = 0.5, colConnectors = "black", legendPosition = "right"
+) + pub_theme
+
+p_volcano_paired
+
+pdf(paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_allGroups_paired_volcano.pdf"),
+    height = 5, width = 3.5, useDingbats = FALSE)
+p_volcano_paired; dev.off()
+```
+
+## ___Top DEG expression - all groups, paired___
+
+Violin body = distribution; boxplot = median/IQR; points = individual cells (quasi-random jitter).
+
+```{r fig.height=5, fig.width=9}
+plot_top_deg_violins(hNK_Bm2_Bm3, deg_df = bind_rows(DEG_paired_all_up, DEG_paired_all_down),
+  top_n = 12, out_path = paste0(params$out,
+    "figures/DEG_hNKBm2-vs-hNKBm3_allGroups_paired_topDEG_violins.pdf"))
+```
+
+## ___Pathway enrichment - all groups, paired (up in hNK_Bm3)___
+
+```{r fig.height=4.5, fig.width=5}
+genes <- DEG_paired_all_up$feature
+
+go_BP_p    <- run_enrichment(genes, "BP",       label = "paired Bm3 up: GO-BP")
+go_MF_p    <- run_enrichment(genes, "MF",       label = "paired Bm3 up: GO-MF")
+go_CC_p    <- run_enrichment(genes, "CC",       label = "paired Bm3 up: GO-CC")
+kegg_p     <- run_enrichment(genes, "KEGG",     label = "paired Bm3 up: KEGG")
+hallmark_p <- run_enrichment(genes, "HALLMARK", label = "paired Bm3 up: HALLMARK",
+                             term2gene = hallmark_genes_H)
+
+show_enrichment(go_BP_p,    "paired Bm3 up: GO-BP",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_allGroups_paired_Bm3up_GO-BP_dotplot.pdf"))
+show_enrichment(go_MF_p,    "paired Bm3 up: GO-MF",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_allGroups_paired_Bm3up_GO-MF_dotplot.pdf"))
+show_enrichment(go_CC_p,    "paired Bm3 up: GO-CC",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_allGroups_paired_Bm3up_GO-CC_dotplot.pdf"))
+show_enrichment(kegg_p,     "paired Bm3 up: KEGG",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_allGroups_paired_Bm3up_KEGG_dotplot.pdf"))
+show_enrichment(hallmark_p, "paired Bm3 up: HALLMARK",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_allGroups_paired_Bm3up_HALLMARK_dotplot.pdf"))
+```
+
+```{r}
+run_treeplot(kegg_p,  label = "paired Bm3 up: KEGG",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_allGroups_paired_Bm3up_KEGG_treeplot.pdf"))
+run_treeplot(go_BP_p, label = "paired Bm3 up: GO-BP",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_allGroups_paired_Bm3up_GO-BP_treeplot.pdf"))
+```
+
+## ___Pathway enrichment - all groups, paired (up in hNK_Bm2)___
+
+```{r fig.height=4.5, fig.width=5}
+genes <- DEG_paired_all_down$feature
+
+go_BP_p2    <- run_enrichment(genes, "BP",       label = "paired Bm2 up: GO-BP")
+go_MF_p2    <- run_enrichment(genes, "MF",       label = "paired Bm2 up: GO-MF")
+go_CC_p2    <- run_enrichment(genes, "CC",       label = "paired Bm2 up: GO-CC")
+kegg_p2     <- run_enrichment(genes, "KEGG",     label = "paired Bm2 up: KEGG")
+hallmark_p2 <- run_enrichment(genes, "HALLMARK", label = "paired Bm2 up: HALLMARK",
+                              term2gene = hallmark_genes_H)
+
+show_enrichment(go_BP_p2,    "paired Bm2 up: GO-BP",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_allGroups_paired_Bm2up_GO-BP_dotplot.pdf"))
+show_enrichment(go_MF_p2,    "paired Bm2 up: GO-MF",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_allGroups_paired_Bm2up_GO-MF_dotplot.pdf"))
+show_enrichment(go_CC_p2,    "paired Bm2 up: GO-CC",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_allGroups_paired_Bm2up_GO-CC_dotplot.pdf"))
+show_enrichment(kegg_p2,     "paired Bm2 up: KEGG",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_allGroups_paired_Bm2up_KEGG_dotplot.pdf"))
+show_enrichment(hallmark_p2, "paired Bm2 up: HALLMARK",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_allGroups_paired_Bm2up_HALLMARK_dotplot.pdf"))
+```
+
+```{r}
+run_treeplot(kegg_p2,  label = "paired Bm2 up: KEGG",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_allGroups_paired_Bm2up_KEGG_treeplot.pdf"))
+run_treeplot(go_BP_p2, label = "paired Bm2 up: GO-BP",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_allGroups_paired_Bm2up_GO-BP_treeplot.pdf"))
+```
+
+## ___Overlap: paired all-groups vs. per-group___
+
+```{r fig.height=4.5, fig.width=4.5}
+paired_up_Bm3_list <- list(paired_all = DEG_paired_all_up$feature,
+  control = DEG_ctrl_up$feature, ATRXdel = DEG_ATRXdel_up$feature,
+  MYCNamp = DEG_MYCNamp_up$feature)
+
+p_venn_paired_Bm3 <- ggVennDiagram(paired_up_Bm3_list, set_size = 3.5, label_alpha = 0,
+  label_size = 3.5, category.names = c("paired_all","control","ATRXdel","MYCNamp"),
+  edge_size = 0.5, label_percent_digit = 1, label_color = "white") +
+  scale_fill_gradient(low = "#D9C97A", high = COL_BM3, name = "n genes") +
+  labs(title = "up in hNK_Bm3: paired vs. per-group") +
+  theme(plot.title = element_text(size = 10, face = "bold"),
+        legend.text = element_text(size = 8), legend.title = element_text(size = 9)) +
+  scale_x_continuous(expand = expansion(mult = .2))
+
+p_venn_paired_Bm3
+
+pdf(paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_Venn_paired-vs-perGroup_upInBm3.pdf"),
+    height = 4.5, width = 4.5, useDingbats = FALSE)
+p_venn_paired_Bm3; dev.off()
+
+only_in_paired_up <- setdiff(DEG_paired_all_up$feature,
+  unique(c(DEG_ctrl_up$feature, DEG_ATRXdel_up$feature,
+           DEG_MYCNamp_up$feature, DEG_ATRXwtMYCNwt_up$feature)))
+cat("Genes up Bm3 only in paired (power gain):", length(only_in_paired_up), "\n")
+print(only_in_paired_up)
+```
+
+```{r fig.height=4.5, fig.width=4.5}
+paired_up_Bm2_list <- list(paired_all = DEG_paired_all_down$feature,
+  control = DEG_ctrl_down$feature, ATRXdel = DEG_ATRXdel_down$feature,
+  MYCNamp = DEG_MYCNamp_down$feature)
+
+p_venn_paired_Bm2 <- ggVennDiagram(paired_up_Bm2_list, set_size = 3.5, label_alpha = 0,
+  label_size = 3.5, category.names = c("paired_all","control","ATRXdel","MYCNamp"),
+  edge_size = 0.5, label_percent_digit = 1, label_color = "white") +
+  scale_fill_gradient(low = "#C8DDD9", high = COL_BM2, name = "n genes") +
+  labs(title = "up in hNK_Bm2: paired vs. per-group") +
+  theme(plot.title = element_text(size = 10, face = "bold"),
+        legend.text = element_text(size = 8), legend.title = element_text(size = 9)) +
+  scale_x_continuous(expand = expansion(mult = .2))
+
+p_venn_paired_Bm2
+
+pdf(paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_Venn_paired-vs-perGroup_upInBm2.pdf"),
+    height = 4.5, width = 4.5, useDingbats = FALSE)
+p_venn_paired_Bm2; dev.off()
+
+only_in_paired_down <- setdiff(DEG_paired_all_down$feature,
+  unique(c(DEG_ctrl_down$feature, DEG_ATRXdel_down$feature,
+           DEG_MYCNamp_down$feature, DEG_ATRXwtMYCNwt_down$feature)))
+cat("Genes up Bm2 only in paired (power gain):", length(only_in_paired_down), "\n")
+print(only_in_paired_down)
+```
+
+
+# ___Single-cell heatmap + PCA: pooled DEGs___
+
+Significant genes from the pooled paired analysis (|log_fc| > 0.5, padj < 0.05),
+sorted by log_fc descending (hNK_Bm3-high at top, hNK_Bm2-high at bottom).
+
+## ___Prepare gene list___
+
+```{r}
+DEG_heatmap_genes <- bind_rows(DEG_paired_all_up, DEG_paired_all_down) %>%
+  arrange(desc(log_fc))
+cat("Total significant DEGs:", nrow(DEG_heatmap_genes), "\n")
+
+if (nrow(DEG_heatmap_genes) > 80) {
+  DEG_heatmap_genes <- DEG_heatmap_genes %>%
+    mutate(abs_logfc = abs(log_fc)) %>% slice_max(abs_logfc, n = 80) %>%
+    arrange(desc(log_fc)) %>% dplyr::select(-abs_logfc)
+  message("Capping to top 80 genes by |log_fc| for heatmap readability")
+}
+
+genes_for_heatmap <- intersect(DEG_heatmap_genes$feature, rownames(hNK_Bm2_Bm3))
+cat("Genes present in object:", length(genes_for_heatmap), "\n")
+```
+
+## ___Single-cell heatmap___
+
+```{r fig.height=12, fig.width=8}
+Idents(hNK_Bm2_Bm3) <- hNK_Bm2_Bm3$predicted_NK_type_de.n350
+hNK_Bm2_Bm3 <- ScaleData(hNK_Bm2_Bm3, features = genes_for_heatmap, verbose = FALSE)
+
+p_heatmap <- DoHeatmap(
+  hNK_Bm2_Bm3, features = genes_for_heatmap,
+  group.by = "predicted_NK_type_de.n350", group.colors = unname(COL_CLUST),
+  label = TRUE, size = 3.5, draw.lines = TRUE
+) +
+  scale_fill_gradientn(colors = rev(RColorBrewer::brewer.pal(11, "RdBu")),
+                       na.value = "white", name = "scaled\nexpr.") +
+  labs(title    = "hNK_Bm2 vs. hNK_Bm3 - pooled paired analysis DEGs",
+       subtitle = "sorted by log_fc  up-Bm3-high top  |  down-Bm2-high bottom") +
+  theme(plot.title = element_text(size = 10, face = "bold"), plot.subtitle = element_text(size = 8),
+        axis.text.y = element_text(size = 7), legend.text = element_text(size = 8),
+        legend.title = element_text(size = 9))
+
+p_heatmap
+
+pdf(paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_allGroups_paired_singleCell_heatmap.pdf"),
+    height = 12, width = 8, useDingbats = FALSE)
+p_heatmap; dev.off()
+```
+
+## ___PCA: cell separation driven by DEGs___
+
+```{r}
+all_deg_genes <- intersect(union(DEG_paired_all_up$feature, DEG_paired_all_down$feature),
+                           rownames(hNK_Bm2_Bm3))
+
+expr_mat  <- as.matrix(GetAssayData(hNK_Bm2_Bm3, slot = "data")[all_deg_genes, ])
+gene_vars <- apply(expr_mat, 1, var)
+expr_mat  <- expr_mat[gene_vars > 0, ]
+cat("Genes used for PCA (non-zero variance):", nrow(expr_mat), "\n")
+
+pca_res       <- prcomp(t(expr_mat), scale. = TRUE, center = TRUE)
+var_explained <- summary(pca_res)$importance[2, ] * 100
+
+pca_df <- data.frame(PC1 = pca_res$x[, 1], PC2 = pca_res$x[, 2],
+                     cluster = hNK_Bm2_Bm3$predicted_NK_type_de.n350,
+                     patient = hNK_Bm2_Bm3$rados_et_al_2025)
+cat("Variance: PC1 =", round(var_explained[1], 1), "%, PC2 =",
+    round(var_explained[2], 1), "%\n")
+```
+
+```{r fig.height=3.5, fig.width=3.5}
+p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(alpha = 0.35, size = 0.8) +
+  stat_ellipse(type = "norm", linetype = 2, linewidth = 0.7) +
+  scale_color_manual(values = COL_CLUST) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1))) +
+  labs(title    = "PCA: hNK_Bm2 vs. hNK_Bm3",
+       subtitle = "features = significant DEGs (pooled analysis)",
+       x = paste0("PC1 (", round(var_explained[1], 1), "% variance)"),
+       y = paste0("PC2 (", round(var_explained[2], 1), "% variance)"),
+       color = NULL) +
+  theme(legend.position = "top")
+
+p_pca
+```
+
+## ___Top genes driving PC1___
+
+```{r fig.height=5, fig.width=3.5}
+n_top <- 30
+
+loadings_pc1 <- data.frame(gene = rownames(pca_res$rotation),
+                            loading = pca_res$rotation[, 1]) %>%
+  left_join(DEG_paired_all %>% dplyr::select(feature, log_fc), by = c("gene" = "feature")) %>%
+  mutate(abs_loading = abs(loading)) %>%
+  slice_max(abs_loading, n = n_top) %>%
+  arrange(loading) %>%
+  mutate(gene = factor(gene, levels = gene),
+         higher_in = case_when(log_fc > 0 ~ "hNK_Bm3", log_fc < 0 ~ "hNK_Bm2", TRUE ~ "n.s."))
+
+p_loadings <- ggplot(loadings_pc1, aes(x = gene, y = loading, fill = higher_in)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  coord_flip() +
+  scale_fill_manual(values = c("hNK_Bm3" = COL_BM3, "hNK_Bm2" = COL_BM2, "n.s." = "gray70"),
+                    na.value = "gray70") +
+  labs(title    = paste0("Top ", n_top, " genes: PC1 loadings"),
+       subtitle = "fill = cluster with higher expression",
+       x = NULL, y = "PC1 loading", fill = NULL) +
+  theme(legend.position = "top", axis.text.y = element_text(size = 7))
+
+p_loadings
+
+pdf(paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_allGroups_paired_PCA.pdf"),
+    height = 5, width = 7, useDingbats = FALSE)
+p_pca + p_loadings + plot_layout(widths = c(1, 1.2)); dev.off()
+
+p_pca + p_loadings + plot_layout(widths = c(1, 1.2))
+```
+
+## ___Scree plot___
+
+```{r fig.height=3, fig.width=4}
+scree_df <- data.frame(PC = seq_along(var_explained), var = var_explained,
+                       cum = cumsum(var_explained))
+
+p_scree <- ggplot(scree_df[1:min(20, nrow(scree_df)), ], aes(x = PC, y = var)) +
+  geom_col(fill = COL_BM2, color = NA, width = 0.7) +
+  geom_line(aes(y = cum), color = "black", linewidth = 0.5) +
+  geom_point(aes(y = cum), color = "black", size = 1.5) +
+  scale_x_continuous(breaks = seq(2, 20, 2)) +
+  labs(title = "Scree plot (top 20 PCs)",
+       subtitle = "bars = % variance per PC; line = cumulative",
+       x = "Principal component", y = "% variance explained")
+
+p_scree
+
+pdf(paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_allGroups_paired_PCA_scree.pdf"),
+    height = 3, width = 4, useDingbats = FALSE)
+p_scree; dev.off()
+```
+
+
+# ___Expression of CD160 and CD52 in hNK_Bm2 and hNK_Bm3___
+
+CD160 and CD52 expression across hNK_Bm2 and hNK_Bm3 cells, split by genetic group.
+
+```{r fig.height=4, fig.width=8}
+GENES_OF_INTEREST <- c("CD160", "CD52")
+
+# Violin plots per cluster, split by genetic group
+p_vln_cd <- VlnPlot(
+  hNK_Bm2_Bm3,
+  features    = GENES_OF_INTEREST,
+  group.by    = "predicted_NK_type_de.n350",
+  split.by    = "group",
+  split.plot  = TRUE,
+  cols        = unname(COLOR_CODE_GROUP[c("control", "ATRXdel", "MYCNamp", "ATRXwtMYCNwt")]),
+  pt.size     = 0,
+  ncol        = 2
+) & pub_theme &
+  theme(axis.title.x = element_blank(), legend.position = "right")
+
+p_vln_cd
+
+pdf(paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_CD160-CD52_violin.pdf"),
+    height = 4, width = 8, useDingbats = FALSE)
+p_vln_cd; dev.off()
+```
+
+```{r fig.height=4, fig.width=7}
+# Dot plot: cluster × genetic group for CD160 and CD52
+hNK_Bm2_Bm3$clust_group <- paste0(hNK_Bm2_Bm3$predicted_NK_type_de.n350, " | ",
+                                    hNK_Bm2_Bm3$group)
+Idents(hNK_Bm2_Bm3) <- factor(
+  hNK_Bm2_Bm3$clust_group,
+  levels = as.vector(outer(c("hNK_Bm2", "hNK_Bm3"),
+                           c("control", "ATRXdel", "MYCNamp", "ATRXwtMYCNwt"),
+                           paste, sep = " | "))
+)
+
+p_dot_cd <- DotPlot(
+  hNK_Bm2_Bm3,
+  features = GENES_OF_INTEREST,
+  cols     = c("lightgrey", "#B2182B")
+) +
+  coord_flip() +
+  labs(title = "CD160 & CD52 expression", x = NULL, y = NULL) +
+  pub_theme +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1, size = 7))
+
+p_dot_cd
+
+pdf(paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_CD160-CD52_dotplot.pdf"),
+    height = 4, width = 7, useDingbats = FALSE)
+p_dot_cd; dev.off()
+```
+
+```{r fig.height=3.5, fig.width=6}
+# Box plot of per-cell normalized expression, Bm2 vs Bm3 per genetic group
+Idents(hNK_Bm2_Bm3) <- hNK_Bm2_Bm3$predicted_NK_type_de.n350
+
+expr_df <- bind_rows(lapply(GENES_OF_INTEREST, function(gene) {
+  vals <- FetchData(hNK_Bm2_Bm3, vars = c(gene, "predicted_NK_type_de.n350", "group"))
+  colnames(vals)[1] <- "expression"
+  vals$gene <- gene
+  vals
+})) %>%
+  mutate(
+    cluster = factor(predicted_NK_type_de.n350, levels = c("hNK_Bm2", "hNK_Bm3")),
+    group   = factor(group, levels = c("control", "ATRXdel", "MYCNamp", "ATRXwtMYCNwt"))
+  )
+
+p_box_cd <- ggplot(expr_df, aes(x = cluster, y = expression, fill = cluster)) +
+  geom_violin(scale = "width", linewidth = 0.3, alpha = 0.85) +
+  geom_boxplot(width = 0.12, fill = "white", outlier.size = 0.3, linewidth = 0.3) +
+  facet_grid(gene ~ group, scales = "free_y") +
+  scale_fill_manual(values = c("hNK_Bm2" = unname(COL_BM2),
+                               "hNK_Bm3" = unname(COL_BM3))) +
+  labs(
+    title    = "CD160 & CD52 expression — hNK_Bm2 vs hNK_Bm3",
+    subtitle = "per genetic group",
+    x = NULL, y = "normalized expression"
+  ) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1), legend.position = "none")
+
+p_box_cd
+
+pdf(paste0(params$out, "figures/DEG_hNKBm2-vs-hNKBm3_CD160-CD52_boxplot.pdf"),
+    height = 3.5, width = 6, useDingbats = FALSE)
+p_box_cd; dev.off()
+```
+
+```{r}
+# Wilcoxon test: Bm2 vs Bm3 per gene per genetic group
+Idents(hNK_Bm2_Bm3) <- hNK_Bm2_Bm3$predicted_NK_type_de.n350
+
+stat_cd <- bind_rows(lapply(GENES_OF_INTEREST, function(gene) {
+  bind_rows(lapply(c("control", "ATRXdel", "MYCNamp", "ATRXwtMYCNwt"), function(grp) {
+    sub_obj <- subset(hNK_Bm2_Bm3, subset = group == grp)
+    bm2_vals <- FetchData(subset(sub_obj, idents = "hNK_Bm2"), vars = gene)[[1]]
+    bm3_vals <- FetchData(subset(sub_obj, idents = "hNK_Bm3"), vars = gene)[[1]]
+    if (length(bm2_vals) < 3 || length(bm3_vals) < 3) return(NULL)
+    wt <- wilcox.test(bm3_vals, bm2_vals)
+    data.frame(
+      gene       = gene,
+      group      = grp,
+      n_Bm2      = length(bm2_vals),
+      n_Bm3      = length(bm3_vals),
+      median_Bm2 = median(bm2_vals),
+      median_Bm3 = median(bm3_vals),
+      log2FC     = log2((mean(bm3_vals) + 0.01) / (mean(bm2_vals) + 0.01)),
+      p_value    = wt$p.value,
+      stringsAsFactors = FALSE
+    )
+  }))
+}))
+
+stat_cd$p_adj <- p.adjust(stat_cd$p_value, method = "BH")
+stat_cd$sig   <- stat_cd$p_adj < 0.05
+stat_cd <- stat_cd %>%
+  mutate(across(c(p_value, p_adj, log2FC, median_Bm2, median_Bm3), ~signif(.x, 3)))
+
+cat("CD160 & CD52: Bm3 vs Bm2 Wilcoxon tests (BH-adjusted):\n")
+print(stat_cd)
+
+write.csv(stat_cd,
+          paste0(params$out, "tables/CD160-CD52_Bm2-vs-Bm3_wilcoxon_2026-06-25.csv"),
+          row.names = FALSE)
+```
+
+# ___The End___
+
+```{r}
+sessionInfo()
+```
+
+```{r render, eval=FALSE, include=FALSE}
+rmarkdown::render(
+  input         = "/home/rstudio/NK-NB_study/code/36_20260625_DEG_hNKBm2_vs_hNKBm3_analysis.Rmd",
+  output_format = "html_document",
+  output_file   = "36_20260625_DEG_hNKBm2_vs_hNKBm3_analysis.html",
+  output_dir    = "/home/rstudio/mnt_out/NK_project/"
+)
+```

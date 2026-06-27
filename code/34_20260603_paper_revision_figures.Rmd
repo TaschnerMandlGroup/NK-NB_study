@@ -1,0 +1,1215 @@
+---
+title: "NK project: Paper revision figures, part II"
+subtitle: "Bulk RNA/ATAC/ChIP-seq"
+author: "Dr. Sara Wernig-Zorc"
+date: "2026-06-03"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  out: "/home/rstudio/mnt_out/"
+  anno: "/home/rstudio/mnt_resources/"
+  markers: "/home/rstudio/mnt_resources/MES_ADRN/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 80)
+options(future.globals.maxSize = 80 * 10^9)
+print(params)
+```
+
+# ___Project specific setup___
+
+```{r load project specific R packages and color code, echo = FALSE}
+source("/home/rstudio/00_NK_paper_setup.R")
+source("/home/rstudio/00_NK_paper_utils.R")
+library(Gviz)
+set.seed(2805)
+```
+
+
+*Data from: van Gerven et al., 2023, Lorenzi et al., 2025 and Qadeer et al., 2019*
+
+# ___Bulk RNA-seq: ALCAM expression in isogenic NB cell lines___
+
+## ___van Gerven et al., 2023___
+
+*Isogenic NB cell lines: GI-M-EN, NB139, SK-N-AS*
+
+```{r load-isogenic-counts}
+raw_counts_isogenic <- read.csv(
+  "/home/rstudio/mnt_data/nb_tumors/vanGerven2023.bulkRNA/processed_data/GSE226770_RNA_raw_counts_isogenic_cell_lines.csv",
+  row.names = 1,
+  check.names = FALSE
+)
+
+CLONE_TYPE_LEVELS <- c("WT", "KO", "Del2-10", "Del2-13", "Del10-12")
+
+COLOR_CODE_CLONE <- c(
+  "WT"       = "#FAA21B",
+  "KO"       = "#4f4e92",
+  "Del2-10"  = "#7b5ea7",
+  "Del2-13"  = "#9b7ec8",
+  "Del10-12" = "#bba0d8"
+)
+
+# Build metadata from column names
+sample_meta_isogenic <- data.frame(
+  sample     = colnames(raw_counts_isogenic),
+  cell_line  = sub("\\.(WT|KO|Del).*", "", colnames(raw_counts_isogenic)),
+  clone_type = sub("^[^.]+\\.([^.]+)\\..*", "\\1", colnames(raw_counts_isogenic)),
+  stringsAsFactors = FALSE
+)
+rownames(sample_meta_isogenic) <- sample_meta_isogenic$sample
+
+sample_meta_isogenic$clone_type <- factor(sample_meta_isogenic$clone_type,
+                                           levels = CLONE_TYPE_LEVELS)  # WT = reference
+sample_meta_isogenic$cell_line  <- factor(sample_meta_isogenic$cell_line,
+                                           levels = c("GIMEN", "NB139", "SKNAS"))
+```
+
+```{r deseq2-isogenic}
+# Pre-filter: require >= 10 counts in at least 4 samples (= smallest single replicate group)
+dds_isogenic <- DESeqDataSetFromMatrix(
+  countData = raw_counts_isogenic,
+  colData   = sample_meta_isogenic,
+  # cell_line is the paired factor (isogenic design).
+  # clone_type captures each deletion separately; WT is the reference level.
+  design    = ~ cell_line + clone_type
+)
+keep         <- rowSums(counts(dds_isogenic) >= 10) >= 4
+dds_isogenic <- dds_isogenic[keep, ]
+cat("Genes retained after filtering:", nrow(dds_isogenic), "\n")
+
+# Full DESeq2 pipeline
+dds_isogenic <- DESeq(dds_isogenic)
+
+# VST for visualization (blind=FALSE: uses design dispersion estimates)
+vst_isogenic     <- vst(dds_isogenic, blind = FALSE)
+vst_mat_isogenic <- assay(vst_isogenic)
+```
+
+```{r deseq2-isogenic-results}
+library(ashr)  # required for lfcShrink(type = "ashr")
+# Each clone type vs WT, controlling for cell line
+clone_types_tested <- c("KO", "Del2-10", "Del2-13", "Del10-12")
+
+res_isogenic_list <- lapply(clone_types_tested, function(ct) {
+  res <- results(dds_isogenic,
+                 contrast = c("clone_type", ct, "WT"),
+                 alpha    = 0.05)
+  res <- lfcShrink(dds_isogenic,
+                   contrast = c("clone_type", ct, "WT"),
+                   res      = res,
+                   type     = "ashr")
+  df <- as.data.frame(res) %>%
+    rownames_to_column("ensembl_id") %>%
+    arrange(padj)
+  df[["clone_type"]] <- ct  # plain character assignment avoids list-column from mutate()
+  df
+})
+res_isogenic_df <- bind_rows(res_isogenic_list)
+res_isogenic_df$clone_type <- as.character(res_isogenic_df$clone_type)
+
+cat("Significant DEGs per clone type (padj < 0.05, |LFC| > 1):\n")
+sig_degs <- res_isogenic_df[
+  !is.na(res_isogenic_df$padj) &
+  abs(res_isogenic_df$log2FoldChange) > 1 &
+  res_isogenic_df$padj < 0.05, ]
+table(as.character(sig_degs$clone_type))
+
+# ALCAM result per clone type
+ALCAM_ENSG <- "ENSG00000170017"
+alcam_res  <- res_isogenic_df[res_isogenic_df$ensembl_id == ALCAM_ENSG,
+                               c("clone_type", "log2FoldChange", "lfcSE", "pvalue", "padj")]
+alcam_res$clone_type <- as.character(alcam_res$clone_type)
+print(alcam_res)
+```
+
+```{r alcam-size-factor-normalized}
+# log2(size-factor normalized + 1) — re-uses size factors from dds_isogenic
+norm_counts_isogenic <- counts(dds_isogenic, normalized = TRUE)
+log_norm_isogenic    <- log2(norm_counts_isogenic + 1)
+
+alcam_lognorm <- data.frame(
+  sample     = colnames(log_norm_isogenic),
+  expression = as.numeric(log_norm_isogenic[ALCAM_ENSG, ]),
+  cell_line  = sample_meta_isogenic$cell_line,
+  clone_type = sample_meta_isogenic$clone_type
+)
+```
+
+```{r alcam-raw-counts-diagnostic}
+# Diagnostic: raw ALCAM counts per sample
+alcam_raw <- data.frame(
+  sample     = colnames(raw_counts_isogenic),
+  raw_count  = as.numeric(raw_counts_isogenic[ALCAM_ENSG, ]),
+  cell_line  = sample_meta_isogenic$cell_line,
+  clone_type = sample_meta_isogenic$clone_type
+)
+alcam_raw %>% arrange(cell_line, clone_type)
+```
+
+```{r alcam-lognorm-plot, fig.height=5, fig.width=10}
+# Build one panel per cell line with only the comparisons that exist in that panel,
+# then combine with patchwork — this avoids ggpubr silently dropping all brackets
+# when a clone type is absent from a facet.
+
+make_alcam_panel <- function(cl, comparisons, show_legend = FALSE) {
+  df <- droplevels(alcam_lognorm[alcam_lognorm$cell_line == cl, ])
+  ggboxplot(
+    df,
+    x             = "clone_type",
+    y             = "expression",
+    fill          = "clone_type",
+    add           = "jitter",
+    add.params    = list(size = 2.5, alpha = 0.8, color = "black"),
+    outlier.shape = NA
+  ) +
+    scale_fill_manual(values = COLOR_CODE_CLONE, name = "Clone type",
+                      drop = TRUE) +
+    stat_compare_means(
+      comparisons = comparisons,
+      method      = "wilcox.test",
+      label       = "p.format"
+    ) +
+    labs(title = cl,
+         y     = expression(log[2] ~ "(normalized counts + 1)"),
+         x     = "") +
+    theme_pubr(base_size = 12) +
+    theme(
+      axis.text.x     = element_text(angle = 45, hjust = 1),
+      legend.position = if (show_legend) "right" else "none",
+      plot.title      = element_text(face = "bold", size = 12)
+    )
+}
+
+p_gimen <- make_alcam_panel("GIMEN",
+  list(c("WT", "KO"), c("WT", "Del2-10"), c("WT", "Del2-13")))
+p_nb139 <- make_alcam_panel("NB139",
+  list(c("WT", "Del10-12"), c("WT", "Del2-10")))
+p_sknas <- make_alcam_panel("SKNAS",
+  list(c("WT", "KO")),
+  show_legend = TRUE)
+
+alcam_lognorm_plot <- (p_gimen | p_nb139 | p_sknas) +
+  plot_annotation(
+    title = "ALCAM expression in isogenic NB cell lines",
+    subtitle = "van Gerven et al., 2023",
+    theme = theme(plot.title = element_text(face = "bold", size = 13))
+  )
+
+alcam_lognorm_plot
+
+pdf(paste0(params$out, "NK_project/figures/isogenic_ALCAM_lognorm_per_clonetype.pdf"),
+    height = 5, width = 10)
+alcam_lognorm_plot
+dev.off()
+```
+
+```{r alcam-lognorm-stats}
+alcam_lognorm %>%
+  group_by(cell_line, clone_type) %>%
+  summarise(n      = n(),
+            mean   = round(mean(expression), 3),
+            median = round(median(expression), 3),
+            sd     = round(sd(expression), 3),
+            .groups = "drop")
+```
+
+## ___Qadeer et al., 2019___
+
+*Isogenic NB cell lines: SK-N-FI*
+
+```{r load-sknfi-fpkm}
+# grep the ALCAM expression
+alcam_line_sknfi <- grep(
+  "^ALCAM\\s",
+  readLines("/home/rstudio/mnt_data/nb_tumors/qadeer2019.bulkRNA.bulkChIP/processed_data/GSE100148/GSE100148_SKNFI_MS2_IFF_FPKM.txt"),
+  value = TRUE
+)
+alcam_fpkm_sknfi <- as.numeric(strsplit(trimws(alcam_line_sknfi), "\\s+")[[1]][-1])
+names(alcam_fpkm_sknfi) <- c("FI.MS2.R1", "FI.MS2.R2", "FI.MS2.IFF.R1", "FI.MS2.IFF.R2")
+alcam_fpkm_sknfi
+
+# Metadata: MS2 = ATRXwt (parental); IFF = ATRXdel (ATRX-deleted)
+sample_meta_sknfi <- data.frame(
+  sample      = names(alcam_fpkm_sknfi),
+  ATRX_status = ifelse(grepl("IFF", names(alcam_fpkm_sknfi)), "ATRXdel", "ATRXwt"),
+  stringsAsFactors = FALSE
+)
+sample_meta_sknfi$ATRX_status <- factor(sample_meta_sknfi$ATRX_status,
+                                         levels = c("ATRXwt", "ATRXdel"))
+
+COLOR_CODE_ATRX <- c("ATRXwt" = "#FAA21B", "ATRXdel" = "#4f4e92")
+```
+
+```{r alcam-sknfi-df}
+alcam_sknfi <- data.frame(
+  sample      = names(alcam_fpkm_sknfi),
+  expression  = log2(alcam_fpkm_sknfi + 1),
+  ATRX_status = sample_meta_sknfi$ATRX_status
+)
+alcam_sknfi
+```
+
+```{r alcam-sknfi-plot, fig.height=5, fig.width=3}
+alcam_sknfi_plot <- ggboxplot(
+  alcam_sknfi,
+  x             = "ATRX_status",
+  y             = "expression",
+  fill          = "ATRX_status",
+  add           = "jitter",
+  add.params    = list(size = 3, alpha = 0.9, color = "black"),
+  outlier.shape = NA
+) +
+  scale_fill_manual(values = COLOR_CODE_ATRX, name = "ATRX status") +
+  stat_compare_means(
+    comparisons = list(c("ATRXwt", "ATRXdel")),
+    method      = "wilcox.test",
+    label       = "p.format"
+  ) +
+  labs(
+    title   = "SK-N-FI",
+    subtitle = "Qadeer et al., 2019",
+    y       = expression(log[2] ~ "(FPKM + 1)"),
+    x       = "",
+    caption = ""
+  ) +
+  theme_pubr(base_size = 12) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    legend.position = "none",
+    plot.title      = element_text(face = "bold", size = 13),
+    plot.caption    = element_text(size = 9, color = "gray40")
+  )
+
+alcam_sknfi_plot
+
+pdf(paste0(params$out, "NK_project/figures/SKNFI_ALCAM_ATRXwt_vs_ATRXdel.pdf"),
+    height = 5, width = 3)
+alcam_sknfi_plot
+dev.off()
+```
+
+# ___DEG pathway enrichment analysis: ATRXdel vs ATRXwt___
+
+## ___van Gerven et al., 2023___
+
+*Isogenic NB cell lines: GI-M-EN, NB139, SK-N-AS*
+
+*One representative deletion per cell line selected: GIMEN KO, NB139 Del2-10, SKNAS KO.*
+
+```{r deseq2-selected-clones}
+# Select the purest deletion type per cell line (4 WT + 4 del each, balanced)
+selected_samples <- c(
+  grep("^GIMEN\\.WT\\.",     colnames(raw_counts_isogenic), value = TRUE),
+  grep("^GIMEN\\.KO\\.",     colnames(raw_counts_isogenic), value = TRUE),
+  grep("^NB139\\.WT\\.",     colnames(raw_counts_isogenic), value = TRUE),
+  grep("^NB139\\.Del2-10\\.",colnames(raw_counts_isogenic), value = TRUE),
+  grep("^SKNAS\\.WT\\.",     colnames(raw_counts_isogenic), value = TRUE),
+  grep("^SKNAS\\.KO\\.",     colnames(raw_counts_isogenic), value = TRUE)
+)
+
+meta_selected <- sample_meta_isogenic[selected_samples, , drop = FALSE]
+meta_selected$ATRX_status <- factor(
+  ifelse(meta_selected$clone_type == "WT", "ATRXwt", "ATRXdel"),
+  levels = c("ATRXwt", "ATRXdel")
+)
+
+# Re-use pre-filtered gene set from dds_isogenic
+dds_selected <- DESeqDataSetFromMatrix(
+  countData = counts(dds_isogenic)[, selected_samples],
+  colData   = meta_selected,
+  design    = ~ cell_line + ATRX_status
+)
+dds_selected <- DESeq(dds_selected)
+cat("Samples:", ncol(dds_selected), "| Genes:", nrow(dds_selected), "\n")
+table(meta_selected$cell_line, meta_selected$ATRX_status)
+```
+
+```{r deseq2-selected-results}
+res_selected <- results(dds_selected,
+                        contrast = c("ATRX_status", "ATRXdel", "ATRXwt"),
+                        alpha    = 0.05)
+res_selected <- lfcShrink(dds_selected,
+                           contrast = c("ATRX_status", "ATRXdel", "ATRXwt"),
+                           res      = res_selected,
+                           type     = "ashr")
+
+res_selected_df <- as.data.frame(res_selected) %>%
+  rownames_to_column("ensembl_id") %>%
+  arrange(padj)
+
+n_sig  <- sum(res_selected_df$padj < 0.05 & abs(res_selected_df$log2FoldChange) > 1, na.rm = TRUE)
+n_up   <- sum(res_selected_df$padj < 0.05 & res_selected_df$log2FoldChange > 1,  na.rm = TRUE)
+n_down <- sum(res_selected_df$padj < 0.05 & res_selected_df$log2FoldChange < -1, na.rm = TRUE)
+cat("Significant DEGs (padj<0.05, |LFC|>1):", n_sig, "— Up:", n_up, "| Down:", n_down, "\n")
+
+# ALCAM result
+res_selected_df[res_selected_df$ensembl_id == ALCAM_ENSG,
+                c("ensembl_id", "log2FoldChange", "lfcSE", "pvalue", "padj")]
+```
+
+```{r deg-id-conversion}
+# Convert Ensembl → Entrez + Symbol for downstream enrichment
+gene_map <- bitr(res_selected_df$ensembl_id,
+                 fromType = "ENSEMBL",
+                 toType   = c("ENTREZID", "SYMBOL"),
+                 OrgDb    = org.Hs.eg.db)
+
+res_selected_annot <- res_selected_df %>%
+  left_join(gene_map, by = c("ensembl_id" = "ENSEMBL"))
+
+# Gene universe: expressed, tested genes with a valid Entrez ID
+geneUniverse_entrez <- unique(gene_map$ENTREZID)
+cat("Gene universe:", length(geneUniverse_entrez), "genes\n")
+
+# Significant subsets (upregulated = primary interest given expected ALCAM↑ with ATRXdel)
+sig_up   <- res_selected_annot %>% filter(padj < 0.05, log2FoldChange > 1,  !is.na(ENTREZID))
+sig_down <- res_selected_annot %>% filter(padj < 0.05, log2FoldChange < -1, !is.na(ENTREZID))
+cat("Up:", nrow(sig_up), "| Down:", nrow(sig_down), "genes with Entrez IDs\n")
+```
+
+```{r volcano-selected, fig.height=8, fig.width=8}
+top_labels <- res_selected_annot %>%
+  filter(!is.na(padj), !is.na(SYMBOL)) %>%
+  slice_min(padj, n = 15) %>%
+  pull(SYMBOL)
+
+volcano_plot <- EnhancedVolcano(
+  res_selected_annot,
+  lab             = res_selected_annot$SYMBOL,
+  x               = "log2FoldChange",
+  y               = "padj",
+  selectLab       = top_labels,
+  pCutoff         = 0.05,
+  FCcutoff        = 1,
+  title           = "ATRXdel vs ATRXwt",
+  subtitle        = "Isogenic NB cell lines — GIMEN KO, NB139 Del2-10, SKNAS KO",
+  caption         = paste0("Up: ", n_up, " | Down: ", n_down, " (padj<0.05, |LFC|>1)"),
+  legendPosition  = "right",
+  drawConnectors  = TRUE,
+  widthConnectors = 0.4
+)
+volcano_plot
+
+pdf(paste0(params$out, "NK_project/figures/DEG_volcano_ATRXdel_vs_ATRXwt.pdf"),
+    height = 8, width = 8)
+volcano_plot
+dev.off()
+```
+
+```{r ora-go, fig.height=6, fig.width=8}
+ego_up <- enrichGO(gene          = unique(sig_up$ENTREZID),
+                   universe      = geneUniverse_entrez,
+                   OrgDb         = org.Hs.eg.db,
+                   ont           = "BP",
+                   pAdjustMethod = "fdr",
+                   pvalueCutoff  = 0.05,
+                   qvalueCutoff  = 0.1,
+                   minGSSize     = 10,
+                   maxGSSize     = 500,
+                   readable      = TRUE)
+
+ego_down <- enrichGO(gene          = unique(sig_down$ENTREZID),
+                     universe      = geneUniverse_entrez,
+                     OrgDb         = org.Hs.eg.db,
+                     ont           = "BP",
+                     pAdjustMethod = "fdr",
+                     pvalueCutoff  = 0.05,
+                     qvalueCutoff  = 0.2,
+                     minGSSize     = 2,
+                     maxGSSize     = 5000,
+                     readable      = TRUE)
+
+if (!is.null(ego_up) && nrow(ego_up) > 0) {
+  p_go_up <- dotplot(ego_up, showCategory = 20, title = "GO:BP — upregulated in ATRXdel")
+  print(p_go_up)
+  pdf(paste0(params$out, "NK_project/figures/ORA_GO_up_ATRXdel.pdf"), height = 6, width = 8)
+  print(p_go_up); dev.off()
+  if (nrow(ego_up) >= 10) {
+    p_tree_up <- treeplot(pairwise_termsim(ego_up), nCluster = 4, label_format = 30)
+    print(p_tree_up)
+    pdf(paste0(params$out, "NK_project/figures/ORA_GO_up_ATRXdel_tree.pdf"), height = 8, width = 12)
+    print(p_tree_up); dev.off()
+  }
+} else { cat("No significant GO:BP terms for upregulated genes.\n") }
+
+if (!is.null(ego_down) && nrow(ego_down) > 0) {
+  p_go_down <- dotplot(ego_down, showCategory = 20, title = "GO:BP — downregulated in ATRXdel")
+  print(p_go_down)
+  pdf(paste0(params$out, "NK_project/figures/ORA_GO_down_ATRXdel.pdf"), height = 6, width = 8)
+  print(p_go_down); dev.off()
+  if (nrow(ego_down) >= 10) {
+    p_tree_down <- treeplot(pairwise_termsim(ego_down), nCluster = 4, label_format = 30)
+    print(p_tree_down)
+    pdf(paste0(params$out, "NK_project/figures/ORA_GO_down_ATRXdel_tree.pdf"), height = 8, width = 12)
+    print(p_tree_down); dev.off()
+  }
+} else { cat("No significant GO:BP terms for downregulated genes.\n") }
+```
+
+```{r ora-kegg, fig.height=6, fig.width=8}
+ekegg_up <- enrichKEGG(gene          = unique(sig_up$ENTREZID),
+                       universe      = geneUniverse_entrez,
+                       organism      = "hsa",
+                       keyType       = "kegg",
+                       pAdjustMethod = "fdr",
+                       pvalueCutoff  = 0.05,
+                       qvalueCutoff  = 0.1,
+                       minGSSize     = 10,
+                       maxGSSize     = 500)
+
+ekegg_down <- enrichKEGG(gene          = unique(sig_down$ENTREZID),
+                         universe      = geneUniverse_entrez,
+                         organism      = "hsa",
+                         keyType       = "kegg",
+                         pAdjustMethod = "fdr",
+                         pvalueCutoff  = 0.05,
+                         qvalueCutoff  = 0.2,
+                         minGSSize     = 2,
+                         maxGSSize     = 5000)
+
+if (!is.null(ekegg_up) && nrow(ekegg_up) > 0) {
+  p_kegg_up <- dotplot(ekegg_up, showCategory = 20, title = "KEGG — upregulated in ATRXdel")
+  print(p_kegg_up)
+  pdf(paste0(params$out, "NK_project/figures/ORA_KEGG_up_ATRXdel.pdf"), height = 6, width = 8)
+  print(p_kegg_up); dev.off()
+} else { cat("No significant KEGG terms for upregulated genes.\n") }
+
+if (!is.null(ekegg_down) && nrow(ekegg_down) > 0) {
+  p_kegg_down <- dotplot(ekegg_down, showCategory = 20, title = "KEGG — downregulated in ATRXdel")
+  print(p_kegg_down)
+  pdf(paste0(params$out, "NK_project/figures/ORA_KEGG_down_ATRXdel.pdf"), height = 6, width = 8)
+  print(p_kegg_down); dev.off()
+} else { cat("No significant KEGG terms for downregulated genes.\n") }
+```
+
+
+## ___Qadeer et al., 2019___
+
+*Isogenic NB cell lines: SK-N-FI*
+
+*Note: For Qadeer et al., 2019 only FPKM data is available, but raw counts required for DESeq2.*
+
+
+# ___GSEAnalysis: MES and inflammation signatures___
+
+## ___van Gerven et al., 2023___
+
+```{r gsea-setup}
+# Ranked gene list: shrunken LFC descending, named by Entrez ID
+ranked_df <- res_selected_annot %>%
+  filter(!is.na(ENTREZID), !is.na(log2FoldChange)) %>%
+  arrange(desc(log2FoldChange)) %>%
+  distinct(ENTREZID, .keep_all = TRUE)
+
+ranked_genes <- setNames(ranked_df$log2FoldChange, ranked_df$ENTREZID)
+cat("Genes in ranked list:", length(ranked_genes), "\n")
+
+# Hallmark gene sets
+hallmark_t2g <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  dplyr::select(gs_name, entrez_gene) %>%
+  mutate(entrez_gene = as.character(entrez_gene))
+
+# NB MES/ADRN gene sets from mounted resource path
+mes_adrn_files <- list.files(params$markers, full.names = TRUE)
+mes_adrn_t2g <- lapply(mes_adrn_files, function(f) {
+  gs_name   <- tools::file_path_sans_ext(basename(f))
+  gene_syms <- readLines(f)
+  gene_syms <- gene_syms[nzchar(trimws(gene_syms))]
+  entrez    <- bitr(gene_syms, fromType = "SYMBOL", toType = "ENTREZID",
+                    OrgDb = org.Hs.eg.db)$ENTREZID
+  data.frame(gs_name = gs_name, entrez_gene = as.character(entrez))
+}) %>% bind_rows()
+
+cat("MES/ADRN gene sets:", length(unique(mes_adrn_t2g$gs_name)), "\n")
+cat("Hallmark gene sets:", length(unique(hallmark_t2g$gs_name)), "\n")
+```
+
+```{r gsea-mesenchymal, fig.height=5, fig.width=8}
+mes_hallmark <- hallmark_t2g %>%
+  filter(grepl("EPITHELIAL_MESENCHYMAL", gs_name))
+mes_t2g <- bind_rows(mes_hallmark, mes_adrn_t2g)
+
+# pvalueCutoff=0.25: MSigDB/Broad convention for GSEA (permutation-based, 0.05 is too strict)
+# pvalueCutoff=1 to retrieve all results; filter by padj<0.25 for significance calls
+gsea_mes <- GSEA(ranked_genes,
+                 TERM2GENE     = mes_t2g,
+                 pAdjustMethod = "fdr",
+                 pvalueCutoff  = 1,
+                 verbose       = FALSE)
+
+sig_sets_mes <- gsea_mes@result$ID[gsea_mes@result$p.adjust < 0.25]
+
+if (length(sig_sets_mes) > 0) {
+  p_dot_mes <- dotplot(gsea_mes, showCategory = sig_sets_mes,
+                       title = "GSEA — mesenchymal signatures (ATRXdel vs ATRXwt)")
+  print(p_dot_mes)
+  pdf(paste0(params$out, "NK_project/figures/GSEA_mesenchymal_ATRXdel_dotplot.pdf"),
+      height = 5, width = 8)
+  print(p_dot_mes); dev.off()
+} else { cat("No mesenchymal gene sets significant at FDR<0.25.\n") }
+
+# Running enrichment plots for ALL tested sets (shows NES + p even if not significant)
+for (gs in gsea_mes@result$ID) {
+  gs_padj <- gsea_mes@result$p.adjust[gsea_mes@result$ID == gs]
+  gs_label <- ifelse(gs_padj < 0.25, gs, paste0(gs, " (ns, padj=", round(gs_padj, 3), ")"))
+  p_es <- gseaplot2(gsea_mes, geneSetID = gs, title = gs_label, pvalue_table = TRUE)
+  print(p_es)
+  pdf(paste0(params$out, "NK_project/figures/GSEA_mes_", gs, ".pdf"), height = 6, width = 8)
+  print(p_es); dev.off()
+}
+```
+
+```{r gsea-inflammation, fig.height=5, fig.width=8}
+inflam_t2g <- hallmark_t2g %>%
+  filter(grepl("INFLAMMATORY|TNF_ALPHA|IL6_JAK|INTERFERON|IL2_STAT5", gs_name))
+
+gsea_inflam <- GSEA(ranked_genes,
+                    TERM2GENE     = inflam_t2g,
+                    pAdjustMethod = "fdr",
+                    pvalueCutoff  = 1,
+                    verbose       = FALSE)
+
+sig_sets_inflam <- gsea_inflam@result$ID[gsea_inflam@result$p.adjust < 0.25]
+
+if (length(sig_sets_inflam) > 0) {
+  p_dot_inflam <- dotplot(gsea_inflam, showCategory = sig_sets_inflam,
+                          title = "GSEA — inflammatory signatures (ATRXdel vs ATRXwt)")
+  print(p_dot_inflam)
+  pdf(paste0(params$out, "NK_project/figures/GSEA_inflammation_ATRXdel_dotplot.pdf"),
+      height = 5, width = 8)
+  print(p_dot_inflam); dev.off()
+} else { cat("No inflammatory gene sets significant at FDR<0.25.\n") }
+
+# Running enrichment plots for ALL tested sets
+for (gs in gsea_inflam@result$ID) {
+  gs_padj <- gsea_inflam@result$p.adjust[gsea_inflam@result$ID == gs]
+  gs_label <- ifelse(gs_padj < 0.25, gs, paste0(gs, " (ns, padj=", round(gs_padj, 3), ")"))
+  p_es <- gseaplot2(gsea_inflam, geneSetID = gs, title = gs_label, pvalue_table = TRUE)
+  print(p_es)
+  pdf(paste0(params$out, "NK_project/figures/GSEA_inflam_", gs, ".pdf"), height = 6, width = 8)
+  print(p_es); dev.off()
+}
+```
+
+## ___Qadeer et al., 2019___
+
+```{r sknfi-ranked-genes}
+# Parse the malformed SKNFI FPKM file.
+# Strategy: for each line, extract the gene name (first token) and then extract
+# all decimal numbers via regex — this handles merged values with trailing dots
+# (e.g. "1.23.4.56" → matches "1.23" then "4.56") without any whitespace assumptions.
+sknfi_lines <- readLines(
+  "/home/rstudio/mnt_data/nb_tumors/qadeer2019.bulkRNA.bulkChIP/processed_data/GSE100148/GSE100148_SKNFI_MS2_IFF_FPKM.txt"
+)
+# Strip non-printable characters (e.g. \f form feeds) and drop blank lines
+sknfi_lines <- gsub("[^[:print:]]", "", sknfi_lines)
+sknfi_lines <- sknfi_lines[nzchar(trimws(sknfi_lines))]
+
+parse_sknfi_line <- function(l) {
+  l <- trimws(l)
+  gene <- strsplit(l, "\\s+")[[1]][1]
+  gene <- gsub("[^A-Za-z0-9_\\-\\.]", "", gene)   # remove any residual non-word chars
+  rest <- sub("^\\S+\\s+", "", l)
+  # Extract all decimal or integer numbers; stray dots between merged values are skipped
+  nums <- as.numeric(regmatches(rest, gregexpr("\\d+\\.\\d+|\\d+", rest))[[1]])
+  if (nzchar(gene) && length(nums) >= 4) c(gene, nums[1:4]) else NULL
+}
+
+sknfi_parsed <- Filter(Negate(is.null), lapply(sknfi_lines[-1], parse_sknfi_line))
+
+sknfi_df <- data.frame(
+  gene   = sapply(sknfi_parsed, `[`, 1),
+  MS2_R1 = as.numeric(sapply(sknfi_parsed, `[`, 2)),
+  MS2_R2 = as.numeric(sapply(sknfi_parsed, `[`, 3)),
+  IFF_R1 = as.numeric(sapply(sknfi_parsed, `[`, 4)),
+  IFF_R2 = as.numeric(sapply(sknfi_parsed, `[`, 5)),
+  stringsAsFactors = FALSE
+)
+sknfi_df <- sknfi_df[complete.cases(sknfi_df), ]
+cat("Genes parsed from SKNFI file:", nrow(sknfi_df), "\n")
+
+# log2 fold change (ATRXdel/IFF vs ATRXwt/MS2); pseudocount avoids log(0)
+sknfi_df$mean_wt  <- (sknfi_df$MS2_R1 + sknfi_df$MS2_R2) / 2
+sknfi_df$mean_del <- (sknfi_df$IFF_R1 + sknfi_df$IFF_R2) / 2
+sknfi_df$log2FC   <- log2(sknfi_df$mean_del + 0.1) - log2(sknfi_df$mean_wt + 0.1)
+
+# Convert gene symbols → Entrez IDs for GSEA
+gene_map_sknfi   <- bitr(sknfi_df$gene, fromType = "SYMBOL", toType = "ENTREZID",
+                          OrgDb = org.Hs.eg.db)
+sknfi_df_mapped  <- merge(sknfi_df, gene_map_sknfi, by.x = "gene", by.y = "SYMBOL")
+sknfi_df_mapped  <- sknfi_df_mapped[!duplicated(sknfi_df_mapped$ENTREZID), ]
+
+ranked_sknfi <- sort(setNames(sknfi_df_mapped$log2FC, sknfi_df_mapped$ENTREZID),
+                     decreasing = TRUE)
+cat("SKNFI ranked gene list:", length(ranked_sknfi), "genes\n")
+
+# ALCAM check
+alcam_entrez <- gene_map_sknfi$ENTREZID[gene_map_sknfi$SYMBOL == "ALCAM"]
+cat("ALCAM log2FC in SKNFI:", ranked_sknfi[alcam_entrez], "\n")
+```
+
+```{r gsea-sknfi-mesenchymal, fig.height=5, fig.width=8}
+gsea_mes_sknfi <- GSEA(ranked_sknfi,
+                       TERM2GENE     = mes_t2g,
+                       pAdjustMethod = "fdr",
+                       pvalueCutoff  = 1,
+                       verbose       = FALSE)
+
+sig_sets_mes_sknfi <- gsea_mes_sknfi@result$ID[gsea_mes_sknfi@result$p.adjust < 0.25]
+if (length(sig_sets_mes_sknfi) > 0) {
+  print(dotplot(gsea_mes_sknfi, showCategory = sig_sets_mes_sknfi,
+                title = "GSEA mesenchymal — SKNFI (ATRXdel vs ATRXwt)"))
+} else { cat("No mesenchymal gene sets significant at FDR<0.25 in SKNFI.\n") }
+
+for (gs in gsea_mes_sknfi@result$ID) {
+  gs_padj <- gsea_mes_sknfi@result$p.adjust[gsea_mes_sknfi@result$ID == gs]
+  gs_label <- ifelse(gs_padj < 0.25, gs, paste0(gs, " (ns, padj=", round(gs_padj, 3), ")"))
+  p_es <- gseaplot2(gsea_mes_sknfi, geneSetID = gs, title = gs_label, pvalue_table = TRUE)
+  print(p_es)
+  pdf(paste0(params$out, "NK_project/figures/GSEA_SKNFI_mes_", gs, ".pdf"), height = 6, width = 8)
+  print(p_es); dev.off()
+}
+```
+
+```{r gsea-sknfi-inflammation, fig.height=5, fig.width=8}
+gsea_inflam_sknfi <- GSEA(ranked_sknfi,
+                          TERM2GENE     = inflam_t2g,
+                          pAdjustMethod = "fdr",
+                          pvalueCutoff  = 1,
+                          verbose       = FALSE)
+
+sig_sets_inflam_sknfi <- gsea_inflam_sknfi@result$ID[gsea_inflam_sknfi@result$p.adjust < 0.25]
+if (length(sig_sets_inflam_sknfi) > 0) {
+  print(dotplot(gsea_inflam_sknfi, showCategory = sig_sets_inflam_sknfi,
+                title = "GSEA inflammation — SKNFI (ATRXdel vs ATRXwt)"))
+} else { cat("No inflammatory gene sets significant at FDR<0.25 in SKNFI.\n") }
+
+for (gs in gsea_inflam_sknfi@result$ID) {
+  gs_padj <- gsea_inflam_sknfi@result$p.adjust[gsea_inflam_sknfi@result$ID == gs]
+  gs_label <- ifelse(gs_padj < 0.25, gs, paste0(gs, " (ns, padj=", round(gs_padj, 3), ")"))
+  p_es <- gseaplot2(gsea_inflam_sknfi, geneSetID = gs, title = gs_label, pvalue_table = TRUE)
+  print(p_es)
+  pdf(paste0(params$out, "NK_project/figures/GSEA_SKNFI_inflam_", gs, ".pdf"),
+      height = 6, width = 8)
+  print(p_es); dev.off()
+}
+```
+
+# ___Bulk ATAC-seq & ChIP-seq: ATRX binding, histone marks and chromatin accessibility at ALCAM gene locus___
+
+
+```{r gviz-setup}
+library(Gviz)
+library(rtracklayer)
+library(GenomicFeatures)
+library(txdbmaker)
+library(GenomeInfoDbData)
+
+# ALCAM locus (based on genome version hg38 and gencode v43 gene annotations): chr3:105,366,909-105,576,900
+# Plot window with +/- 80 kb flanking
+ALCAM_CHR   <- "chr3"
+ALCAM_START <- 105280000
+ALCAM_END   <- 105640000
+
+alcam_region <- GRanges(seqnames = ALCAM_CHR,
+                         ranges   = IRanges(ALCAM_START, ALCAM_END))
+
+# Helper: import a bigWig over the ALCAM region
+import_bw <- function(path, region = alcam_region) {
+  import(path, which = region, as = "GRanges")
+}
+
+# Helper: average multiple bigWig replicates → single GRanges with mean score
+avg_bw <- function(paths, region = alcam_region) {
+  rle_list <- lapply(paths, function(f) {
+    bw <- import(f, which = region, as = "RleList")
+    bw[[ALCAM_CHR]][ALCAM_START:ALCAM_END]
+  })
+  avg_rle <- Reduce("+", rle_list) / length(rle_list)
+  GRanges(seqnames = ALCAM_CHR,
+          ranges   = IRanges(start = ALCAM_START:ALCAM_END, width = 1),
+          score    = as.numeric(avg_rle))
+}
+
+# Gene model from GTF
+txdb_alcam <- suppressMessages(
+  txdbmaker::makeTxDbFromGFF(
+    "/home/rstudio/mnt_resources/GTF/gencode.v43.annotation.gtf",
+    format    = "gtf",
+    organism  = "Homo sapiens",
+    chrominfo = Seqinfo(genome = "hg38")
+  )
+)
+
+# ENCODE cCREs
+# read.table + manual GRanges construction avoids rtracklayer parse error
+ccre_df <- read.table(
+  "/home/rstudio/mnt_resources/regulatory_regions/GRCh38-cCREs.bed",
+  header    = FALSE, sep = "\t",
+  col.names = c("chr", "start", "end", "accession", "accession2", "type"),
+  colClasses = c("character", "integer", "integer",
+                 "character", "character", "character")
+)
+# BED coordinates are 0-based half-open → convert to 1-based closed for GRanges
+ccre_gr <- GRanges(
+  seqnames = ccre_df$chr,
+  ranges   = IRanges(start = ccre_df$start + 1L, end = ccre_df$end),
+  accession = ccre_df$accession,
+  type      = ccre_df$type
+)
+ccre_alcam <- subsetByOverlaps(ccre_gr, alcam_region)
+cat("cCREs overlapping ALCAM window:", length(ccre_alcam), "\n")
+print(as.data.frame(ccre_alcam)[, c("accession", "type")])
+
+# EPD (Eukaryotic Promoter Database) — experimentally validated ALCAM promoters
+epd_df    <- read.table(
+  "/home/rstudio/mnt_resources/regulatory_regions/homo_sapiens/human_EPDnew_promoters_hg38.bed",
+  header       = FALSE, sep = "\t",
+  comment.char = "#",   # skip the #chrom header line
+  col.names    = c("chr", "start", "end", "name", "score", "strand", "thickStart", "thickEnd"),
+  colClasses   = c("character", "integer", "integer", "character",
+                   "numeric",   "character", "integer",   "integer")
+)
+epd_alcam_df <- epd_df[grep("^ALCAM", epd_df$name), ]
+epd_alcam    <- GRanges(
+  seqnames = epd_alcam_df$chr,
+  ranges   = IRanges(start = epd_alcam_df$start + 1L, end = epd_alcam_df$end),
+  strand   = epd_alcam_df$strand,
+  name     = epd_alcam_df$name
+)
+cat("EPD promoters for ALCAM:\n")
+print(as.data.frame(epd_alcam)[, c("seqnames", "start", "end", "name")])
+```
+
+```{r gviz-annotation-tracks}
+axis_track <- GenomeAxisTrack()
+ideo_track <- IdeogramTrack(genome = "hg38", chromosome = ALCAM_CHR)
+
+gene_track <- GeneRegionTrack(
+  txdb_alcam,
+  chromosome  = ALCAM_CHR,
+  start       = ALCAM_START,
+  end         = ALCAM_END,
+  name        = "ALCAM",
+  showId      = TRUE,
+  geneSymbols = TRUE,
+  fill        = "#333333",
+  col         = NA,
+  fontsize    = 10
+)
+
+# Color cCREs by type: PLS/promoter = red, ELS/enhancer = orange, CTCF-only = gray
+ccre_cols <- ifelse(grepl("PLS|DNase-H3K4me3", ccre_alcam$type), "#e63946",
+             ifelse(grepl("ELS|pELS|dELS",      ccre_alcam$type), "#E07B39",
+                    "#aaaaaa"))
+ccre_track <- AnnotationTrack(
+  ccre_alcam,
+  name     = "ENCODE cCREs",
+  fill     = ccre_cols,
+  col      = NA,
+  fontsize = 8,
+  stacking = "dense"
+)
+
+# EPD promoter track — marks exact TSS positions validated by EPD
+epd_track <- AnnotationTrack(
+  epd_alcam,
+  name     = "EPD promoters",
+  id       = epd_alcam$name,
+  showFeatureId = TRUE,
+  fill     = "#c1121f",
+  col      = NA,
+  fontsize = 8,
+  stacking = "dense"
+)
+```
+
+```{r gviz-atrx-tracks}
+CHIP_DIR <- "/home/rstudio/mnt_data/nb_tumors/qadeer2019.bulkRNA.bulkChIP/processed_data/GSE100148/GSE100148_RAW/"
+
+chla90_atrx_gr <- import_bw(file.path(CHIP_DIR, "GSM3389350_CHLA90_ATRX.bigWig"))
+sknfi_atrx_gr  <- import_bw(file.path(CHIP_DIR, "GSM3389345_SKNFI_ATRX.bigWig"))
+
+track_chla90_atrx <- DataTrack(chla90_atrx_gr, name = "CHLA90 ATRX",
+                                type = "histogram", fill.histogram = "#4f4e92",
+                                col.histogram = NA, fontsize = 10)
+track_sknfi_atrx  <- DataTrack(sknfi_atrx_gr,  name = "SKNFI ATRX",
+                                type = "histogram", fill.histogram = "#7b5ea7",
+                                col.histogram = NA, fontsize = 10)
+```
+
+```{r gviz-atac-tracks}
+ATAC_DIR <- "/home/rstudio/mnt_data/nb_tumors/lorenzi2026.bulkATAC/GSE312501/"
+
+p53_avg <- avg_bw(file.path(ATAC_DIR, c(
+  "GSM9347420_p53_DMSO_REP1.mLb.clN.bigWig",
+  "GSM9347424_p53_DMSO_REP2.mLb.clN.bigWig",
+  "GSM9347428_p53_DMSO_REP3.mLb.clN.bigWig"
+)))
+e6_avg <- avg_bw(file.path(ATAC_DIR, c(
+  "GSM9347422_E6_DMSO_REP1.mLb.clN.bigWig",
+  "GSM9347426_E6_DMSO_REP2.mLb.clN.bigWig",
+  "GSM9347430_E6_DMSO_REP3.mLb.clN.bigWig"
+)))
+
+atac_ylim <- c(0, max(c(score(p53_avg), score(e6_avg)), na.rm = TRUE) * 1.05)
+
+track_atac_p53 <- DataTrack(p53_avg, name = "ATAC p53\n(ATRXwt)",
+                             type = "histogram", fill.histogram = "#7EA3AC",
+                             col.histogram = NA, ylim = atac_ylim, fontsize = 10)
+track_atac_e6  <- DataTrack(e6_avg,  name = "ATAC E6\n(ATRXdel)",
+                             type = "histogram", fill.histogram = "#4f4e92",
+                             col.histogram = NA, ylim = atac_ylim, fontsize = 10)
+```
+
+```{r gviz-histone-tracks}
+chla90_h3k9ac_gr   <- import_bw(file.path(CHIP_DIR, "GSM2672020_CHLA90_H3K9ac.bigWig"))
+chla90_h3k27me3_gr <- import_bw(file.path(CHIP_DIR, "GSM2672018_CHLA90_H3K27me3.bigWig"))
+chla90_h3k9me3_gr  <- import_bw(file.path(CHIP_DIR, "GSM2672019_CHLA90_H3K9me3.bigWig"))
+
+track_h3k9ac   <- DataTrack(chla90_h3k9ac_gr,   name = "CHLA90\nH3K9ac",
+                             type = "histogram", fill.histogram = "#2a9d8f",
+                             col.histogram = NA, fontsize = 10)
+track_h3k27me3 <- DataTrack(chla90_h3k27me3_gr, name = "CHLA90\nH3K27me3",
+                             type = "histogram", fill.histogram = "#e63946",
+                             col.histogram = NA, fontsize = 10)
+track_h3k9me3  <- DataTrack(chla90_h3k9me3_gr,  name = "CHLA90\nH3K9me3",
+                             type = "histogram", fill.histogram = "#8d8d8d",
+                             col.histogram = NA, fontsize = 10)
+```
+
+```{r gviz-ratio-track}
+# Log2(ATRXdel / ATRXwt) ratio track for ATAC-seq (E6 / p53)
+# Pseudocount avoids log(0); positive = more open in ATRXdel, negative = more open in ATRXwt
+p53_scores <- score(p53_avg)
+e6_scores  <- score(e6_avg)
+ratio_scores <- log2((e6_scores + 0.01) / (p53_scores + 0.01))
+
+ratio_gr <- GRanges(seqnames = ALCAM_CHR,
+                     ranges   = IRanges(start = ALCAM_START:ALCAM_END, width = 1),
+                     score    = ratio_scores)
+
+track_atac_ratio <- DataTrack(
+  ratio_gr,
+  name           = "ATAC\nlog2(del/WT)",
+  type           = "histogram",
+  fill.histogram = "#E07B39",
+  col.histogram  = NA,
+  fontsize       = 10,
+  # Symmetric y-axis around 0
+  ylim           = c(-max(abs(ratio_scores), na.rm = TRUE),
+                      max(abs(ratio_scores), na.rm = TRUE))
+)
+```
+
+## ___Lorenzi et al., 2025___
+
+*Isogenic NB cell lines: SK-N-SH*
+
+```{r atac-profile-r, fig.height=5, fig.width=7}
+# R-based equivalent of deepTools computeMatrix + plotProfile
+# TSS-centered profile around ALCAM_1 EPD promoter (TSS at 105,366,908)
+ALCAM_TSS  <- 105366908L
+PROF_WIN   <- 5000L   # ±5kb
+BIN_SIZE   <- 50L
+
+get_binned_profile <- function(bw_paths, condition, chr = ALCAM_CHR,
+                                tss = ALCAM_TSS, window = PROF_WIN,
+                                bin_size = BIN_SIZE) {
+  region     <- GRanges(chr, IRanges(tss - window, tss + window))
+  bin_starts <- seq(tss - window, tss + window - bin_size + 1L, by = bin_size)
+  bins       <- GRanges(chr, IRanges(start = bin_starts, width = bin_size))
+  seqlevels(bins) <- chr  # ensure only chr3 is in seqlevels
+
+  rep_mat <- sapply(bw_paths, function(f) {
+    cov     <- import(f, which = region, as = "RleList")
+    cov_chr <- cov[chr]  # subset RleList to chr3 only → names(cov_chr) == seqlevels(bins)
+    ba      <- binnedAverage(bins, cov_chr, "avg")
+    ba$avg
+  })
+
+  data.frame(
+    position  = bin_starts - tss,
+    signal    = rowMeans(rep_mat, na.rm = TRUE),
+    condition = condition
+  )
+}
+
+p53_profile <- get_binned_profile(
+  file.path(ATAC_DIR, c("GSM9347420_p53_DMSO_REP1.mLb.clN.bigWig",
+                          "GSM9347424_p53_DMSO_REP2.mLb.clN.bigWig",
+                          "GSM9347428_p53_DMSO_REP3.mLb.clN.bigWig")),
+  condition = "p53 (ATRXwt)"
+)
+e6_profile <- get_binned_profile(
+  file.path(ATAC_DIR, c("GSM9347422_E6_DMSO_REP1.mLb.clN.bigWig",
+                          "GSM9347426_E6_DMSO_REP2.mLb.clN.bigWig",
+                          "GSM9347430_E6_DMSO_REP3.mLb.clN.bigWig")),
+  condition = "E6 (ATRXdel)"
+)
+
+profile_df <- rbind(p53_profile, e6_profile)
+profile_df$condition <- factor(profile_df$condition,
+                                levels = c("p53 (ATRXwt)", "E6 (ATRXdel)"))
+
+ATAC_PROFILE_COLORS <- c("p53 (ATRXwt)" = "#FAA21B", "E6 (ATRXdel)" = "#4f4e92")
+
+atac_profile_plot <- ggplot(profile_df, aes(x = position / 1000, y = signal,
+                                             color = condition)) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.5) +
+  scale_color_manual(values = ATAC_PROFILE_COLORS, name = "") +
+  scale_x_continuous(labels = function(x) paste0(x, " kb")) +
+  labs(
+    title    = "ATAC-seq signal around ALCAM TSS",
+    subtitle = "EPD promoter ALCAM_1 (chr3:105,366,908)",
+    x        = "Distance from TSS",
+    y        = "Mean ATAC-seq signal (bigWig)"
+  ) +
+  theme_pubr(base_size = 12) +
+  theme(legend.position = "top",
+        plot.title      = element_text(face = "bold", size = 13))
+
+atac_profile_plot
+
+pdf(paste0(params$out, "NK_project/figures/ALCAM_ATAC_TSS_profile.pdf"),
+    height = 5, width = 7)
+atac_profile_plot
+dev.off()
+```
+
+```{r atrx-profile-r, fig.height=5, fig.width=7}
+# ATRX ChIP-seq profile: CHLA90 vs SKNFI around ALCAM TSS
+chla90_atrx_profile <- get_binned_profile(
+  file.path(CHIP_DIR, "GSM3389350_CHLA90_ATRX.bigWig"),
+  condition = "CHLA90"
+)
+sknfi_atrx_profile <- get_binned_profile(
+  file.path(CHIP_DIR, "GSM3389345_SKNFI_ATRX.bigWig"),
+  condition = "SKNFI"
+)
+
+atrx_profile_df <- rbind(chla90_atrx_profile, sknfi_atrx_profile)
+atrx_profile_df$condition <- factor(atrx_profile_df$condition,
+                                     levels = c("CHLA90", "SKNFI"))
+
+atrx_profile_plot <- ggplot(atrx_profile_df,
+                              aes(x = position / 1000, y = signal, color = condition)) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.5) +
+  scale_color_manual(values = c("CHLA90" = "#4f4e92", "SKNFI" = "#FAA21B"), name = "") +
+  scale_x_continuous(labels = function(x) paste0(x, " kb")) +
+  labs(
+    title    = "ATRX ChIP-seq signal around ALCAM TSS",
+    subtitle = "Qadeer et al., 2019",
+    x        = "Distance from TSS",
+    y        = "ATRX ChIP-seq signal (bigWig)"
+  ) +
+  theme_pubr(base_size = 12) +
+  theme(legend.position = "top",
+        plot.title      = element_text(face = "bold", size = 13))
+
+atrx_profile_plot
+
+pdf(paste0(params$out, "NK_project/figures/ALCAM_ATRX_ChIP_TSS_profile.pdf"),
+    height = 5, width = 7)
+atrx_profile_plot
+dev.off()
+```
+
+## ___Qadeer et al., 2019___
+
+```{r histone-profile-r, fig.height=6, fig.width=7}
+# Histone mark profiles: CHLA90 vs SKNFI for H3K9ac, H3K27me3, H3K9me3
+histone_marks <- list(
+  list(file = "GSM2672020_CHLA90_H3K9ac.bigWig",   cell = "CHLA90", mark = "H3K9ac"),
+  list(file = "GSM2672010_SKNFI_H3K9ac.bigWig",    cell = "SKNFI",  mark = "H3K9ac"),
+  list(file = "GSM2672018_CHLA90_H3K27me3.bigWig",  cell = "CHLA90", mark = "H3K27me3"),
+  list(file = "GSM2672008_SKNFI_H3K27me3.bigWig",   cell = "SKNFI",  mark = "H3K27me3"),
+  list(file = "GSM2672019_CHLA90_H3K9me3.bigWig",   cell = "CHLA90", mark = "H3K9me3"),
+  list(file = "GSM2672009_SKNFI_H3K9me3.bigWig",    cell = "SKNFI",  mark = "H3K9me3")
+)
+
+histone_profile_df <- do.call(rbind, lapply(histone_marks, function(m) {
+  df       <- get_binned_profile(file.path(CHIP_DIR, m$file), condition = m$cell)
+  df$mark  <- m$mark
+  df
+}))
+
+histone_profile_df$mark      <- factor(histone_profile_df$mark,
+                                        levels = c("H3K9ac", "H3K27me3", "H3K9me3"))
+histone_profile_df$condition <- factor(histone_profile_df$condition,
+                                        levels = c("CHLA90", "SKNFI"))
+
+MARK_COLORS <- c("H3K9ac" = "#2a9d8f", "H3K27me3" = "#e63946", "H3K9me3" = "#8d8d8d")
+CELL_LTYPE  <- c("CHLA90" = "solid",   "SKNFI"    = "dashed")
+
+histone_profile_plot <- ggplot(histone_profile_df,
+                                aes(x = position / 1000, y = signal,
+                                    color = mark, linetype = condition)) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.4) +
+  scale_color_manual(values = MARK_COLORS, name = "Histone mark") +
+  scale_linetype_manual(values = CELL_LTYPE, name = "Cell line") +
+  scale_x_continuous(labels = function(x) paste0(x, " kb")) +
+  facet_wrap(~ mark, ncol = 1, scales = "free_y") +
+  labs(
+    title    = "Histone mark ChIP-seq signal around ALCAM TSS",
+    subtitle = "Qadeer et al., 2019 — CHLA90 (solid) vs SKNFI (dashed)",
+    x        = "Distance from TSS",
+    y        = "ChIP-seq signal (bigWig)"
+  ) +
+  theme_pubr(base_size = 12) +
+  theme(legend.position = "right",
+        strip.text      = element_text(face = "bold"),
+        plot.title      = element_text(face = "bold", size = 13))
+
+histone_profile_plot
+
+pdf(paste0(params$out, "NK_project/figures/ALCAM_histone_TSS_profile.pdf"),
+    height = 6, width = 7)
+histone_profile_plot
+dev.off()
+```
+
+```{r gviz-plot, fig.height=16, fig.width=10}
+all_tracks <- list(
+  ideo_track, axis_track, gene_track, epd_track, ccre_track,
+  track_chla90_atrx, track_sknfi_atrx,
+  track_atac_p53, track_atac_e6, track_atac_ratio,
+  track_h3k9ac, track_h3k27me3, track_h3k9me3
+)
+track_sizes <- c(0.5, 0.5, 1.5, 0.3, 0.5, 1.5, 1.5, 1.5, 1.5, 1.0, 1.5, 1.5, 1.5)
+
+plotTracks(all_tracks, from = ALCAM_START, to = ALCAM_END, sizes = track_sizes,
+           background.panel = "#FFFFFF", background.title = "#F0F0F0",
+           col.title = "#333333", fontsize = 10, title.width = 1.5)
+
+pdf(paste0(params$out, "NK_project/figures/ALCAM_genome_browser.pdf"),
+    height = 14, width = 10)
+plotTracks(all_tracks, from = ALCAM_START, to = ALCAM_END, sizes = track_sizes,
+           background.panel = "#FFFFFF", background.title = "#F0F0F0",
+           col.title = "#333333", fontsize = 10, title.width = 1.5)
+dev.off()
+```
+
+```{r gviz-promoter-zoom, fig.height=16, fig.width=8}
+# Zoom into ALCAM promoter region (±30 kb around EPD TSS at chr3:105,366,908)
+plotTracks(all_tracks, from = 105336000, to = 105400000, sizes = track_sizes,
+           background.panel = "#FFFFFF", background.title = "#F0F0F0",
+           col.title = "#333333", fontsize = 10, title.width = 1.5)
+
+pdf(paste0(params$out, "NK_project/figures/ALCAM_genome_browser_promoter_zoom.pdf"),
+    height = 16, width = 8)
+plotTracks(all_tracks, from = 105336000, to = 105400000, sizes = track_sizes,
+           background.panel = "#FFFFFF", background.title = "#F0F0F0",
+           col.title = "#333333", fontsize = 10, title.width = 1.5)
+dev.off()
+```
+
+# ___(alternative method) deepTools bigWig comparison in BASH___
+
+```{bash deeptools-install, eval=FALSE}
+# Install deepTools into the conda environment (run once)
+conda install -c bioconda deeptools -y
+```
+
+```{bash deeptools-compare, eval=FALSE}
+ATAC_DIR="/home/rstudio/mnt_data/nb_tumors/lorenzi2026.bulkATAC/GSE312501"
+CHIP_DIR="/home/rstudio/mnt_data/nb_tumors/qadeer2019.bulkRNA.bulkChIP/processed_data/GSE100148/GSE100148_RAW"
+OUT_DIR="/home/rstudio/mnt_out/NK_project/figures/deeptools"
+mkdir -p "$OUT_DIR"
+
+ALCAM_REGION="chr3:105280000:105640000"
+ALCAM_TSS="chr3 105366908"  # for reference-point matrix
+
+#  ATAC-seq: log2 ratio bigWig (p53 ATRXwt / E6 ATRXdel, merged replicates) 
+bigwigMerge \
+  "$ATAC_DIR/GSM9347420_p53_DMSO_REP1.mLb.clN.bigWig" \
+  "$ATAC_DIR/GSM9347424_p53_DMSO_REP2.mLb.clN.bigWig" \
+  "$ATAC_DIR/GSM9347428_p53_DMSO_REP3.mLb.clN.bigWig" \
+  -o "$OUT_DIR/p53_merged.bedGraph" 2>/dev/null &&
+  bedGraphToBigWig "$OUT_DIR/p53_merged.bedGraph" <(fetchChromSizes hg38) \
+    "$OUT_DIR/p53_merged.bw" || true
+
+bigwigCompare \
+  --bigwig1 "$ATAC_DIR/GSM9347420_p53_DMSO_REP1.mLb.clN.bigWig" \
+  --bigwig2 "$ATAC_DIR/GSM9347422_E6_DMSO_REP1.mLb.clN.bigWig" \
+  --operation log2 --pseudocount 1 \
+  --binSize 50 \
+  -o "$OUT_DIR/ATAC_log2_p53_vs_E6.bw"
+
+#  Profile plot: ATAC signal ±5kb around ALCAM TSS 
+computeMatrix reference-point \
+  --referencePoint TSS \
+  --regionsFileName <(echo -e "chr3\t105361908\t105371908\tALCAM\t0\t+") \
+  --scoreFileName \
+    "$ATAC_DIR/GSM9347420_p53_DMSO_REP1.mLb.clN.bigWig" \
+    "$ATAC_DIR/GSM9347424_p53_DMSO_REP2.mLb.clN.bigWig" \
+    "$ATAC_DIR/GSM9347428_p53_DMSO_REP3.mLb.clN.bigWig" \
+    "$ATAC_DIR/GSM9347422_E6_DMSO_REP1.mLb.clN.bigWig" \
+    "$ATAC_DIR/GSM9347426_E6_DMSO_REP2.mLb.clN.bigWig" \
+    "$ATAC_DIR/GSM9347430_E6_DMSO_REP3.mLb.clN.bigWig" \
+  --beforeRegionStartLength 5000 \
+  --afterRegionStartLength 5000 \
+  --binSize 50 \
+  --samplesLabel p53_R1 p53_R2 p53_R3 E6_R1 E6_R2 E6_R3 \
+  -o "$OUT_DIR/ATAC_ALCAM_matrix.gz"
+
+plotProfile \
+  --matrixFile "$OUT_DIR/ATAC_ALCAM_matrix.gz" \
+  --outFileName "$OUT_DIR/ATAC_ALCAM_profile.pdf" \
+  --samplesLabel "p53 (ATRXwt)" "p53 (ATRXwt)" "p53 (ATRXwt)" \
+                 "E6 (ATRXdel)" "E6 (ATRXdel)" "E6 (ATRXdel)" \
+  --colors "#7EA3AC" "#7EA3AC" "#7EA3AC" "#4f4e92" "#4f4e92" "#4f4e92" \
+  --plotTitle "ATAC-seq at ALCAM TSS" \
+  --averageType mean \
+  --perGroup \
+  --plotHeight 5 --plotWidth 7
+
+#  ChIP-seq profile: ATRX + histone marks 
+computeMatrix reference-point \
+  --referencePoint TSS \
+  --regionsFileName <(echo -e "chr3\t105361908\t105371908\tALCAM\t0\t+") \
+  --scoreFileName \
+    "$CHIP_DIR/GSM3389350_CHLA90_ATRX.bigWig" \
+    "$CHIP_DIR/GSM3389345_SKNFI_ATRX.bigWig" \
+    "$CHIP_DIR/GSM2672020_CHLA90_H3K9ac.bigWig" \
+    "$CHIP_DIR/GSM2672018_CHLA90_H3K27me3.bigWig" \
+    "$CHIP_DIR/GSM2672019_CHLA90_H3K9me3.bigWig" \
+  --beforeRegionStartLength 5000 \
+  --afterRegionStartLength 5000 \
+  --binSize 50 \
+  -o "$OUT_DIR/ChIP_ALCAM_matrix.gz"
+
+plotProfile \
+  --matrixFile "$OUT_DIR/ChIP_ALCAM_matrix.gz" \
+  --outFileName "$OUT_DIR/ChIP_ALCAM_profile.pdf" \
+  --samplesLabel "CHLA90 ATRX" "SKNFI ATRX" "CHLA90 H3K9ac" "CHLA90 H3K27me3" "CHLA90 H3K9me3" \
+  --colors "#4f4e92" "#7b5ea7" "#2a9d8f" "#e63946" "#8d8d8d" \
+  --plotTitle "ChIP-seq at ALCAM TSS" \
+  --plotHeight 5 --plotWidth 7
+```
+
+
+
+
+

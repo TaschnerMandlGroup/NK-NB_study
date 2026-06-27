@@ -1,0 +1,1100 @@
+---
+title: "NK project: bulk ATAC-seq - NB isogenic cell lines E6 (ATRXdel) vs p53 (ATRXwt)"
+author: "Dr. Sara Wernig-Zorc"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  data_dir: "/home/rstudio/mnt_data/nb_tumors/lorenzi2026.bulkATAC/GSE312501"
+  nk_tables: "/home/rstudio/mnt_out/NK_project/tables/"
+  out:       "/home/rstudio/mnt_out/NK_project/"
+  tss_window: 2000
+---
+
+**PROJECT DESCRIPTION**
+
+Validation of NK cell finding direction in an isogenic neuroblastoma cell line system.
+E6 = SK-N-SH ATRXdel (ATRX-deleted); p53 = SK-N-SH ATRXwt (ATRX wild-type).
+Genome: hg38 (UCSC chromosome naming).
+
+Question: do TFs and genes found to be differentially expressed or active in NK cells
+from ATRXdel patients (vs. ATRXwt/control) also show concordant chromatin accessibility
+changes at their loci in the isogenic ATRXdel NB cell line?
+
+Samples (Lorenzi 2026, GSE312501):
+  E6:    ATRXdel clone, DMSO (n=3) + RA (n=3)
+  p53:   ATRXwt clone,  DMSO (n=3) + RA (n=3)
+  CHLA90, SKNMM: included in QC for context.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE,
+                      error = FALSE,
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+options(future.globals.maxSize = 8 * 10^9)
+print(params)
+```
+
+```{r include=FALSE}
+source("/home/rstudio/00_NK_paper_setup.R")
+source("/home/rstudio/00_NK_paper_utils.R")
+```
+
+# ___Load packages___
+
+```{r include=FALSE}
+suppressPackageStartupMessages({
+  library(rtracklayer)
+  library(GenomicRanges)
+  library(IRanges)
+  library(limma)
+  library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+  library(org.Hs.eg.db)
+  library(AnnotationDbi)
+  library(ggrepel)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(EnhancedVolcano)
+  library(tidyverse)
+  library(purrr)
+})
+```
+
+```{r}
+pub_theme <- theme_classic(base_size = 9) +
+  theme(
+    axis.line        = element_line(linewidth = 0.4, color = "black"),
+    axis.ticks       = element_line(linewidth = 0.4, color = "black"),
+    axis.text        = element_text(size = 8, color = "black"),
+    axis.title       = element_text(size = 9, color = "black"),
+    plot.title       = element_text(size = 10, face = "bold"),
+    plot.subtitle    = element_text(size = 8),
+    legend.key.size  = unit(3, "mm"),
+    legend.text      = element_text(size = 8),
+    legend.title     = element_text(size = 9),
+    strip.background = element_blank(),
+    strip.text       = element_text(size = 9)
+  )
+theme_set(pub_theme)
+
+# Cell-line colors (map onto project palette where logical)
+COL_ATRX <- c(
+  "ATRXdel" = unname(COLOR_CODE_GROUP["ATRXdel"]),  # "#4f4e92"
+  "ATRXwt"  = unname(COLOR_CODE_GROUP["control"])    # "#7EA3AC"
+)
+COL_LINE <- c(
+  "p53"    = unname(COLOR_CODE_GROUP["control"]),
+  "E6"     = unname(COLOR_CODE_GROUP["ATRXdel"]),
+  "CHLA90" = unname(COLOR_CODE_GROUP["MYCNamp"]),
+  "SKNMM"  = unname(COLOR_CODE_GROUP["ATRXwtMYCNwt"])
+)
+COL_TREAT <- c("DMSO" = "gray30", "RA" = "#C56A30")
+```
+
+# ___Sample metadata___
+
+```{r}
+bw_files   <- list.files(params$data_dir, pattern = "\\.bigWig$",        full.names = TRUE)
+peak_files <- list.files(params$data_dir, pattern = "\\.broadPeak\\.gz$", full.names = TRUE)
+
+parse_fname <- function(fnames) {
+  base <- gsub("^GSM[0-9]+_", "", basename(fnames))
+  base <- gsub("\\.mLb.*$", "", base)
+  parts <- strsplit(base, "_")
+  data.frame(
+    file      = fnames,
+    sample_id = base,
+    cell_line = sapply(parts, `[[`, 1),
+    treatment = sapply(parts, `[[`, 2),
+    replicate = sapply(parts, `[[`, 3),
+    stringsAsFactors = FALSE
+  )
+}
+
+meta_bw   <- parse_fname(bw_files)
+meta_peak <- parse_fname(peak_files)
+
+meta_bw$ATRX <- ifelse(meta_bw$cell_line == "E6", "ATRXdel",
+                 ifelse(meta_bw$cell_line == "p53", "ATRXwt", NA))
+meta_bw$ATRX <- factor(meta_bw$ATRX, levels = c("ATRXwt", "ATRXdel"))
+
+cat("BigWig files found:", nrow(meta_bw), "\n")
+print(table(meta_bw$cell_line, meta_bw$treatment))
+```
+
+# ___Consensus peak set (E6 + p53 DMSO)___
+
+Build one merged peak set from all DMSO E6 and p53 replicates so the differential
+analysis uses exactly the same genomic windows for both conditions.
+
+```{r}
+import_broadpeak <- function(peak_file) {
+  df <- read.table(peak_file, header = FALSE,
+                   col.names = c("chr","start","end","name","score","strand",
+                                 "signalValue","pValue","qValue"))
+  std_chroms <- paste0("chr", c(1:22, "X", "Y", "M"))
+  df <- df[df$chr %in% std_chroms, ]
+  GRanges(seqnames = df$chr,
+          ranges   = IRanges(start = df$start + 1L, end = df$end),
+          score    = df$signalValue)
+}
+
+focal_peaks_meta <- meta_peak[meta_peak$cell_line %in% c("E6","p53") &
+                               meta_peak$treatment == "DMSO", ]
+
+peak_list <- lapply(focal_peaks_meta$file, import_broadpeak)
+names(peak_list) <- focal_peaks_meta$sample_id
+
+consensus_peaks <- GenomicRanges::reduce(unlist(GRangesList(peak_list)))
+
+std_chroms <- paste0("chr", c(1:22, "X", "Y", "M"))
+consensus_peaks <- consensus_peaks[as.character(seqnames(consensus_peaks)) %in% std_chroms]
+seqlevels(consensus_peaks) <- seqlevelsInUse(consensus_peaks)
+
+consensus_peaks$peak_id <- paste0("peak_", seq_len(length(consensus_peaks)))
+
+cat("Consensus peaks (E6 + p53 DMSO):", length(consensus_peaks), "\n")
+hist(width(consensus_peaks), breaks = 200, main = "Peak width distribution",
+     xlab = "Peak width (bp)", col = "gray70", border = NA)
+abline(v = median(width(consensus_peaks)), col = "#4f4e92", lwd = 2, lty = 2)
+```
+
+# ___Score peaks from bigWig___
+
+For each sample, compute mean bigWig coverage within each consensus peak.
+Only DMSO E6 and p53 samples are used for the primary differential analysis;
+all 24 samples are scored for the QC PCA.
+
+```{r}
+score_bw_at_peaks <- function(bw_path, peaks) {
+  # Use bare GRanges (no seqinfo) for the query to avoid seqinfo validation
+  query <- GRanges(seqnames = as.character(seqnames(peaks)), ranges = ranges(peaks))
+  bw_gr <- tryCatch(
+    rtracklayer::import.bw(bw_path, which = query),
+    error = function(e) {
+      message("ERROR importing ", basename(bw_path), ": ", conditionMessage(e))
+      NULL
+    }
+  )
+  if (is.null(bw_gr) || length(bw_gr) == 0L) {
+    message("No signal returned from ", basename(bw_path))
+    return(rep(0, length(peaks)))
+  }
+  # Weighted mean: sum(score * overlap_width) / peak_width
+  hits   <- findOverlaps(query, bw_gr)
+  result <- rep(0.0, length(peaks))
+  if (length(hits) > 0L) {
+    ov_w <- width(pintersect(query[queryHits(hits)], bw_gr[subjectHits(hits)],
+                              ignore.strand = TRUE))
+    agg  <- tapply(bw_gr$score[subjectHits(hits)] * ov_w, queryHits(hits), sum)
+    qi   <- as.integer(names(agg))
+    result[qi] <- as.numeric(agg) / width(peaks)[qi]
+  }
+  result
+}
+
+# Verify chromosome names match between peaks and bigWig files
+bw_chroms <- seqlevels(rtracklayer::BigWigFile(bw_files[1]))
+cat("BigWig chromosomes (first 10):", paste(head(bw_chroms, 10), collapse = ", "), "\n")
+cat("Peak chromosomes:", paste(seqlevels(consensus_peaks), collapse = ", "), "\n")
+cat("Matching chromosomes:",
+    length(intersect(bw_chroms, seqlevels(consensus_peaks))), "\n")
+
+cat("Scoring", nrow(meta_bw), "bigWig files at", length(consensus_peaks),
+    "peaks — this may take several minutes...\n")
+
+signal_mat <- vapply(setNames(meta_bw$file, meta_bw$sample_id),
+                     score_bw_at_peaks, peaks = consensus_peaks,
+                     FUN.VALUE = numeric(length(consensus_peaks)))
+
+# Replace any NAs with 0 (peaks with no coverage in a sample)
+signal_mat[is.na(signal_mat)] <- 0
+
+cat("Signal matrix:", nrow(signal_mat), "peaks ×", ncol(signal_mat), "samples\n")
+cat("Fraction of peaks with zero signal across all samples:",
+    round(mean(rowSums(signal_mat) == 0), 3), "\n")
+
+# Remove peaks with zero signal in all samples; re-index to 1..N
+keep <- rowSums(signal_mat) > 0
+signal_mat      <- signal_mat[keep, ]
+consensus_peaks <- consensus_peaks[keep]
+rownames(signal_mat) <- seq_len(nrow(signal_mat))   # 1, 2, ..., N — matches queryHits() output
+cat("Peaks after removing zero-signal peaks:", length(consensus_peaks), "\n")
+```
+
+# ___QC: all 24 samples___
+
+```{r fig.height=4, fig.width=5}
+lib_sizes <- colSums(signal_mat)
+lib_df <- data.frame(
+  sample_id = names(lib_sizes),
+  total_signal = lib_sizes,
+  cell_line = meta_bw$cell_line[match(names(lib_sizes), meta_bw$sample_id)],
+  treatment = meta_bw$treatment[match(names(lib_sizes), meta_bw$sample_id)]
+)
+
+p_libsize <- ggplot(lib_df, aes(x = sample_id, y = total_signal / 1e6,
+                                 fill = cell_line, alpha = treatment)) +
+  geom_col(width = 0.7) +
+  scale_fill_manual(values = COL_LINE) +
+  scale_alpha_manual(values = c("DMSO" = 1, "RA" = 0.55)) +
+  labs(title = "Total ATAC signal per sample",
+       x = NULL, y = "Total signal (× 10⁶)", fill = "cell line", alpha = "treatment") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+
+p_libsize
+
+pdf(paste0(params$out, "figures/bulkATAC_NBcelllines_library_sizes.pdf"),
+    height = 4, width = 5, useDingbats = FALSE)
+p_libsize; dev.off()
+```
+
+```{r fig.height=4.5, fig.width=5}
+# PCA of log2-normalised signal across all 24 samples
+log2_signal <- log2(signal_mat + 0.01)
+
+pca_all  <- prcomp(t(log2_signal), scale. = TRUE, center = TRUE)
+var_expl <- summary(pca_all)$importance[2, ] * 100
+
+pca_df <- data.frame(
+  PC1       = pca_all$x[, 1], PC2 = pca_all$x[, 2],
+  sample_id = colnames(log2_signal)
+) %>%
+  left_join(meta_bw %>% dplyr::select(sample_id, cell_line, treatment), by = "sample_id")
+
+p_pca_all <- ggplot(pca_df, aes(x = PC1, y = PC2, color = cell_line, shape = treatment,
+                                  label = sample_id)) +
+  geom_point(size = 3, alpha = 0.9) +
+  ggrepel::geom_text_repel(size = 2.5, max.overlaps = 20) +
+  scale_color_manual(values = COL_LINE) +
+  scale_shape_manual(values = c("DMSO" = 16, "RA" = 17)) +
+  labs(title    = "PCA: all bulk ATAC-seq samples",
+       subtitle = paste0("PC1 ", round(var_expl[1], 1), "%, PC2 ", round(var_expl[2], 1), "%"),
+       x = paste0("PC1 (", round(var_expl[1], 1), "% var)"),
+       y = paste0("PC2 (", round(var_expl[2], 1), "% var)"),
+       color = "cell line", shape = "treatment")
+
+p_pca_all
+
+pdf(paste0(params$out, "figures/bulkATAC_NBcelllines_PCA_allSamples.pdf"),
+    height = 4.5, width = 5, useDingbats = FALSE)
+p_pca_all; dev.off()
+```
+
+# ___Differential accessibility: E6 (ATRXdel) vs p53 (ATRXwt) — DMSO___
+
+```{r}
+dmso_meta <- meta_bw[meta_bw$cell_line %in% c("E6", "p53") &
+                      meta_bw$treatment == "DMSO", ]
+dmso_meta$ATRX <- factor(ifelse(dmso_meta$cell_line == "E6", "ATRXdel", "ATRXwt"),
+                          levels = c("ATRXwt", "ATRXdel"))
+
+signal_dmso <- log2_signal[, dmso_meta$sample_id]
+
+design <- model.matrix(~ ATRX, data = dmso_meta)
+fit    <- lmFit(signal_dmso, design)
+fit    <- eBayes(fit)
+
+dap_dmso <- topTable(fit, coef = "ATRXATRXdel", number = Inf, sort.by = "P") %>%
+  tibble::rownames_to_column("peak_id") %>%
+  mutate(
+    peak_id   = as.integer(peak_id),
+    chr       = as.character(seqnames(consensus_peaks))[peak_id],
+    start     = start(consensus_peaks)[peak_id],
+    end       = end(consensus_peaks)[peak_id],
+    sig       = adj.P.Val < 0.05 & abs(logFC) > 1,
+    direction = case_when(
+      sig & logFC > 0 ~ "more open ATRXdel",
+      sig & logFC < 0 ~ "more open ATRXwt",
+      TRUE            ~ "NS"
+    )
+  )
+
+cat("DAP summary (adj.P < 0.05, |log2FC| > 1):\n")
+print(table(dap_dmso$direction))
+
+write.table(dap_dmso, sep = "\t", row.names = FALSE, quote = FALSE,
+            file = paste0(params$out,
+                          "tables/bulkATAC_NBcelllines_E6-vs-p53_DMSO_DAP_2026-06-25.csv"))
+```
+
+## ___Volcano: E6 vs p53 DMSO___
+
+```{r fig.height=5, fig.width=4}
+p_volcano_dmso <- ggplot(dap_dmso, aes(x = logFC, y = -log10(adj.P.Val),
+                                        color = direction)) +
+  geom_point(size = 0.8, alpha = 0.5) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "gray60", linewidth = 0.35) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray60", linewidth = 0.35) +
+  scale_color_manual(values = c(
+    "more open ATRXdel" = COL_ATRX["ATRXdel"],
+    "more open ATRXwt"  = COL_ATRX["ATRXwt"],
+    "NS"                = "gray80"
+  )) +
+  labs(title    = "Differential chromatin accessibility",
+       subtitle = "E6 (ATRXdel) vs p53 (ATRXwt) — DMSO",
+       x        = "log2 fold change (E6 / p53)",
+       y        = "-log10 (adj. p-value)",
+       color    = NULL) +
+  theme(legend.position = "top")
+
+p_volcano_dmso
+
+pdf(paste0(params$out, "figures/bulkATAC_NBcelllines_E6-vs-p53_DMSO_volcano.pdf"),
+    height = 5, width = 4, useDingbats = FALSE)
+p_volcano_dmso; dev.off()
+```
+
+## ___MA plot___
+
+```{r fig.height=4, fig.width=4}
+dap_dmso$AveExpr_raw <- 2^dap_dmso$AveExpr
+
+p_ma <- ggplot(dap_dmso, aes(x = AveExpr, y = logFC, color = direction)) +
+  geom_point(size = 0.6, alpha = 0.4) +
+  geom_hline(yintercept = c(-1, 0, 1), linetype = c("dashed","solid","dashed"),
+             color = c("gray60","black","gray60"), linewidth = c(0.35,0.5,0.35)) +
+  scale_color_manual(values = c(
+    "more open ATRXdel" = COL_ATRX["ATRXdel"],
+    "more open ATRXwt"  = COL_ATRX["ATRXwt"],
+    "NS"                = "gray80"
+  )) +
+  labs(title = "MA plot: E6 vs p53 DMSO",
+       x = "Average log2 expression", y = "log2 FC (E6 / p53)", color = NULL) +
+  theme(legend.position = "top")
+
+p_ma
+
+pdf(paste0(params$out, "figures/bulkATAC_NBcelllines_E6-vs-p53_DMSO_MAplot.pdf"),
+    height = 4, width = 4, useDingbats = FALSE)
+p_ma; dev.off()
+```
+
+# ___Annotate peaks to nearest gene___
+
+Map each consensus peak to the nearest TSS (TxDb hg38, ±50 kb cutoff).
+Peaks within the TSS window (±`r params$tss_window` bp) are labelled "promoter".
+
+```{r}
+txdb  <- TxDb.Hsapiens.UCSC.hg38.knownGene
+genes_hg38 <- genes(txdb)
+
+gene_symbols <- mapIds(org.Hs.eg.db, keys = genes_hg38$gene_id,
+                       keytype = "ENTREZID", column = "SYMBOL",
+                       multiVals = "first")
+genes_hg38$symbol <- gene_symbols
+
+# Strand-aware TSS
+tss_pos <- ifelse(as.character(strand(genes_hg38)) == "+",
+                  start(genes_hg38), end(genes_hg38))
+tss_gr <- GRanges(seqnames = seqnames(genes_hg38),
+                  ranges   = IRanges(start = tss_pos, width = 1),
+                  gene_id  = genes_hg38$gene_id,
+                  symbol   = genes_hg38$symbol)
+
+# For each peak, find nearest TSS
+dist_to_tss <- distanceToNearest(consensus_peaks, tss_gr, ignore.strand = TRUE)
+
+peak_anno <- data.frame(
+  peak_id     = queryHits(dist_to_tss),          # integer index into consensus_peaks
+  gene_id     = tss_gr$gene_id[subjectHits(dist_to_tss)],
+  gene_symbol = tss_gr$symbol[subjectHits(dist_to_tss)],
+  dist_to_tss = mcols(dist_to_tss)$distance
+) %>%
+  filter(dist_to_tss <= 50000) %>%
+  mutate(region = case_when(
+    dist_to_tss <= params$tss_window ~ "promoter",
+    dist_to_tss <= 10000             ~ "gene-proximal",
+    TRUE                             ~ "distal"
+  ))
+
+# Merge annotation into DAP table
+dap_dmso <- dap_dmso %>%
+  left_join(peak_anno %>%
+              group_by(peak_id) %>%
+              slice_min(dist_to_tss, n = 1, with_ties = FALSE),
+            by = "peak_id")
+
+cat("Peak region breakdown:\n")
+print(table(peak_anno$region))
+cat("\nTop DAPs with gene annotation:\n")
+dap_dmso %>% filter(sig) %>% arrange(adj.P.Val) %>%
+  dplyr::select(gene_symbol, logFC, adj.P.Val, region, chr, start, end) %>%
+  head(20)
+```
+
+# ___Pathway analysis: chromatin accessibility signatures (DMSO)___
+
+Gene-set over-representation (ORA) for the six accessibility gene sets (direction × region),
+plus GSEA on the full ranked gene list.
+
+```{r include=FALSE}
+suppressPackageStartupMessages({
+  library(clusterProfiler)
+  library(DOSE)
+  library(enrichplot)
+  library(msigdbr)
+})
+
+hallmark_genes_H <- msigdbr(species = "human", category = "H") %>%
+  dplyr::select(gs_name, entrez_gene)
+
+geneUniverse_atac <- unique(na.omit(peak_anno$gene_symbol))
+geneUniverse_entrez <- na.omit(map_gene_to_entrez(geneUniverse_atac))
+```
+
+## ___Gene sets: direction × region___
+
+```{r}
+# All sig DAPs annotated (joined in dap_dmso)
+sig_dap <- dap_dmso %>%
+  filter(sig, !is.na(gene_symbol), !is.na(region))
+
+# Define 6 gene sets
+gene_sets_atac <- list(
+  ATRXdel_promoter  = unique(sig_dap$gene_symbol[sig_dap$direction == "more open ATRXdel" & sig_dap$region == "promoter"]),
+  ATRXdel_proximal  = unique(sig_dap$gene_symbol[sig_dap$direction == "more open ATRXdel" & sig_dap$region == "gene-proximal"]),
+  ATRXdel_distal    = unique(sig_dap$gene_symbol[sig_dap$direction == "more open ATRXdel" & sig_dap$region == "distal"]),
+  ATRXwt_promoter   = unique(sig_dap$gene_symbol[sig_dap$direction == "more open ATRXwt"  & sig_dap$region == "promoter"]),
+  ATRXwt_proximal   = unique(sig_dap$gene_symbol[sig_dap$direction == "more open ATRXwt"  & sig_dap$region == "gene-proximal"]),
+  ATRXwt_distal     = unique(sig_dap$gene_symbol[sig_dap$direction == "more open ATRXwt"  & sig_dap$region == "distal"])
+)
+
+cat("Gene set sizes:\n")
+sapply(gene_sets_atac, length)
+```
+
+## ___Enrichment helpers___
+
+```{r}
+run_enrichment <- function(gene_symbols,
+                           type = c("BP", "MF", "CC", "KEGG", "HALLMARK"),
+                           term2gene = NULL,
+                           label = "") {
+  type <- match.arg(type)
+  if (length(gene_symbols) == 0) {
+    message(label, ": no input genes — skipping"); return(invisible(NULL))
+  }
+  entrez_ids <- na.omit(map_gene_to_entrez(gene_symbols))
+  if (length(entrez_ids) == 0) {
+    message(label, ": no valid Entrez IDs — skipping"); return(invisible(NULL))
+  }
+  tryCatch({
+    if (type %in% c("BP", "MF", "CC")) {
+      enrichGO(gene = entrez_ids, universe = geneUniverse_entrez,
+               ont = type, OrgDb = "org.Hs.eg.db",
+               readable = TRUE, pAdjustMethod = "bonferroni",
+               pvalueCutoff = 0.05)
+    } else if (type == "KEGG") {
+      enrichKEGG(gene = entrez_ids, universe = geneUniverse_entrez,
+                 organism = "hsa", keyType = "kegg",
+                 pAdjustMethod = "bonferroni", pvalueCutoff = 0.05)
+    } else if (type == "HALLMARK") {
+      enricher(gene = entrez_ids, universe = as.character(geneUniverse_entrez),
+               TERM2GENE = term2gene,
+               pAdjustMethod = "bonferroni", pvalueCutoff = 0.05)
+    }
+  }, error = function(e) {
+    message(label, " (", type, ") error: ", conditionMessage(e)); NULL
+  })
+}
+
+show_enrichment <- function(result, label = "", out_path = NULL,
+                            out_w = 5, out_h = 4.5) {
+  if (is.null(result) || nrow(result@result) == 0) {
+    message("0 enriched terms — ", label); return(invisible(NULL))
+  }
+  signif_rows <- result@result[result@result$p.adjust < 0.05, ]
+  if (nrow(signif_rows) == 0) {
+    message("0 terms with bonferroni p.adjust < 0.05 — ", label)
+    return(invisible(NULL))
+  }
+  p <- dotplot(result, showCategory = 20) +
+    ggtitle(label) + pub_theme +
+    theme(axis.text.y = element_text(size = 7))
+  print(p)
+  if (!is.null(out_path)) {
+    pdf(out_path, height = out_h, width = out_w, useDingbats = FALSE)
+    print(p); dev.off()
+  }
+  invisible(result)
+}
+```
+
+## ___ORA: ATRXdel open — promoter___
+
+```{r fig.height=3, fig.width=3}
+genes <- gene_sets_atac$ATRXdel_promoter
+show_enrichment(run_enrichment(genes, "BP",       label = "ATRXdel open — promoter: GO-BP"),
+                "ATRXdel open — promoter: GO-BP",
+                out_path = paste0(params$out, "figures/bulkATAC_ATRXdel-promoter_GO-BP.pdf"))
+show_enrichment(run_enrichment(genes, "MF",       label = "ATRXdel open — promoter: GO-MF"),
+                "ATRXdel open — promoter: GO-MF")
+show_enrichment(run_enrichment(genes, "KEGG",     label = "ATRXdel open — promoter: KEGG"),
+                "ATRXdel open — promoter: KEGG",
+                out_path = paste0(params$out, "figures/bulkATAC_ATRXdel-promoter_KEGG.pdf"))
+show_enrichment(run_enrichment(genes, "HALLMARK", label = "ATRXdel open — promoter: HALLMARK",
+                               term2gene = hallmark_genes_H),
+                "ATRXdel open — promoter: HALLMARK",
+                out_path = paste0(params$out, "figures/bulkATAC_ATRXdel-promoter_HALLMARK.pdf"))
+```
+
+## ___ORA: ATRXdel open — gene-proximal___
+
+```{r fig.height=3, fig.width=3}
+genes <- gene_sets_atac$ATRXdel_proximal
+show_enrichment(run_enrichment(genes, "BP",       label = "ATRXdel open — proximal: GO-BP"),
+                "ATRXdel open — proximal: GO-BP")
+show_enrichment(run_enrichment(genes, "KEGG",     label = "ATRXdel open — proximal: KEGG"),
+                "ATRXdel open — proximal: KEGG")
+show_enrichment(run_enrichment(genes, "HALLMARK", label = "ATRXdel open — proximal: HALLMARK",
+                               term2gene = hallmark_genes_H),
+                "ATRXdel open — proximal: HALLMARK")
+```
+
+## ___ORA: ATRXdel open — distal___
+
+```{r fig.height=3, fig.width=3}
+genes <- gene_sets_atac$ATRXdel_distal
+show_enrichment(run_enrichment(genes, "BP",       label = "ATRXdel open — distal: GO-BP"),
+                "ATRXdel open — distal: GO-BP")
+show_enrichment(run_enrichment(genes, "KEGG",     label = "ATRXdel open — distal: KEGG"),
+                "ATRXdel open — distal: KEGG")
+show_enrichment(run_enrichment(genes, "HALLMARK", label = "ATRXdel open — distal: HALLMARK",
+                               term2gene = hallmark_genes_H),
+                "ATRXdel open — distal: HALLMARK")
+```
+
+## ___ORA: ATRXwt open — promoter___
+
+```{r fig.height=3, fig.width=3}
+genes <- gene_sets_atac$ATRXwt_promoter
+show_enrichment(run_enrichment(genes, "BP",       label = "ATRXwt open — promoter: GO-BP"),
+                "ATRXwt open — promoter: GO-BP",
+                out_path = paste0(params$out, "figures/bulkATAC_ATRXwt-promoter_GO-BP.pdf"))
+show_enrichment(run_enrichment(genes, "MF",       label = "ATRXwt open — promoter: GO-MF"),
+                "ATRXwt open — promoter: GO-MF")
+show_enrichment(run_enrichment(genes, "KEGG",     label = "ATRXwt open — promoter: KEGG"),
+                "ATRXwt open — promoter: KEGG",
+                out_path = paste0(params$out, "figures/bulkATAC_ATRXwt-promoter_KEGG.pdf"))
+show_enrichment(run_enrichment(genes, "HALLMARK", label = "ATRXwt open — promoter: HALLMARK",
+                               term2gene = hallmark_genes_H),
+                "ATRXwt open — promoter: HALLMARK",
+                out_path = paste0(params$out, "figures/bulkATAC_ATRXwt-promoter_HALLMARK.pdf"))
+```
+
+## ___ORA: ATRXwt open — gene-proximal___
+
+```{r fig.height=3, fig.width=3}
+genes <- gene_sets_atac$ATRXwt_proximal
+show_enrichment(run_enrichment(genes, "BP",       label = "ATRXwt open — proximal: GO-BP"),
+                "ATRXwt open — proximal: GO-BP")
+show_enrichment(run_enrichment(genes, "KEGG",     label = "ATRXwt open — proximal: KEGG"),
+                "ATRXwt open — proximal: KEGG")
+show_enrichment(run_enrichment(genes, "HALLMARK", label = "ATRXwt open — proximal: HALLMARK",
+                               term2gene = hallmark_genes_H),
+                "ATRXwt open — proximal: HALLMARK")
+```
+
+## ___ORA: ATRXwt open — distal___
+
+```{r fig.height=3, fig.width=3}
+genes <- gene_sets_atac$ATRXwt_distal
+show_enrichment(run_enrichment(genes, "BP",       label = "ATRXwt open — distal: GO-BP"),
+                "ATRXwt open — distal: GO-BP")
+show_enrichment(run_enrichment(genes, "KEGG",     label = "ATRXwt open — distal: KEGG"),
+                "ATRXwt open — distal: KEGG")
+show_enrichment(run_enrichment(genes, "HALLMARK", label = "ATRXwt open — distal: HALLMARK",
+                               term2gene = hallmark_genes_H),
+                "ATRXwt open — distal: HALLMARK")
+```
+
+## ___GSEA: ranked by logFC at best peak per gene___
+
+Rank all annotated genes by the logFC of their best (most significant) associated DAP.
+Positive rank = more open in ATRXdel; negative = more open in ATRXwt.
+
+```{r fig.height=3, fig.width=4}
+# For each gene, take the peak with the lowest adj.P.Val
+gene_ranked <- dap_dmso %>%
+  filter(!is.na(gene_symbol)) %>%
+  group_by(gene_symbol) %>%
+  slice_min(adj.P.Val, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(desc(logFC))
+
+ranked_vec <- setNames(gene_ranked$logFC, gene_ranked$gene_symbol)
+ranked_entrez <- na.omit(map_gene_to_entrez(names(ranked_vec)))
+ranked_vec_entrez <- ranked_vec[match(names(ranked_entrez), names(ranked_vec))]
+names(ranked_vec_entrez) <- as.character(ranked_entrez)
+ranked_vec_entrez <- sort(ranked_vec_entrez, decreasing = TRUE)
+ranked_vec_entrez <- ranked_vec_entrez[!duplicated(names(ranked_vec_entrez))]
+
+cat("Genes in ranked list:", length(ranked_vec_entrez), "\n")
+
+# GSEA — Hallmark
+hallmark_gsea_list <- msigdbr(species = "human", category = "H") %>%
+  dplyr::select(gs_name, entrez_gene) %>%
+  mutate(entrez_gene = as.character(entrez_gene))
+
+gsea_hallmark <- tryCatch(
+  GSEA(geneList  = ranked_vec_entrez,
+       TERM2GENE = hallmark_gsea_list,
+       pvalueCutoff = 0.05,
+       pAdjustMethod = "bonferroni",
+       verbose = FALSE),
+  error = function(e) { message("GSEA Hallmark error: ", conditionMessage(e)); NULL }
+)
+
+if (!is.null(gsea_hallmark) && nrow(gsea_hallmark@result) > 0) {
+  p_gsea_h <- dotplot(gsea_hallmark, showCategory = 20, split = ".sign") +
+    facet_grid(. ~ .sign) +
+    ggtitle("GSEA — Hallmark (ranked by ATAC logFC, ATRXdel vs ATRXwt)") +
+    pub_theme + theme(axis.text.y = element_text(size = 7))
+  print(p_gsea_h)
+  pdf(paste0(params$out, "figures/bulkATAC_GSEA_Hallmark_ATRXdel-vs-ATRXwt.pdf"),
+      height = 5, width = 10, useDingbats = FALSE)
+  print(p_gsea_h); dev.off()
+} else {
+  message("No significant Hallmark GSEA terms (adj.p < 0.05)")
+}
+
+# GSEA — GO biological process
+gsea_go_bp <- tryCatch(
+  gseGO(geneList     = ranked_vec_entrez,
+        OrgDb        = org.Hs.eg.db,
+        ont          = "BP",
+        pvalueCutoff = 0.05,
+        pAdjustMethod = "bonferroni",
+        verbose = FALSE),
+  error = function(e) { message("gseGO BP error: ", conditionMessage(e)); NULL }
+)
+
+if (!is.null(gsea_go_bp) && nrow(gsea_go_bp@result) > 0) {
+  p_gsea_go <- dotplot(gsea_go_bp, showCategory = 20, split = ".sign") +
+    facet_grid(. ~ .sign) +
+    ggtitle("GSEA — GO-BP (ranked by ATAC logFC)") +
+    pub_theme + theme(axis.text.y = element_text(size = 7))
+  print(p_gsea_go)
+  pdf(paste0(params$out, "figures/bulkATAC_GSEA_GO-BP_ATRXdel-vs-ATRXwt.pdf"),
+      height = 5, width = 10, useDingbats = FALSE)
+  print(p_gsea_go); dev.off()
+} else {
+  message("No significant GO-BP GSEA terms (adj.p < 0.05)")
+}
+```
+
+# ___TF footprinting: TOBIAS (ATRXdel vs ATRXwt — DMSO)___
+
+TOBIAS (Transcription Factor Occupancy prediction By Investigation of ATAC-seq Signal)
+predicts differential TF binding between conditions from ATAC-seq data.
+Pipeline: ScoreBigwig (footprint scores from bigWig) → BINDetect (ATRXdel vs ATRXwt comparison).
+Only bigWig files are available (no BAMs), so ATACorrect is skipped.
+Conditions compared: E6 | ATRXdel vs. p53 | ATRXwt (DMSO only).
+TFs analysed: the `TFs` vector defined in `00_NK_paper_setup.R`.
+
+```{r tobias-setup}
+suppressPackageStartupMessages(library(TFBSTools))
+suppressPackageStartupMessages(library(JASPAR2020))
+
+tobias_dir <- paste0(params$out, "tobias/")
+motif_dir  <- file.path(tobias_dir, "motifs")
+score_dir  <- file.path(tobias_dir, "ScoreBigwig")
+detect_dir <- file.path(tobias_dir, "BINDetect")
+dir.create(motif_dir,  showWarnings = FALSE, recursive = TRUE)
+dir.create(score_dir,  showWarnings = FALSE, recursive = TRUE)
+dir.create(detect_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Resolve genome FASTA (required by BINDetect)
+genome_candidates <- c(
+  "/home/rstudio/mnt_resources/genome/hg38/hg38.fa",
+  "/home/rstudio/mnt_resources/genome/hg38/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna",
+  "/home/rstudio/mnt_resources/hg38/hg38.fa"
+)
+genome_fa <- genome_candidates[file.exists(genome_candidates)][1]
+if (is.na(genome_fa)) stop("hg38 FASTA not found — set genome_fa manually.")
+cat("Genome FASTA:", genome_fa, "\n")
+
+# Consensus peaks as BED (built earlier in this script)
+peaks_bed <- file.path(tobias_dir, "consensus_peaks.bed")
+peaks_df  <- data.frame(
+  chr   = as.character(seqnames(consensus_peaks)),
+  start = start(consensus_peaks) - 1L,   # BED is 0-based
+  end   = end(consensus_peaks),
+  name  = consensus_peaks$peak_id
+)
+write.table(peaks_df, peaks_bed, sep = "\t", row.names = FALSE,
+            col.names = FALSE, quote = FALSE)
+cat("Peaks BED written:", nrow(peaks_df), "peaks →", peaks_bed, "\n")
+
+# TFs of interest (from 00_NK_paper_setup.R), deduplicated
+TFs_tobias <- unique(TFs)
+cat("TFs to analyse:", paste(TFs_tobias, collapse = ", "), "\n")
+```
+
+## ___Fetch JASPAR motifs for TFs of interest___
+
+```{r tobias-motifs}
+# Query JASPAR2020 CORE vertebrates for the TFs of interest
+opts <- list(collection = "CORE", tax_group = "vertebrates", all_versions = FALSE)
+pfm_all <- TFBSTools::getMatrixSet(JASPAR2020, opts = opts)
+
+# Filter to TFs of interest (case-insensitive match on TF name)
+tf_names_upper <- toupper(TFs_tobias)
+keep_idx <- sapply(pfm_all, function(m) toupper(TFBSTools::name(m)) %in% tf_names_upper)
+pfm_tfs  <- pfm_all[keep_idx]
+
+cat("Motifs retrieved for", length(pfm_tfs), "of", length(TFs_tobias),
+    "requested TFs\n")
+if (length(pfm_tfs) > 0)
+  cat("Matched:", paste(unique(sapply(pfm_tfs, TFBSTools::name)), collapse = ", "), "\n")
+
+# Write filtered motifs as JASPAR format for TOBIAS
+# (TFBSTools::writeJASPARMatrix is not exported; write manually)
+motif_file <- file.path(motif_dir, "NK_TFs_JASPAR2020.jaspar")
+write_jaspar <- function(pfm_list, path) {
+  lines <- unlist(lapply(pfm_list, function(m) {
+    mat <- TFBSTools::Matrix(m)
+    fmt_row <- function(nuc) {
+      vals <- formatC(mat[nuc, ], width = 6, format = "f", digits = 2)
+      paste0(nuc, " [", paste(vals, collapse = ""), "]")
+    }
+    c(paste0(">", TFBSTools::ID(m), "\t", TFBSTools::name(m)),
+      fmt_row("A"), fmt_row("C"), fmt_row("G"), fmt_row("T"), "")
+  }))
+  writeLines(lines, path)
+}
+write_jaspar(pfm_tfs, motif_file)
+cat("Motif file:", motif_file, "\n")
+```
+
+## ___ScoreBigwig: footprint scores___
+
+```{bash}
+pip install tobias
+```
+
+```{r tobias-scorebigwig}
+tobias_ok <- Sys.which("TOBIAS") != ""
+if (!tobias_ok) message("TOBIAS not found in PATH — install via: pip install tobias")
+
+# Use raw bigWig files directly (DMSO E6 + p53 only)
+input_bws <- meta_bw$file[meta_bw$cell_line %in% c("E6", "p53") &
+                           meta_bw$treatment == "DMSO"]
+cat("BigWig files for scoring:", length(input_bws), "\n")
+print(basename(input_bws))
+
+if (tobias_ok) {
+
+  score_cmds <- vapply(input_bws, function(bw) {
+    sid   <- gsub("(_corrected)?\\.bw$|.*[/]", "", bw)
+    out   <- file.path(score_dir, paste0(sid, "_footprints.bw"))
+    sprintf(
+      "TOBIAS ScoreBigwig --signal %s --regions %s --output %s --cores 4",
+      bw, peaks_bed, out
+    )
+  }, character(1))
+
+  for (cmd in score_cmds) {
+    cat("Running:", cmd, "\n")
+    ret <- system(cmd)
+    if (ret != 0) message("ScoreBigwig failed: ", cmd)
+  }
+}
+```
+
+## ___BINDetect: ATRXdel vs ATRXwt differential TF binding___
+
+BINDetect compares per-condition footprint score distributions at each motif site
+and returns a differential binding score and p-value for every TF.
+Signals must be ordered condition-by-condition; `--n-signals` tells TOBIAS how many
+replicates belong to each condition.
+
+```{r tobias-bindetect}
+if (tobias_ok) {
+  # Re-scan scored footprint bigWigs
+  all_score_bws <- list.files(score_dir, pattern = "_footprints\\.bw$", full.names = TRUE)
+
+  bw_to_atrx <- function(path) {
+    fname <- basename(path)
+    if (grepl("^E6",  fname)) return("ATRXdel")
+    if (grepl("^p53", fname)) return("ATRXwt")
+    NA_character_
+  }
+  atrx_labels <- sapply(all_score_bws, bw_to_atrx)
+  all_score_bws <- all_score_bws[!is.na(atrx_labels)]
+  atrx_labels   <- atrx_labels[!is.na(atrx_labels)]
+
+  # Order: ATRXdel replicates first, then ATRXwt — required by BINDetect
+  ord        <- order(atrx_labels)          # "ATRXdel" < "ATRXwt" alphabetically
+  all_score_bws <- all_score_bws[ord]
+  atrx_labels   <- atrx_labels[ord]
+
+  n_del <- sum(atrx_labels == "ATRXdel")
+  n_wt  <- sum(atrx_labels == "ATRXwt")
+  cat(sprintf("BINDetect conditions: ATRXdel (n=%d) vs ATRXwt (n=%d)\n", n_del, n_wt))
+
+  bindetect_cmd <- sprintf(
+    paste("TOBIAS BINDetect",
+          "--motifs %s",
+          "--signals %s",
+          "--genome %s",
+          "--peaks %s",
+          "--outdir %s",
+          "--cond-names ATRXdel ATRXwt",
+          "--n-signals %d %d",
+          "--cores 4"),
+    motif_file,
+    paste(all_score_bws, collapse = " "),
+    genome_fa, peaks_bed, detect_dir,
+    n_del, n_wt
+  )
+
+  cat("Running BINDetect:\n", bindetect_cmd, "\n")
+  ret <- system(bindetect_cmd)
+  if (ret != 0) message("BINDetect failed — check TOBIAS log in ", detect_dir)
+
+  # Make score bigwig paths available to downstream chunks
+  score_bws_del <- all_score_bws[atrx_labels == "ATRXdel"]
+  score_bws_wt  <- all_score_bws[atrx_labels == "ATRXwt"]
+}
+```
+
+## ___Parse and visualise BINDetect results___
+
+```{r tobias-results, fig.height=5, fig.width=5}
+bindetect_result_file <- file.path(detect_dir, "bindetect_results.txt")
+
+if (!file.exists(bindetect_result_file)) {
+  message("BINDetect results not found at: ", bindetect_result_file,
+          "\n  — run the TOBIAS chunks above first.")
+} else {
+  bd <- read.table(bindetect_result_file, header = TRUE, sep = "\t",
+                   stringsAsFactors = FALSE)
+  cat("BINDetect output:", nrow(bd), "TF motifs ×", ncol(bd), "columns\n")
+
+  # Identify the change-score column: typically "<condA>_<condB>_change"
+  change_col <- grep("ATRXdel.*ATRXwt.*change|change", colnames(bd),
+                     value = TRUE, ignore.case = TRUE)[1]
+  pval_col   <- grep("pvalue",   colnames(bd), value = TRUE, ignore.case = TRUE)[1]
+  cat("Using change column:", change_col, "| p-value column:", pval_col, "\n")
+
+  bd <- bd %>%
+    dplyr::rename(tf_name = output_prefix) %>%
+    dplyr::mutate(
+      change    = .data[[change_col]],
+      pval      = .data[[pval_col]],
+      log10p    = -log10(pval + 1e-300),
+      sig       = pval < 0.05 & abs(change) > 0.1,
+      direction = case_when(
+        sig & change > 0 ~ "more bound ATRXdel",
+        sig & change < 0 ~ "more bound ATRXwt",
+        TRUE             ~ "NS"
+      ),
+      label     = ifelse(toupper(tf_name) %in% toupper(TFs_tobias), tf_name, NA)
+    )
+
+  p_bindetect <- ggplot(bd, aes(x = change, y = log10p, color = direction)) +
+    geom_point(size = 1.2, alpha = 0.7) +
+    ggrepel::geom_text_repel(
+      aes(label = label), size = 2.5, max.overlaps = 30,
+      na.rm = TRUE, segment.size = 0.3
+    ) +
+    geom_vline(xintercept = c(-0.1, 0.1), linetype = "dashed",
+               color = "gray60", linewidth = 0.35) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+               color = "gray60", linewidth = 0.35) +
+    scale_color_manual(values = c(
+      "more bound ATRXdel" = COL_ATRX["ATRXdel"],
+      "more bound ATRXwt"  = COL_ATRX["ATRXwt"],
+      "NS"                 = "gray80"
+    )) +
+    labs(
+      title    = "TF footprinting: ATRXdel vs ATRXwt (TOBIAS BINDetect)",
+      subtitle = "Positive change = more bound in ATRXdel",
+      x        = "Differential binding score (ATRXdel − ATRXwt)",
+      y        = "-log10 (p-value)",
+      color    = NULL
+    ) +
+    pub_theme + theme(legend.position = "top")
+
+  p_bindetect
+  pdf(paste0(params$out, "figures/bulkATAC_TOBIAS_BINDetect_volcano.pdf"),
+      height = 5, width = 5, useDingbats = FALSE)
+  print(p_bindetect); dev.off()
+
+  # Summary table: TFs of interest only
+  bd_tfs <- bd %>%
+    dplyr::filter(toupper(tf_name) %in% toupper(TFs_tobias)) %>%
+    dplyr::select(tf_name, change, pval, direction) %>%
+    dplyr::arrange(pval)
+
+  cat("\nBINDetect results for TFs of interest:\n")
+  print(bd_tfs)
+
+  write.table(bd_tfs, sep = "\t", row.names = FALSE, quote = FALSE,
+              file = paste0(params$out,
+                            "tables/bulkATAC_TOBIAS_BINDetect_TFs_2026-06-25.csv"))
+}
+```
+
+## ___ATRXdel vs ATRXwt: TF binding comparison for TFs of interest___
+
+```{r tobias-compare-lollipop, fig.height=4, fig.width=5}
+if (exists("bd") && nrow(bd) > 0) {
+  bd_tfs <- bd %>%
+    dplyr::filter(toupper(tf_name) %in% toupper(TFs_tobias)) %>%
+    dplyr::mutate(
+      tf_label  = tf_name,
+      tf_label  = factor(tf_label, levels = tf_label[order(change)]),
+      fill_col  = case_when(
+        sig & change > 0 ~ "ATRXdel",
+        sig & change < 0 ~ "ATRXwt",
+        TRUE             ~ "NS"
+      ),
+      sig_label = ifelse(pval < 0.001, "***",
+                  ifelse(pval < 0.01,  "**",
+                  ifelse(pval < 0.05,  "*", "")))
+    )
+
+  p_lollipop <- ggplot(bd_tfs, aes(x = change, y = tf_label, color = fill_col)) +
+    geom_vline(xintercept = 0, linetype = "solid", color = "gray40", linewidth = 0.4) +
+    geom_vline(xintercept = c(-0.1, 0.1), linetype = "dashed",
+               color = "gray70", linewidth = 0.3) +
+    geom_segment(aes(x = 0, xend = change, y = tf_label, yend = tf_label),
+                 linewidth = 0.6) +
+    geom_point(size = 3) +
+    geom_text(aes(label = sig_label),
+              hjust = ifelse(bd_tfs$change >= 0, -0.4, 1.4),
+              size = 3, color = "black") +
+    scale_color_manual(values = c(
+      "ATRXdel" = COL_ATRX["ATRXdel"],
+      "ATRXwt"  = COL_ATRX["ATRXwt"],
+      "NS"      = "gray70"
+    ), name = "More bound in") +
+    labs(
+      title    = "TF footprint: ATRXdel vs ATRXwt",
+      subtitle = "Differential binding score (BINDetect); * p<0.05, ** p<0.01, *** p<0.001",
+      x        = "Binding score change (ATRXdel − ATRXwt)",
+      y        = NULL
+    ) +
+    pub_theme +
+    theme(legend.position = "top", panel.grid.major.y = element_line(linewidth = 0.2,
+                                                                      color = "gray90"))
+
+  p_lollipop
+  pdf(paste0(params$out, "figures/bulkATAC_TOBIAS_TFs_lollipop_ATRXdel-vs-ATRXwt.pdf"),
+      height = 4, width = 5, useDingbats = FALSE)
+  print(p_lollipop); dev.off()
+}
+```
+
+Per-condition mean binding scores for TFs of interest (heatmap).
+Columns = BINDetect per-condition average score; rows = TFs, ordered by differential score.
+
+```{r tobias-compare-heatmap, fig.height=4, fig.width=3}
+if (exists("bd") && nrow(bd) > 0) {
+  # BINDetect result columns include <cond>_mean_score for each condition
+  del_score_col <- grep("ATRXdel.*mean_score|mean_score.*ATRXdel",
+                        colnames(bd), value = TRUE, ignore.case = TRUE)[1]
+  wt_score_col  <- grep("ATRXwt.*mean_score|mean_score.*ATRXwt",
+                        colnames(bd), value = TRUE, ignore.case = TRUE)[1]
+
+  if (!is.na(del_score_col) && !is.na(wt_score_col)) {
+    hm_df <- bd %>%
+      dplyr::filter(toupper(tf_name) %in% toupper(TFs_tobias)) %>%
+      dplyr::mutate(
+        ATRXdel = .data[[del_score_col]],
+        ATRXwt  = .data[[wt_score_col]]
+      ) %>%
+      dplyr::arrange(change) %>%
+      dplyr::select(tf_name, ATRXdel, ATRXwt)
+
+    hm_mat <- as.matrix(hm_df[, c("ATRXdel", "ATRXwt")])
+    rownames(hm_mat) <- hm_df$tf_name
+
+    # Scale row-wise so color reflects relative binding per TF
+    hm_mat_z <- t(scale(t(hm_mat)))
+
+    pheatmap::pheatmap(
+      hm_mat_z,
+      cluster_rows   = FALSE,
+      cluster_cols   = FALSE,
+      color          = colorRampPalette(c(COL_ATRX["ATRXwt"], "white",
+                                          COL_ATRX["ATRXdel"]))(101),
+      breaks         = seq(-2, 2, length.out = 102),
+      border_color   = NA,
+      fontsize        = 8,
+      fontsize_row    = 7,
+      main            = "Mean footprint score\n(row z-score)",
+      filename        = paste0(params$out,
+                               "figures/bulkATAC_TOBIAS_TFs_heatmap_ATRXdel-vs-ATRXwt.pdf")
+    )
+  } else {
+    message("Mean score columns not found in BINDetect output — column names: ",
+            paste(grep("score|mean", colnames(bd), value = TRUE, ignore.case = TRUE),
+                  collapse = ", "))
+  }
+}
+```
+
+## ___Aggregate footprint plots for significant TFs___
+
+```{r tobias-aggregate, fig.height=3, fig.width=5}
+if (tobias_ok && exists("bd") && any(bd$sig, na.rm = TRUE)) {
+  sig_tfs <- bd$tf_name[bd$sig & !is.na(bd$label)]
+
+  if (length(sig_tfs) > 0) {
+    agg_out <- file.path(tobias_dir, "aggregate_plots")
+    dir.create(agg_out, showWarnings = FALSE)
+
+    for (tf in sig_tfs) {
+      # TOBIAS stores per-TF bound/unbound site BED files under detect_dir/tf_name/
+      sites_bed <- file.path(detect_dir, tf, paste0(tf, "_all_bound.bed"))
+      if (!file.exists(sites_bed)) next
+
+      agg_cmd <- sprintf(
+        paste("TOBIAS PlotAggregate",
+              "--TFBS %s",
+              "--signals %s %s",
+              "--labels ATRXdel ATRXwt",
+              "--output %s",
+              "--share-y both --smooth 3"),
+        sites_bed,
+        paste(score_bws_atrxdel, collapse = " "),
+        paste(score_bws_atrxwt,  collapse = " "),
+        file.path(agg_out, paste0(tf, "_aggregate.pdf"))
+      )
+      ret <- system(agg_cmd)
+      if (ret != 0) message("PlotAggregate failed for TF: ", tf)
+    }
+    cat("Aggregate footprint PDFs written to:", agg_out, "\n")
+  }
+}
+```
+
+# ___The End___
+
+```{r}
+sessionInfo()
+```
+
+```{r render, eval=FALSE, include=FALSE}
+rmarkdown::render(
+  input         = "/home/rstudio/NK-NB_study/code/38_20260625_bulkATAC_NBcelllines_ATRXdel_vs_ATRXwt.Rmd",
+  output_format = "html_document",
+  output_file   = "38_20260625_bulkATAC_NBcelllines_ATRXdel_vs_ATRXwt.html",
+  output_dir    = "/home/rstudio/mnt_out/NK_project/"
+)
+```

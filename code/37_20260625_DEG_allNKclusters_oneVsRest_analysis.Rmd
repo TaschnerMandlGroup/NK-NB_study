@@ -1,0 +1,760 @@
+---
+title: "NK project: DEG analysis - all NK clusters, one-vs-rest paired by patient"
+author: "Dr. Sara Wernig-Zorc"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  input_NK: "/home/rstudio/mnt_out/NK_project/Rds/ALL_NK_cluster_withNewMetadata.Rds"
+  out: "/home/rstudio/mnt_out/NK_project/"
+---
+
+PROJECT DESCRIPTION
+
+Characterise each NK sub-population (hNK_Bm1–4) by identifying genes that
+distinguish it from all other clusters combined (one-vs-rest pseudobulk DEG).
+Patient ID is used as a blocking factor so that the comparison is made within
+each donor before averaging across donors, accounting for the matched sample
+design.
+
+Positive log_fc = higher in the cluster of interest relative to all other NK cells.
+Cutoffs: padj < 0.05 & |log_fc| > 0.5 (Bonferroni correction).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE,
+                      error = FALSE,
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 20)
+options(future.globals.maxSize = 8 * 10^9)
+
+print(params)
+```
+
+```{r include=FALSE}
+source("/home/rstudio/00_NK_paper_setup.R")
+source("/home/rstudio/00_NK_paper_utils.R")
+```
+
+# ___Load data___
+
+```{r include=FALSE}
+suppressPackageStartupMessages(library("DOSE"))
+suppressPackageStartupMessages(library("enrichplot"))
+suppressPackageStartupMessages(library("ggupset"))
+suppressPackageStartupMessages(library("EnhancedVolcano"))
+suppressPackageStartupMessages(library("ggbeeswarm"))
+```
+
+```{r include=FALSE}
+ALL_NK <- readRDS(file = params$input_NK)
+```
+
+```{r}
+counts_matrix <- GetAssayData(ALL_NK, slot = "counts")
+
+hist(Matrix::rowSums(counts_matrix), breaks = 100000000, xlim = c(0, 100))
+abline(v = 2)
+hist(log(Matrix::rowSums(counts_matrix)), breaks = 1000)
+abline(v = 3)
+
+geneUniverse <- rownames(counts_matrix)[Matrix::rowSums(counts_matrix) > 1]
+length(geneUniverse)
+
+geneUniverse_entrezIDs <- map_gene_to_entrez(geneUniverse)
+
+hallmark_genes_H <- msigdbr(species = "human", category = "H") %>%
+  dplyr::select(gs_name, entrez_gene)
+
+cat("Clusters present:\n")
+print(table(ALL_NK$predicted_NK_type_de.n350))
+```
+
+Publication theme and shared color helpers.
+
+```{r}
+pub_theme <- theme_classic(base_size = 9) +
+  theme(
+    axis.line        = element_line(linewidth = 0.4, color = "black"),
+    axis.ticks       = element_line(linewidth = 0.4, color = "black"),
+    axis.text        = element_text(size = 8,  color = "black"),
+    axis.title       = element_text(size = 9,  color = "black"),
+    plot.title       = element_text(size = 10, face = "bold"),
+    plot.subtitle    = element_text(size = 8),
+    legend.key.size  = unit(3,  "mm"),
+    legend.text      = element_text(size = 8),
+    legend.title     = element_text(size = 9),
+    strip.background = element_blank(),
+    strip.text       = element_text(size = 9)
+  )
+theme_set(pub_theme)
+
+# All 4 cluster colors from COLOR_CODE_v2
+COL_CLUST_ALL <- COLOR_CODE_v2[c("hNK_Bm1", "hNK_Bm2", "hNK_Bm3", "hNK_Bm4")]
+
+# Volcano color helper: cluster-of-interest color for up, gray for down/NS
+volcano_colors_ovr <- function(df, clust_col, padj_cut = 0.05, fc_cut = 0.5) {
+  col_vec <- rep("gray70", nrow(df))
+  col_vec[!is.na(df$padj) & df$padj < padj_cut & df$log_fc >  fc_cut] <- clust_col
+  col_vec[!is.na(df$padj) & df$padj < padj_cut & df$log_fc < -fc_cut] <- "gray40"
+  names(col_vec) <- rownames(df)
+  col_vec
+}
+
+# Enrichment helpers
+run_enrichment <- function(gene_symbols,
+                           type = c("BP", "MF", "CC", "KEGG", "HALLMARK"),
+                           term2gene = NULL,
+                           label = "") {
+  type <- match.arg(type)
+  if (length(gene_symbols) == 0) {
+    message(label, ": no input genes - skipping"); return(invisible(NULL))
+  }
+  entrez_ids <- na.omit(map_gene_to_entrez(gene_symbols))
+  if (length(entrez_ids) == 0) {
+    message(label, ": no valid Entrez IDs - skipping"); return(invisible(NULL))
+  }
+  tryCatch(
+    {
+      if (type %in% c("BP", "MF", "CC")) {
+        enrichGO(gene = entrez_ids, ont = type, OrgDb = "org.Hs.eg.db",
+                 readable = TRUE, pAdjustMethod = "bonferroni",
+                 pvalueCutoff = 0.05)
+      } else if (type == "KEGG") {
+        enrichKEGG(gene = entrez_ids, organism = "hsa", keyType = "kegg",
+                   pAdjustMethod = "bonferroni", pvalueCutoff = 0.05)
+      } else if (type == "HALLMARK") {
+        enricher(gene = entrez_ids, TERM2GENE = term2gene,
+                 pAdjustMethod = "bonferroni", pvalueCutoff = 0.05)
+      }
+    },
+    error = function(e) {
+      message(label, " (", type, ") error: ", conditionMessage(e)); NULL
+    }
+  )
+}
+
+show_enrichment <- function(result, label = "", out_path = NULL,
+                            out_w = 5, out_h = 4.5) {
+  if (is.null(result) || nrow(result@result) == 0) {
+    print(paste0("0 enriched terms - ", label)); return(invisible(NULL))
+  }
+  signif_rows <- result@result[result@result$p.adjust < 0.05, ]
+  if (nrow(signif_rows) == 0) {
+    print(paste0("0 terms with bonferroni p.adjust < 0.05 - ", label))
+    return(invisible(NULL))
+  }
+  p <- dotplot(result, showCategory = 20) +
+    ggtitle(label) + pub_theme +
+    theme(axis.text.y = element_text(size = 7))
+  print(p)
+  if (!is.null(out_path)) {
+    pdf(out_path, height = out_h, width = out_w, useDingbats = FALSE)
+    print(p); dev.off()
+  }
+}
+
+run_treeplot <- function(result, label = "", n_cluster = 5, n_words = 1,
+                         show_cat = 15, out_path = NULL, out_w = 9, out_h = 4) {
+  if (is.null(result) || nrow(result@result) == 0) {
+    message("treeplot skipped (no enriched terms): ", label); return(invisible(NULL))
+  }
+  signif_rows <- result@result[result@result$p.adjust < 0.05, ]
+  if (nrow(signif_rows) < 2) {
+    message("treeplot skipped (< 2 significant terms): ", label); return(invisible(NULL))
+  }
+  p <- tryCatch(
+    {
+      enrichres2 <- pairwise_termsim(result)
+      treeplot(enrichres2, showCategory = show_cat, color = "p.adjust",
+               offset = 10, offset_tiplab = 0.5,
+               nCluster = min(n_cluster, nrow(signif_rows)),
+               nWords = n_words, split = "subcategory")
+    },
+    error = function(e) { message("treeplot error: ", conditionMessage(e)); NULL }
+  )
+  if (!is.null(p)) {
+    tryCatch(print(p),
+             error = function(e) message("treeplot render error: ", conditionMessage(e)))
+    if (!is.null(out_path)) {
+      tryCatch({
+        pdf(out_path, height = out_h, width = out_w, useDingbats = FALSE)
+        print(p); dev.off()
+      }, error = function(e) {
+        try(dev.off(), silent = TRUE)
+        message("treeplot PDF error: ", conditionMessage(e))
+      })
+    }
+  }
+}
+
+# Violin + boxplot + jitter for top marker genes of a given cluster
+plot_top_markers_violins <- function(seurat_obj, deg_df, cluster_name,
+                                     group_col = "predicted_NK_type_de.n350",
+                                     top_n = 10, out_path = NULL,
+                                     out_w = 8, out_h = 4) {
+  if (nrow(deg_df) == 0) {
+    message("no DEGs - skipping violin plot"); return(invisible(NULL))
+  }
+  top_genes <- deg_df %>%
+    filter(log_fc > 0.5, padj < 0.05) %>%
+    slice_max(log_fc, n = top_n) %>%
+    arrange(desc(log_fc)) %>%
+    mutate(feature = factor(feature, levels = unique(feature)))
+
+  genes <- levels(top_genes$feature)
+  genes <- intersect(genes, rownames(seurat_obj))
+  if (length(genes) == 0) {
+    message("no genes in object - skipping violin plot"); return(invisible(NULL))
+  }
+
+  expr <- as.data.frame(
+    t(as.matrix(GetAssayData(seurat_obj, slot = "data")[genes, , drop = FALSE]))
+  )
+  expr$cluster <- seurat_obj@meta.data[[group_col]]
+  expr_long <- expr %>%
+    pivot_longer(-cluster, names_to = "gene", values_to = "expr") %>%
+    mutate(gene      = factor(gene, levels = genes),
+           is_target = cluster == cluster_name)
+
+  p <- ggplot(expr_long, aes(x = cluster, y = expr,
+                              fill = cluster, color = cluster)) +
+    geom_violin(scale = "width", trim = TRUE, linewidth = 0.3, alpha = 0.6) +
+    geom_boxplot(width = 0.15, outlier.shape = NA, fill = "white",
+                 color = "black", linewidth = 0.35) +
+    geom_quasirandom(size = 0.2, alpha = 0.3, color = "black",
+                     groupOnX = TRUE, bandwidth = 0.5) +
+    facet_wrap(~ gene, nrow = 2, scales = "free_y") +
+    scale_fill_manual(values  = COL_CLUST_ALL, guide = "none") +
+    scale_color_manual(values = COL_CLUST_ALL, guide = "none") +
+    labs(x = NULL, y = "log-normalised expression",
+         title    = paste0(cluster_name, " - top ", top_n, " marker genes"),
+         subtitle = "log_fc > 0.5, padj < 0.05 (one-vs-rest)") +
+    theme(
+      axis.text.x   = element_text(size = 7, angle = 30, hjust = 1),
+      axis.text.y   = element_text(size = 7),
+      strip.text    = element_text(size = 7, face = "italic"),
+      panel.spacing = unit(2, "mm")
+    )
+
+  print(p)
+  if (!is.null(out_path)) {
+    pdf(out_path, height = out_h, width = out_w, useDingbats = FALSE)
+    print(p); dev.off()
+  }
+}
+```
+
+Helper to run one-vs-rest DEG for a single cluster.
+`compare = "other"` with `compare_is_ref = TRUE` → positive log_fc = higher in cluster of interest.
+
+```{r}
+run_ovr_DEG <- function(seurat_obj, cluster_name,
+                        group_col   = "predicted_NK_type_de.n350",
+                        patient_col = "rados_et_al_2025") {
+  seurat_obj$ovr_group <- ifelse(
+    seurat_obj@meta.data[[group_col]] == cluster_name,
+    cluster_name, "other"
+  )
+  DElegate::findDE(
+    seurat_obj,
+    group_column     = "ovr_group",
+    order_results    = TRUE,
+    compare_is_ref   = TRUE,
+    replicate_column = patient_col,
+    compare          = "other"
+  )
+}
+```
+
+# ___DEG one-vs-rest per cluster___
+
+## ___1. hNK_Bm1___
+
+```{r}
+DEG_Bm1 <- run_ovr_DEG(ALL_NK, "hNK_Bm1")
+
+DEG_Bm1_signif <- subset(DEG_Bm1, padj < 0.1)
+DEG_Bm1_up     <- subset(DEG_Bm1, padj < 0.05 & log_fc >  0.5)
+DEG_Bm1_down   <- subset(DEG_Bm1, padj < 0.05 & log_fc < -0.5)
+
+cat("Total (padj<0.1):", nrow(DEG_Bm1_signif),
+    "| up Bm1:", nrow(DEG_Bm1_up), "| down:", nrow(DEG_Bm1_down), "\n")
+DEG_Bm1_signif
+
+write.table(DEG_Bm1, sep = "\t", row.names = FALSE, quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNKBm1_vs_rest_2026-06-25.csv"))
+```
+
+### ___Volcano - hNK_Bm1___
+
+```{r fig.height=5, fig.width=3.5}
+rownames(DEG_Bm1) <- DEG_Bm1$feature
+
+p_volcano_Bm1 <- EnhancedVolcano(
+  DEG_Bm1, lab = rownames(DEG_Bm1), x = "log_fc", y = "padj",
+  title = "hNK_Bm1", subtitle = "vs. all other NK clusters",
+  pCutoff = 0.05, FCcutoff = 0.5,
+  ylim = c(0, ceiling(-log10(min(pmax(DEG_Bm1$padj, 1e-300), na.rm = TRUE))) + 0.5),
+  pointSize = 1.5, labSize = 3,
+  colCustom = volcano_colors_ovr(DEG_Bm1, COL_CLUST_ALL["hNK_Bm1"]),
+  colAlpha = 0.7, legendLabSize = 8, legendIconSize = 3,
+  titleLabSize = 10, subtitleLabSize = 8, axisLabSize = 9,
+  boxedLabels = TRUE, drawConnectors = TRUE,
+  widthConnectors = 0.5, colConnectors = "black", legendPosition = "right"
+) + pub_theme
+
+p_volcano_Bm1
+
+pdf(paste0(params$out, "figures/DEG_hNKBm1_vs_rest_volcano.pdf"),
+    height = 5, width = 3.5, useDingbats = FALSE)
+p_volcano_Bm1; dev.off()
+```
+
+### ___Top marker expression - hNK_Bm1___
+
+```{r fig.height=4, fig.width=8}
+plot_top_markers_violins(ALL_NK, deg_df = DEG_Bm1, cluster_name = "hNK_Bm1",
+  top_n = 10, out_path = paste0(params$out,
+    "figures/DEG_hNKBm1_vs_rest_topMarkers_violins.pdf"))
+```
+
+### ___Pathway enrichment - hNK_Bm1 marker genes___
+
+```{r fig.height=6, fig.width=9}
+genes <- DEG_Bm1_up$feature
+
+go_BP_Bm1    <- run_enrichment(genes, "BP",       label = "Bm1 up: GO-BP")
+go_MF_Bm1    <- run_enrichment(genes, "MF",       label = "Bm1 up: GO-MF")
+go_CC_Bm1    <- run_enrichment(genes, "CC",       label = "Bm1 up: GO-CC")
+kegg_Bm1     <- run_enrichment(genes, "KEGG",     label = "Bm1 up: KEGG")
+hallmark_Bm1 <- run_enrichment(genes, "HALLMARK", label = "Bm1 up: HALLMARK",
+                               term2gene = hallmark_genes_H)
+
+show_enrichment(go_BP_Bm1, "Bm1 up: GO-BP",
+  out_path = paste0(params$out, "figures/DEG_hNKBm1_vs_rest_up_GO-BP_dotplot.pdf"))
+show_enrichment(go_MF_Bm1, "Bm1 up: GO-MF",
+  out_path = paste0(params$out, "figures/DEG_hNKBm1_vs_rest_up_GO-MF_dotplot.pdf"))
+show_enrichment(go_CC_Bm1, "Bm1 up: GO-CC",
+  out_path = paste0(params$out, "figures/DEG_hNKBm1_vs_rest_up_GO-CC_dotplot.pdf"))
+show_enrichment(kegg_Bm1, "Bm1 up: KEGG",
+  out_path = paste0(params$out, "figures/DEG_hNKBm1_vs_rest_up_KEGG_dotplot.pdf"))
+show_enrichment(hallmark_Bm1, "Bm1 up: HALLMARK",
+  out_path = paste0(params$out, "figures/DEG_hNKBm1_vs_rest_up_HALLMARK_dotplot.pdf"))
+```
+
+```{r}
+run_treeplot(kegg_Bm1,  label = "Bm1 up: KEGG",
+  out_path = paste0(params$out, "figures/DEG_hNKBm1_vs_rest_up_KEGG_treeplot.pdf"))
+run_treeplot(go_BP_Bm1, label = "Bm1 up: GO-BP",
+  out_path = paste0(params$out, "figures/DEG_hNKBm1_vs_rest_up_GO-BP_treeplot.pdf"))
+```
+
+
+## ___2. hNK_Bm2___
+
+```{r}
+DEG_Bm2 <- run_ovr_DEG(ALL_NK, "hNK_Bm2")
+
+DEG_Bm2_signif <- subset(DEG_Bm2, padj < 0.1)
+DEG_Bm2_up     <- subset(DEG_Bm2, padj < 0.05 & log_fc >  0.5)
+DEG_Bm2_down   <- subset(DEG_Bm2, padj < 0.05 & log_fc < -0.5)
+
+cat("Total (padj<0.1):", nrow(DEG_Bm2_signif),
+    "| up Bm2:", nrow(DEG_Bm2_up), "| down:", nrow(DEG_Bm2_down), "\n")
+DEG_Bm2_signif
+
+write.table(DEG_Bm2, sep = "\t", row.names = FALSE, quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNKBm2_vs_rest_2026-06-25.csv"))
+```
+
+### ___Volcano - hNK_Bm2___
+
+```{r fig.height=5, fig.width=3.5}
+rownames(DEG_Bm2) <- DEG_Bm2$feature
+
+p_volcano_Bm2 <- EnhancedVolcano(
+  DEG_Bm2, lab = rownames(DEG_Bm2), x = "log_fc", y = "padj",
+  title = "hNK_Bm2", subtitle = "vs. all other NK clusters",
+  pCutoff = 0.05, FCcutoff = 0.5,
+  ylim = c(0, ceiling(-log10(min(pmax(DEG_Bm2$padj, 1e-300), na.rm = TRUE))) + 0.5),
+  pointSize = 1.5, labSize = 3,
+  colCustom = volcano_colors_ovr(DEG_Bm2, COL_CLUST_ALL["hNK_Bm2"]),
+  colAlpha = 0.7, legendLabSize = 8, legendIconSize = 3,
+  titleLabSize = 10, subtitleLabSize = 8, axisLabSize = 9,
+  boxedLabels = TRUE, drawConnectors = TRUE,
+  widthConnectors = 0.5, colConnectors = "black", legendPosition = "right"
+) + pub_theme
+
+p_volcano_Bm2
+
+pdf(paste0(params$out, "figures/DEG_hNKBm2_vs_rest_volcano.pdf"),
+    height = 5, width = 3.5, useDingbats = FALSE)
+p_volcano_Bm2; dev.off()
+```
+
+### ___Top marker expression - hNK_Bm2___
+
+```{r fig.height=4, fig.width=8}
+plot_top_markers_violins(ALL_NK, deg_df = DEG_Bm2, cluster_name = "hNK_Bm2",
+  top_n = 10, out_path = paste0(params$out,
+    "figures/DEG_hNKBm2_vs_rest_topMarkers_violins.pdf"))
+```
+
+### ___Pathway enrichment - hNK_Bm2 marker genes___
+
+```{r fig.height=6, fig.width=9}
+genes <- DEG_Bm2_up$feature
+
+go_BP_Bm2    <- run_enrichment(genes, "BP",       label = "Bm2 up: GO-BP")
+go_MF_Bm2    <- run_enrichment(genes, "MF",       label = "Bm2 up: GO-MF")
+go_CC_Bm2    <- run_enrichment(genes, "CC",       label = "Bm2 up: GO-CC")
+kegg_Bm2     <- run_enrichment(genes, "KEGG",     label = "Bm2 up: KEGG")
+hallmark_Bm2 <- run_enrichment(genes, "HALLMARK", label = "Bm2 up: HALLMARK",
+                               term2gene = hallmark_genes_H)
+
+show_enrichment(go_BP_Bm2, "Bm2 up: GO-BP",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2_vs_rest_up_GO-BP_dotplot.pdf"))
+show_enrichment(go_MF_Bm2, "Bm2 up: GO-MF",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2_vs_rest_up_GO-MF_dotplot.pdf"))
+show_enrichment(go_CC_Bm2, "Bm2 up: GO-CC",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2_vs_rest_up_GO-CC_dotplot.pdf"))
+show_enrichment(kegg_Bm2, "Bm2 up: KEGG",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2_vs_rest_up_KEGG_dotplot.pdf"))
+show_enrichment(hallmark_Bm2, "Bm2 up: HALLMARK",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2_vs_rest_up_HALLMARK_dotplot.pdf"))
+```
+
+```{r}
+run_treeplot(kegg_Bm2,  label = "Bm2 up: KEGG",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2_vs_rest_up_KEGG_treeplot.pdf"))
+run_treeplot(go_BP_Bm2, label = "Bm2 up: GO-BP",
+  out_path = paste0(params$out, "figures/DEG_hNKBm2_vs_rest_up_GO-BP_treeplot.pdf"))
+```
+
+
+## ___3. hNK_Bm3___
+
+```{r}
+DEG_Bm3 <- run_ovr_DEG(ALL_NK, "hNK_Bm3")
+
+DEG_Bm3_signif <- subset(DEG_Bm3, padj < 0.1)
+DEG_Bm3_up     <- subset(DEG_Bm3, padj < 0.05 & log_fc >  0.5)
+DEG_Bm3_down   <- subset(DEG_Bm3, padj < 0.05 & log_fc < -0.5)
+
+cat("Total (padj<0.1):", nrow(DEG_Bm3_signif),
+    "| up Bm3:", nrow(DEG_Bm3_up), "| down:", nrow(DEG_Bm3_down), "\n")
+DEG_Bm3_signif
+
+write.table(DEG_Bm3, sep = "\t", row.names = FALSE, quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNKBm3_vs_rest_2026-06-25.csv"))
+```
+
+### ___Volcano - hNK_Bm3___
+
+```{r fig.height=5, fig.width=3.5}
+rownames(DEG_Bm3) <- DEG_Bm3$feature
+
+p_volcano_Bm3 <- EnhancedVolcano(
+  DEG_Bm3, lab = rownames(DEG_Bm3), x = "log_fc", y = "padj",
+  title = "hNK_Bm3", subtitle = "vs. all other NK clusters",
+  pCutoff = 0.05, FCcutoff = 0.5,
+  ylim = c(0, ceiling(-log10(min(pmax(DEG_Bm3$padj, 1e-300), na.rm = TRUE))) + 0.5),
+  pointSize = 1.5, labSize = 3,
+  colCustom = volcano_colors_ovr(DEG_Bm3, COL_CLUST_ALL["hNK_Bm3"]),
+  colAlpha = 0.7, legendLabSize = 8, legendIconSize = 3,
+  titleLabSize = 10, subtitleLabSize = 8, axisLabSize = 9,
+  boxedLabels = TRUE, drawConnectors = TRUE,
+  widthConnectors = 0.5, colConnectors = "black", legendPosition = "right"
+) + pub_theme
+
+p_volcano_Bm3
+
+pdf(paste0(params$out, "figures/DEG_hNKBm3_vs_rest_volcano.pdf"),
+    height = 5, width = 3.5, useDingbats = FALSE)
+p_volcano_Bm3; dev.off()
+```
+
+### ___Top marker expression - hNK_Bm3___
+
+```{r fig.height=4, fig.width=8}
+plot_top_markers_violins(ALL_NK, deg_df = DEG_Bm3, cluster_name = "hNK_Bm3",
+  top_n = 10, out_path = paste0(params$out,
+    "figures/DEG_hNKBm3_vs_rest_topMarkers_violins.pdf"))
+```
+
+### ___Pathway enrichment - hNK_Bm3 marker genes___
+
+```{r fig.height=6, fig.width=9}
+genes <- DEG_Bm3_up$feature
+
+go_BP_Bm3    <- run_enrichment(genes, "BP",       label = "Bm3 up: GO-BP")
+go_MF_Bm3    <- run_enrichment(genes, "MF",       label = "Bm3 up: GO-MF")
+go_CC_Bm3    <- run_enrichment(genes, "CC",       label = "Bm3 up: GO-CC")
+kegg_Bm3     <- run_enrichment(genes, "KEGG",     label = "Bm3 up: KEGG")
+hallmark_Bm3 <- run_enrichment(genes, "HALLMARK", label = "Bm3 up: HALLMARK",
+                               term2gene = hallmark_genes_H)
+
+show_enrichment(go_BP_Bm3, "Bm3 up: GO-BP",
+  out_path = paste0(params$out, "figures/DEG_hNKBm3_vs_rest_up_GO-BP_dotplot.pdf"))
+show_enrichment(go_MF_Bm3, "Bm3 up: GO-MF",
+  out_path = paste0(params$out, "figures/DEG_hNKBm3_vs_rest_up_GO-MF_dotplot.pdf"))
+show_enrichment(go_CC_Bm3, "Bm3 up: GO-CC",
+  out_path = paste0(params$out, "figures/DEG_hNKBm3_vs_rest_up_GO-CC_dotplot.pdf"))
+show_enrichment(kegg_Bm3, "Bm3 up: KEGG",
+  out_path = paste0(params$out, "figures/DEG_hNKBm3_vs_rest_up_KEGG_dotplot.pdf"))
+show_enrichment(hallmark_Bm3, "Bm3 up: HALLMARK",
+  out_path = paste0(params$out, "figures/DEG_hNKBm3_vs_rest_up_HALLMARK_dotplot.pdf"))
+```
+
+```{r}
+run_treeplot(kegg_Bm3,  label = "Bm3 up: KEGG",
+  out_path = paste0(params$out, "figures/DEG_hNKBm3_vs_rest_up_KEGG_treeplot.pdf"))
+run_treeplot(go_BP_Bm3, label = "Bm3 up: GO-BP",
+  out_path = paste0(params$out, "figures/DEG_hNKBm3_vs_rest_up_GO-BP_treeplot.pdf"))
+```
+
+
+## ___4. hNK_Bm4___
+
+```{r}
+DEG_Bm4 <- run_ovr_DEG(ALL_NK, "hNK_Bm4")
+
+DEG_Bm4_signif <- subset(DEG_Bm4, padj < 0.1)
+DEG_Bm4_up     <- subset(DEG_Bm4, padj < 0.05 & log_fc >  0.5)
+DEG_Bm4_down   <- subset(DEG_Bm4, padj < 0.05 & log_fc < -0.5)
+
+cat("Total (padj<0.1):", nrow(DEG_Bm4_signif),
+    "| up Bm4:", nrow(DEG_Bm4_up), "| down:", nrow(DEG_Bm4_down), "\n")
+DEG_Bm4_signif
+
+write.table(DEG_Bm4, sep = "\t", row.names = FALSE, quote = FALSE,
+            file = paste0(params$out, "tables/DEG_hNKBm4_vs_rest_2026-06-25.csv"))
+```
+
+### ___Volcano - hNK_Bm4___
+
+```{r fig.height=5, fig.width=3.5}
+rownames(DEG_Bm4) <- DEG_Bm4$feature
+
+p_volcano_Bm4 <- EnhancedVolcano(
+  DEG_Bm4, lab = rownames(DEG_Bm4), x = "log_fc", y = "padj",
+  title = "hNK_Bm4", subtitle = "vs. all other NK clusters",
+  pCutoff = 0.05, FCcutoff = 0.5,
+  ylim = c(0, ceiling(-log10(min(pmax(DEG_Bm4$padj, 1e-300), na.rm = TRUE))) + 0.5),
+  pointSize = 1.5, labSize = 3,
+  colCustom = volcano_colors_ovr(DEG_Bm4, COL_CLUST_ALL["hNK_Bm4"]),
+  colAlpha = 0.7, legendLabSize = 8, legendIconSize = 3,
+  titleLabSize = 10, subtitleLabSize = 8, axisLabSize = 9,
+  boxedLabels = TRUE, drawConnectors = TRUE,
+  widthConnectors = 0.5, colConnectors = "black", legendPosition = "right"
+) + pub_theme
+
+p_volcano_Bm4
+
+pdf(paste0(params$out, "figures/DEG_hNKBm4_vs_rest_volcano.pdf"),
+    height = 5, width = 3.5, useDingbats = FALSE)
+p_volcano_Bm4; dev.off()
+```
+
+### ___Top marker expression - hNK_Bm4___
+
+```{r fig.height=4, fig.width=8}
+plot_top_markers_violins(ALL_NK, deg_df = DEG_Bm4, cluster_name = "hNK_Bm4",
+  top_n = 10, out_path = paste0(params$out,
+    "figures/DEG_hNKBm4_vs_rest_topMarkers_violins.pdf"))
+```
+
+### ___Pathway enrichment - hNK_Bm4 marker genes___
+
+```{r fig.height=6, fig.width=9}
+genes <- DEG_Bm4_up$feature
+
+go_BP_Bm4    <- run_enrichment(genes, "BP",       label = "Bm4 up: GO-BP")
+go_MF_Bm4    <- run_enrichment(genes, "MF",       label = "Bm4 up: GO-MF")
+go_CC_Bm4    <- run_enrichment(genes, "CC",       label = "Bm4 up: GO-CC")
+kegg_Bm4     <- run_enrichment(genes, "KEGG",     label = "Bm4 up: KEGG")
+hallmark_Bm4 <- run_enrichment(genes, "HALLMARK", label = "Bm4 up: HALLMARK",
+                               term2gene = hallmark_genes_H)
+
+show_enrichment(go_BP_Bm4, "Bm4 up: GO-BP",
+  out_path = paste0(params$out, "figures/DEG_hNKBm4_vs_rest_up_GO-BP_dotplot.pdf"))
+show_enrichment(go_MF_Bm4, "Bm4 up: GO-MF",
+  out_path = paste0(params$out, "figures/DEG_hNKBm4_vs_rest_up_GO-MF_dotplot.pdf"))
+show_enrichment(go_CC_Bm4, "Bm4 up: GO-CC",
+  out_path = paste0(params$out, "figures/DEG_hNKBm4_vs_rest_up_GO-CC_dotplot.pdf"))
+show_enrichment(kegg_Bm4, "Bm4 up: KEGG",
+  out_path = paste0(params$out, "figures/DEG_hNKBm4_vs_rest_up_KEGG_dotplot.pdf"))
+show_enrichment(hallmark_Bm4, "Bm4 up: HALLMARK",
+  out_path = paste0(params$out, "figures/DEG_hNKBm4_vs_rest_up_HALLMARK_dotplot.pdf"))
+```
+
+```{r}
+run_treeplot(kegg_Bm4,  label = "Bm4 up: KEGG",
+  out_path = paste0(params$out, "figures/DEG_hNKBm4_vs_rest_up_KEGG_treeplot.pdf"))
+run_treeplot(go_BP_Bm4, label = "Bm4 up: GO-BP",
+  out_path = paste0(params$out, "figures/DEG_hNKBm4_vs_rest_up_GO-BP_treeplot.pdf"))
+```
+
+
+## ___Combined 4-panel volcano (publication figure)___
+
+```{r fig.height=10, fig.width=7}
+p_volcano_4panel <- (p_volcano_Bm1 | p_volcano_Bm2) /
+                    (p_volcano_Bm3 | p_volcano_Bm4) +
+  plot_annotation(title = "NK clusters - one-vs-rest marker genes",
+                  theme = theme(plot.title = element_text(size = 11, face = "bold")))
+
+p_volcano_4panel
+
+pdf(paste0(params$out, "figures/DEG_allNKclusters_vs_rest_volcano_4panel.pdf"),
+    height = 10, width = 7, useDingbats = FALSE)
+p_volcano_4panel; dev.off()
+```
+
+
+# ___Summary: marker gene counts per cluster___
+
+```{r fig.height=3.5, fig.width=4}
+summary_markers <- data.frame(
+  cluster  = c("hNK_Bm1", "hNK_Bm2", "hNK_Bm3", "hNK_Bm4"),
+  n_up     = c(nrow(DEG_Bm1_up), nrow(DEG_Bm2_up), nrow(DEG_Bm3_up), nrow(DEG_Bm4_up)),
+  n_down   = c(nrow(DEG_Bm1_down), nrow(DEG_Bm2_down), nrow(DEG_Bm3_down), nrow(DEG_Bm4_down))
+)
+summary_markers
+
+summary_long <- summary_markers %>%
+  pivot_longer(c(n_up, n_down), names_to = "direction", values_to = "n_genes") %>%
+  mutate(cluster   = factor(cluster, levels = c("hNK_Bm1","hNK_Bm2","hNK_Bm3","hNK_Bm4")),
+         direction = factor(direction, levels = c("n_up","n_down"),
+                            labels = c("higher in cluster", "lower in cluster")))
+
+p_summary <- ggplot(summary_long, aes(x = cluster, y = n_genes, fill = cluster)) +
+  geom_col(width = 0.7) +
+  facet_wrap(~ direction, scales = "free_y") +
+  scale_fill_manual(values = COL_CLUST_ALL, guide = "none") +
+  labs(title = "Significant DEGs per cluster (one-vs-rest)",
+       subtitle = "|log_fc| > 0.5, padj < 0.05",
+       x = NULL, y = "Number of genes") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1, size = 8))
+
+p_summary
+
+pdf(paste0(params$out, "figures/DEG_allNKclusters_vs_rest_summary_barplot.pdf"),
+    height = 3.5, width = 4, useDingbats = FALSE)
+p_summary; dev.off()
+```
+
+
+# ___Single-cell heatmap: all clusters × all significant marker genes___
+
+One row per gene, one column per cell. Genes are ordered in four blocks — one per cluster —
+sorted by their one-vs-rest log_fc within each block (cluster-defining genes at the top of
+each block). Only upregulated markers (log_fc > 0.5, padj < 0.05) are included.
+Genes that appear as markers of more than one cluster are assigned to the cluster
+with the highest log_fc.
+
+```{r}
+# Collect all upregulated markers and resolve ambiguity by highest log_fc
+all_up_markers <- bind_rows(
+  DEG_Bm1_up %>% mutate(primary_cluster = "hNK_Bm1"),
+  DEG_Bm2_up %>% mutate(primary_cluster = "hNK_Bm2"),
+  DEG_Bm3_up %>% mutate(primary_cluster = "hNK_Bm3"),
+  DEG_Bm4_up %>% mutate(primary_cluster = "hNK_Bm4")
+)
+
+# Assign each gene to cluster with highest log_fc
+gene_assignments <- all_up_markers %>%
+  group_by(feature) %>%
+  slice_max(log_fc, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  dplyr::select(feature, primary_cluster, log_fc) %>%
+  arrange(primary_cluster,
+          factor(primary_cluster, levels = c("hNK_Bm1","hNK_Bm2","hNK_Bm3","hNK_Bm4")),
+          desc(log_fc))
+
+# Final ordered gene list for heatmap (sorted within each cluster block by log_fc desc)
+gene_order <- gene_assignments %>%
+  arrange(factor(primary_cluster, levels = c("hNK_Bm1","hNK_Bm2","hNK_Bm3","hNK_Bm4")),
+          desc(log_fc)) %>%
+  pull(feature)
+
+# Keep only genes present in the object
+gene_order <- intersect(gene_order, rownames(ALL_NK))
+
+cat("Total unique marker genes for heatmap:", length(gene_order), "\n")
+cat("Per cluster:\n")
+print(table(gene_assignments$primary_cluster))
+```
+
+```{r}
+Idents(ALL_NK) <- ALL_NK$predicted_NK_type_de.n350
+ALL_NK <- ScaleData(ALL_NK, features = gene_order, verbose = FALSE)
+```
+
+```{r fig.height=14, fig.width=9}
+p_heatmap_all <- DoHeatmap(
+  ALL_NK, features = gene_order,
+  group.by     = "predicted_NK_type_de.n350",
+  group.colors = unname(COL_CLUST_ALL),
+  label        = TRUE, size = 3.5, draw.lines = TRUE
+) +
+  scale_fill_gradientn(
+    colors   = rev(RColorBrewer::brewer.pal(11, "RdBu")),
+    na.value = "white", name = "scaled\nexpr."
+  ) +
+  labs(title    = "NK cluster marker genes (one-vs-rest)",
+       subtitle = "log_fc > 0.5, padj < 0.05 | genes sorted by cluster block then log_fc") +
+  theme(
+    plot.title   = element_text(size = 10, face = "bold"),
+    plot.subtitle = element_text(size = 8),
+    axis.text.y  = element_text(size = 6),
+    legend.text  = element_text(size = 8),
+    legend.title = element_text(size = 9)
+  )
+
+p_heatmap_all
+
+pdf(paste0(params$out, "figures/DEG_allNKclusters_vs_rest_singleCell_heatmap.pdf"),
+    height = 14, width = 9, useDingbats = FALSE)
+p_heatmap_all; dev.off()
+```
+
+## ___Cluster-block gene summary table___
+
+```{r}
+gene_assignments %>%
+  group_by(primary_cluster) %>%
+  arrange(desc(log_fc)) %>%
+  slice_head(n = 20) %>%
+  ungroup() %>%
+  dplyr::select(primary_cluster, feature, log_fc) %>%
+  dplyr::rename(cluster = primary_cluster, gene = feature, log_fc_ovr = log_fc)
+```
+
+
+# ___The End___
+
+```{r}
+sessionInfo()
+```
+
+```{r render, eval=FALSE, include=FALSE}
+rmarkdown::render(
+  input         = "/home/rstudio/NK-NB_study/code/37_20260625_DEG_allNKclusters_oneVsRest_analysis.Rmd",
+  output_format = "html_document",
+  output_file   = "37_20260625_DEG_allNKclusters_oneVsRest_analysis.html",
+  output_dir    = "/home/rstudio/mnt_out/NK_project/"
+)
+```

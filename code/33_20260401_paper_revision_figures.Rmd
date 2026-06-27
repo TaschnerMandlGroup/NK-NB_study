@@ -1,0 +1,980 @@
+---
+title: "NK project: Paper revision figures, part I"
+subtitle: "CD6 - ALCAM, other R - L pairs"
+author: "Dr. Sara Wernig-Zorc"
+date: "2026-04-01"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  out: "/home/rstudio/mnt_out/NK_project/"
+  anno: "/home/rstudio/mnt_resources/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE,
+                      error = FALSE,
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan("sequential")
+options(future.globals.maxSize = 80 * 10^9)
+options(Seurat.object.assay.version = "v5")
+print(params)
+```
+
+# ___Project specific setup___
+
+```{r load project specific R packages and color code, echo = FALSE, include = FALSE}
+source("/home/rstudio/00_NK_paper_setup.R")
+source("/home/rstudio/00_NK_paper_utils.R")
+library(ArchR)
+library(ggplot2)
+library(ggtext)
+library(ggpubr)
+library(rstatix)
+library(patchwork)
+library(dplyr)
+set.seed(2805)
+
+fig_out <- paste0(params$out, "figures/revision/")
+dir.create(fig_out, showWarnings = FALSE, recursive = TRUE)
+
+# Group order and labels for all plots in this script
+GROUP_ORDER_PUB  <- c("control", "ATRXdel", "MYCNamp", "ATRXwtMYCNwt")
+NK_SUBSET_ORDER  <- c("hNK_Bm1", "hNK_Bm2", "hNK_Bm3", "hNK_Bm4")
+
+# NB cells are tumor-only (no control) — 3 tumor groups + all pairwise comparisons
+GROUP_ORDER_NB <- c("ATRXdel", "MYCNamp", "ATRXwtMYCNwt")
+COMPS_NB <- list(
+  c("ATRXdel",  "MYCNamp"),
+  c("ATRXdel",  "ATRXwtMYCNwt"),
+  c("MYCNamp",  "ATRXwtMYCNwt")
+)
+```
+
+# ___Load RNA data___
+
+```{r}
+fetahu2023 <- readRDS("~/mnt_out/NK_project/Rds/fetahu2023_withNewMetadata.Rds")
+fetahu2023 <- NormalizeData(fetahu2023, normalization.method = "LogNormalize",
+                            scale.factor = 10000)
+fetahu2023$celltype <- fetahu2023$orig.ident
+
+ALL_NK <- readRDS("~/mnt_out/NK_project/Rds/ALL_NK_cluster_withNewMetadata.Rds")
+ALL_NK <- NormalizeData(ALL_NK, normalization.method = "LogNormalize",
+                        scale.factor = 10000)
+
+ALL_NB <- readRDS("~/mnt_out/NK_project/Rds/ALL_NB_cluster_withNewMetadata.Rds")
+ALL_NB <- NormalizeData(ALL_NB, normalization.method = "LogNormalize",
+                        scale.factor = 10000)
+
+cat("NK subsets:", paste(unique(ALL_NK$predicted_NK_type_de.n350), collapse = ", "), "\n")
+cat("Groups (NK):", paste(unique(ALL_NK$group), collapse = ", "), "\n")
+cat("Groups (NB):", paste(unique(ALL_NB$group), collapse = ", "), "\n")
+```
+
+# ___CD6 receptor - ligand axis___
+
+**Reviewer #1 question #2**
+
+## ___Expression per NK cell state___
+
+```{r fig.height=4, fig.width=9}
+# NK cells: hNK_Bm1-4 labels come from ALL_NK (predicted_NK_type_de.n350)
+# NB cells: ALL_NB; subset label = "NB cells"
+# fetahu2023$orig.ident does NOT contain hNK_Bm labels
+df_cd6_nk <- Seurat::FetchData(ALL_NK,
+                               vars  = c("CD6", "predicted_NK_type_de.n350", "group"),
+                               layer = "data") %>%
+  dplyr::rename(value = CD6, subset = predicted_NK_type_de.n350)
+
+df_cd6_nb <- Seurat::FetchData(ALL_NB,
+                               vars  = c("CD6", "group"),
+                               layer = "data") %>%
+  dplyr::rename(value = CD6) %>%
+  dplyr::mutate(subset = "NB cells")
+
+df_cd6 <- dplyr::bind_rows(df_cd6_nk, df_cd6_nb) %>%
+  dplyr::filter(
+    subset %in% c(NK_SUBSET_ORDER, "NB cells"),
+    group  %in% GROUP_ORDER_PUB
+  ) %>%
+  dplyr::mutate(
+    subset = factor(subset, levels = c(NK_SUBSET_ORDER, "NB cells")),
+    group  = factor(group,  levels = GROUP_ORDER_PUB)
+  )
+cat("CD6 data rows:", nrow(df_cd6), "| subsets:", paste(levels(df_cd6$subset), collapse=", "), "\n")
+
+# Stats: pairwise Wilcoxon within each NK subset (vs control)
+
+# NB cells have no "control" group (tumor-only object) → restrict stats to NK subsets
+stats_cd6 <- df_cd6 %>%
+  dplyr::filter(subset %in% NK_SUBSET_ORDER) %>%
+  group_by(subset) %>%
+  rstatix::wilcox_test(value ~ group,
+                       ref.group = "control",
+                       p.adjust.method = "BH") %>%
+  rstatix::add_significance("p.adj", cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1),
+                            symbols = c("****", "***", "**", "*", "ns")) %>%
+  rstatix::add_xy_position(x = "subset", dodge = 0.85, fun = "max",
+                           step.increase = 0.12)
+
+# y-axis upper limit: must accommodate the highest bracket, not just the data max
+cd6_y_max <- max(max(df_cd6$value, na.rm = TRUE),
+                 max(stats_cd6$y.position, na.rm = TRUE)) * 1.05
+
+# Version 1: no data points
+p_cd6 <- pub_violin(
+  data          = df_cd6,
+  x_col         = "subset",
+  y_col         = "value",
+  fill_col      = "group",
+  colors        = COLOR_CODE_GROUP,
+  x_order       = c(NK_SUBSET_ORDER, "NB cells"),
+  fill_order    = GROUP_ORDER_PUB,
+  x_labels      = NULL,
+  legend_labels = PUB_GROUP_LABELS,
+  y_label       = "CD6 RNA expression",
+  ref_group     = NULL,
+  show_points   = FALSE,
+  base_size     = 12
+) +
+  ggpubr::stat_pvalue_manual(stats_cd6, label = "p.adj.signif",
+                             tip.length = 0.01, bracket.size = 0.3, size = 2.5,
+                             hide.ns = FALSE, inherit.aes = FALSE) +
+  ggplot2::coord_cartesian(ylim = c(0, cd6_y_max))
+p_cd6
+
+ggsave(paste0(fig_out, "CD6_per_NKsubset_no-points.pdf"),
+       p_cd6, width = 9, height = 2, device = cairo_pdf)
+
+# Version 2: with data points
+p_cd6_pts <- pub_violin(
+  data          = df_cd6,
+  x_col         = "subset",
+  y_col         = "value",
+  fill_col      = "group",
+  colors        = COLOR_CODE_GROUP,
+  x_order       = c(NK_SUBSET_ORDER, "NB cells"),
+  fill_order    = GROUP_ORDER_PUB,
+  x_labels      = NULL,
+  legend_labels = PUB_GROUP_LABELS,
+  y_label       = "CD6 RNA expression",
+  ref_group     = NULL,
+  show_points   = TRUE, point_size = 0.3, point_alpha = 1,
+  base_size     = 12
+) +
+  ggpubr::stat_pvalue_manual(stats_cd6, label = "p.adj.signif",
+                             tip.length = 0.01, bracket.size = 0.3, size = 2.5,
+                             hide.ns = FALSE, inherit.aes = FALSE) +
+  ggplot2::coord_cartesian(ylim = c(0, cd6_y_max))
+p_cd6_pts
+
+ggsave(paste0(fig_out, "CD6_per_NKsubset_with-points.pdf"),
+       p_cd6_pts, width = 9, height = 2, device = cairo_pdf)
+```
+
+## ___All CD6 ligands___
+
+**CD6 ligands: ALCAM, CDCP1, CD44, LCP2**
+
+### ___On NK cells___
+
+```{r fig.height=6, fig.width=9}
+CD6_receptors <- c("CDCP1", "CD44", "LCP2")
+
+df_cd6r_nk <- Seurat::FetchData(ALL_NK,
+                                vars = c(CD6_receptors,
+                                         "predicted_NK_type_de.n350", "group"),
+                                layer = "data") %>%
+  tidyr::pivot_longer(cols = all_of(CD6_receptors),
+                      names_to = "gene", values_to = "value") %>%
+  dplyr::filter(group %in% GROUP_ORDER_PUB,
+                predicted_NK_type_de.n350 %in% NK_SUBSET_ORDER) %>%
+  dplyr::mutate(
+    group  = factor(group, levels = GROUP_ORDER_PUB),
+    subset = factor(predicted_NK_type_de.n350, levels = NK_SUBSET_ORDER),
+    gene   = dplyr::recode(gene, CDCP1 = "CDCP1 (= CD318 protein)")
+  )
+
+.cd6r_nk_violin <- function(show_pts) {
+  pub_violin(
+    data          = df_cd6r_nk,
+    x_col         = "group",
+    y_col         = "value",
+    colors        = COLOR_CODE_GROUP,
+    x_order       = GROUP_ORDER_PUB,
+    x_labels      = PUB_GROUP_LABELS,
+    legend_labels = PUB_GROUP_LABELS,
+    y_label       = "RNA expression",
+    ref_group     = "control",
+    stat_label    = "p.signif",
+    hide_ns       = TRUE,
+    show_points   = show_pts,
+    point_size    = 0.3,
+    point_alpha   = 1,
+    base_size     = 12,
+    x_angle       = 45
+  ) + ggplot2::facet_wrap(~ gene, scales = "free_y", nrow = 1)
+}
+
+p_cd6r_nk     <- .cd6r_nk_violin(FALSE)
+p_cd6r_nk_pts <- .cd6r_nk_violin(TRUE)
+
+p_cd6r_nk_stack <- patchwork::wrap_plots(p_cd6r_nk, p_cd6r_nk_pts, ncol = 1)
+p_cd6r_nk_stack
+
+ggsave(paste0(fig_out, "CD6_receptors_NK_no-points.pdf"),
+       p_cd6r_nk, width = 9, height = 3, device = cairo_pdf)
+ggsave(paste0(fig_out, "CD6_receptors_NK_with-points.pdf"),
+       p_cd6r_nk_pts, width = 9, height = 3, device = cairo_pdf)
+ggsave(paste0(fig_out, "CD6_receptors_NK_stacked.pdf"),
+       p_cd6r_nk_stack, width = 9, height = 6, device = cairo_pdf)
+```
+
+### ___On tumor cells___
+
+**Testing for tumor-tumor interactions**
+
+```{r fig.height=4, fig.width=7}
+CD6_receptors_nb <- c("ALCAM", "CDCP1", "CD44", "LCP2")
+
+df_cd6r_nb <- Seurat::FetchData(ALL_NB,
+                                vars = c(CD6_receptors_nb, "group"),
+                                layer = "data") %>%
+  tidyr::pivot_longer(cols = all_of(CD6_receptors_nb),
+                      names_to = "gene", values_to = "value") %>%
+  dplyr::filter(group %in% GROUP_ORDER_NB) %>%
+  dplyr::mutate(group = factor(group, levels = GROUP_ORDER_NB))
+
+p_cd6r_nb <- pub_violin(
+  data          = df_cd6r_nb,
+  x_col         = "group",
+  y_col         = "value",
+  colors        = COLOR_CODE_GROUP,
+  x_order       = GROUP_ORDER_NB,
+  x_labels      = PUB_GROUP_LABELS,
+  legend_labels = PUB_GROUP_LABELS,
+  y_label       = "RNA expression",
+  ref_group     = NULL,
+  comparisons   = COMPS_NB,
+  stat_label    = "p.signif",
+  hide_ns       = TRUE
+) +
+  ggplot2::facet_wrap(~ gene, scales = "free_y", nrow = 1)
+p_cd6r_nb
+
+ggsave(paste0(fig_out, "CD6_receptors_NB_no-points.pdf"),
+       p_cd6r_nb, width = 7, height = 4, device = cairo_pdf)
+
+ggsave(paste0(fig_out, "CD6_receptors_NB_with-points.pdf"),
+       pub_violin(
+         data = df_cd6r_nb, x_col = "group", y_col = "value",
+         colors = COLOR_CODE_GROUP, x_order = GROUP_ORDER_NB,
+         x_labels = PUB_GROUP_LABELS, legend_labels = PUB_GROUP_LABELS,
+         y_label = "RNA expression", ref_group = NULL,
+         comparisons = COMPS_NB, stat_label = "p.signif", hide_ns = FALSE,
+         show_points = TRUE, point_size = 1, point_alpha = 1
+       ) + ggplot2::facet_wrap(~ gene, scales = "free_y", nrow = 1),
+       width = 7, height = 4, device = cairo_pdf)
+```
+
+### ___All cell types___
+
+```{r fig.height=10, fig.width=10}
+# CD6 + CD6 receptors across all cell types (fetahu2023)
+CD6_ALL_GENES <- c("CD6", "CDCP1", "CD44", "LCP2")
+
+df_cd6r_all <- Seurat::FetchData(fetahu2023,
+                                  vars  = c(CD6_ALL_GENES, "celltype", "group"),
+                                  layer = "data") %>%
+  tidyr::pivot_longer(cols = all_of(CD6_ALL_GENES),
+                      names_to = "gene", values_to = "value") %>%
+  dplyr::filter(group %in% GROUP_ORDER_PUB) %>%
+  dplyr::mutate(
+    group = factor(group, levels = GROUP_ORDER_PUB),
+    gene  = factor(gene,  levels = CD6_ALL_GENES)
+  )
+
+.ct_lvls_cd6 <- levels(factor(df_cd6r_all$celltype))
+
+stats_cd6r_all <- df_cd6r_all %>%
+  dplyr::group_by(gene, celltype) %>%
+  dplyr::group_modify(~ {
+    d <- droplevels(.x)
+    if (length(unique(d$group)) < 2)   return(data.frame())
+    if (!"control" %in% d$group)        return(data.frame())
+    if (length(unique(d$value)) < 2)    return(data.frame())
+    tryCatch(
+      rstatix::wilcox_test(d, value ~ group, ref.group = "control",
+                           p.adjust.method = "BH", exact = FALSE),
+      error = function(e) data.frame()
+    )
+  }) %>%
+  rstatix::add_significance("p.adj", cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1),
+                            symbols = c("****", "***", "**", "*", "ns")) %>%
+  dplyr::ungroup()
+
+.grp_lvls_cd6 <- levels(df_cd6r_all$group)
+.n_grp_cd6    <- length(.grp_lvls_cd6); .dw_cd6 <- 0.85
+.gpos_cd6     <- function(ct, grp)
+  match(ct, .ct_lvls_cd6) +
+  (match(grp, .grp_lvls_cd6) - (.n_grp_cd6 + 1) / 2) * .dw_cd6 / .n_grp_cd6
+.ymax_cd6 <- df_cd6r_all %>%
+  dplyr::group_by(gene, celltype) %>%
+  dplyr::summarise(ymax = max(value, na.rm = TRUE), .groups = "drop")
+stats_cd6r_all <- stats_cd6r_all %>%
+  dplyr::left_join(.ymax_cd6, by = c("gene", "celltype")) %>%
+  dplyr::group_by(gene, celltype) %>%
+  dplyr::mutate(
+    x          = match(celltype, .ct_lvls_cd6),
+    xmin       = mapply(.gpos_cd6, celltype, group1),
+    xmax       = mapply(.gpos_cd6, celltype, group2),
+    y.position = ymax + dplyr::row_number() * pmax(ymax, 0.05) * 0.10
+  ) %>%
+  dplyr::ungroup() %>% dplyr::select(-ymax)
+
+.make_cd6r_all_plot <- function(show_pts) {
+  pub_violin(
+    data          = df_cd6r_all,
+    x_col         = "celltype",
+    y_col         = "value",
+    fill_col      = "group",
+    colors        = COLOR_CODE_GROUP,
+    x_order       = .ct_lvls_cd6,
+    fill_order    = GROUP_ORDER_PUB,
+    x_labels      = NULL,
+    legend_labels = PUB_GROUP_LABELS,
+    y_label       = "RNA expression",
+    ref_group     = NULL,
+    show_points   = show_pts,
+    point_size    = 0.2, point_alpha = 1,
+    base_size     = 10
+  ) +
+    ggpubr::stat_pvalue_manual(stats_cd6r_all, label = "p.adj.signif",
+                               tip.length = 0.01, bracket.size = 0.25, size = 2,
+                               hide.ns = TRUE, inherit.aes = FALSE) +
+    ggplot2::facet_wrap(~ gene, scales = "free_y", ncol = 1) +
+    ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0, 0.05)))
+}
+
+p_cd6r_all     <- .make_cd6r_all_plot(FALSE)
+p_cd6r_all_pts <- .make_cd6r_all_plot(TRUE)
+p_cd6r_all
+p_cd6r_all_pts
+
+ggsave(paste0(fig_out, "CD6_allCellTypes_no-points.pdf"),
+       p_cd6r_all, width = 10, height = 10, device = cairo_pdf)
+ggsave(paste0(fig_out, "CD6_allCellTypes_with-points.pdf"),
+       p_cd6r_all_pts, width = 10, height = 10, device = cairo_pdf)
+```
+
+# ___ALCAM ligand - receptor axis___
+
+## ___ALCAM expression per NB group___
+
+```{r fig.height=3, fig.width=4}
+# NB cells only — no subsets, no control group; pairwise among 3 tumor groups
+df_alcam_nb <- Seurat::FetchData(ALL_NB,
+                                  vars  = c("ALCAM", "group"),
+                                  layer = "data") %>%
+  dplyr::rename(value = ALCAM) %>%
+  dplyr::filter(group %in% GROUP_ORDER_NB) %>%
+  dplyr::mutate(group = factor(group, levels = GROUP_ORDER_NB))
+
+p_alcam_nb <- pub_violin(
+  data          = df_alcam_nb,
+  x_col         = "group",
+  y_col         = "value",
+  colors        = COLOR_CODE_GROUP,
+  x_order       = GROUP_ORDER_NB,
+  x_labels      = PUB_GROUP_LABELS,
+  legend_labels = PUB_GROUP_LABELS,
+  y_label       = "ALCAM RNA expression",
+  ref_group     = NULL,
+  comparisons   = COMPS_NB,
+  stat_label    = "p.signif",
+  hide_ns       = FALSE,
+  show_points   = FALSE,
+  base_size     = 12
+)
+p_alcam_nb
+
+ggsave(paste0(fig_out, "ALCAM_NB_no-points.pdf"),
+       p_alcam_nb, width = 4, height = 3, device = cairo_pdf)
+
+p_alcam_nb_pts <- pub_violin(
+  data          = df_alcam_nb,
+  x_col         = "group",
+  y_col         = "value",
+  colors        = COLOR_CODE_GROUP,
+  x_order       = GROUP_ORDER_NB,
+  x_labels      = PUB_GROUP_LABELS,
+  legend_labels = PUB_GROUP_LABELS,
+  y_label       = "ALCAM RNA expression",
+  ref_group     = NULL,
+  comparisons   = COMPS_NB,
+  stat_label    = "p.signif",
+  hide_ns       = FALSE,
+  show_points   = TRUE, point_size = 0.3, point_alpha = 1,
+  base_size     = 12
+)
+p_alcam_nb_pts
+
+ggsave(paste0(fig_out, "ALCAM_NB_with-points.pdf"),
+       p_alcam_nb_pts, width = 4, height = 3, device = cairo_pdf)
+```
+
+## ___All ALCAM receptors___
+
+### ___On NK cells___
+
+**ALCAM receptors: LILRB4, CD9, L1CAM, S100B, LGALS1, LGALS3, LGALS8, SDCBP, EZR, ADAM17, MMP14**
+
+```{r fig.height=10, fig.width=10}
+ALCAM_ligands <- c("CD6", "LILRB4", "CD9", "L1CAM",
+                   "S100B", "LGALS1", "LGALS3", "LGALS8",
+                   "SDCBP", "EZR", "ADAM17", "MMP14")
+
+df_alcam_lig <- Seurat::FetchData(ALL_NK,
+                                  vars = c(ALCAM_ligands,
+                                           "predicted_NK_type_de.n350", "group"),
+                                  layer = "data") %>%
+  tidyr::pivot_longer(cols = all_of(ALCAM_ligands),
+                      names_to = "gene", values_to = "value") %>%
+  dplyr::filter(group %in% GROUP_ORDER_PUB) %>%
+  dplyr::mutate(
+    group  = factor(group, levels = GROUP_ORDER_PUB),
+    subset = factor(predicted_NK_type_de.n350, levels = NK_SUBSET_ORDER),
+    gene   = factor(gene, levels = ALCAM_ligands)
+  )
+
+p_alcam_lig <- pub_violin(
+  data          = df_alcam_lig,
+  x_col         = "group",
+  y_col         = "value",
+  colors        = COLOR_CODE_GROUP,
+  x_order       = GROUP_ORDER_PUB,
+  x_labels      = PUB_GROUP_LABELS,
+  legend_labels = PUB_GROUP_LABELS,
+  y_label       = "RNA expression",
+  ref_group     = "control",
+  stat_label    = "p.signif",
+  hide_ns       = TRUE,
+  show_points   = FALSE
+) +
+  ggplot2::facet_wrap(~ gene, scales = "free_y", ncol = 4) +
+  ggplot2::theme(legend.position = "top")
+p_alcam_lig
+
+ggsave(paste0(fig_out, "ALCAM_ligands_NK_no-points.pdf"),
+       p_alcam_lig, width = 10, height = 10, device = cairo_pdf)
+
+p_alcam_lig_pts <- pub_violin(
+  data          = df_alcam_lig,
+  x_col         = "group",
+  y_col         = "value",
+  colors        = COLOR_CODE_GROUP,
+  x_order       = GROUP_ORDER_PUB,
+  x_labels      = PUB_GROUP_LABELS,
+  legend_labels = PUB_GROUP_LABELS,
+  y_label       = "RNA expression",
+  ref_group     = "control",
+  stat_label    = "p.signif",
+  hide_ns       = TRUE,
+  show_points   = TRUE, point_size = 0.2, point_alpha = 1
+) +
+  ggplot2::facet_wrap(~ gene, scales = "free_y", ncol = 4) +
+  ggplot2::theme(legend.position = "top")
+p_alcam_lig_pts
+
+ggsave(paste0(fig_out, "ALCAM_ligands_NK_with-points.pdf"),
+       p_alcam_lig_pts, width = 10, height = 10, device = cairo_pdf)
+```
+
+### ___On tumor cells___
+
+```{r fig.height=10, fig.width=10}
+df_alcam_lig_nb <- Seurat::FetchData(ALL_NB,
+                                     vars  = c(ALCAM_ligands, "group"),
+                                     layer = "data") %>%
+  tidyr::pivot_longer(cols = all_of(ALCAM_ligands),
+                      names_to = "gene", values_to = "value") %>%
+  dplyr::filter(group %in% GROUP_ORDER_NB) %>%
+  dplyr::mutate(
+    group = factor(group, levels = GROUP_ORDER_NB),
+    gene  = factor(gene,  levels = ALCAM_ligands)
+  )
+
+p_alcam_lig_nb <- pub_violin(
+  data          = df_alcam_lig_nb,
+  x_col         = "group",
+  y_col         = "value",
+  colors        = COLOR_CODE_GROUP,
+  x_order       = GROUP_ORDER_NB,
+  x_labels      = PUB_GROUP_LABELS,
+  legend_labels = PUB_GROUP_LABELS,
+  y_label       = "RNA expression",
+  ref_group     = NULL,
+  comparisons   = COMPS_NB,
+  stat_label    = "p.signif",
+  hide_ns       = TRUE,
+  show_points   = FALSE
+) +
+  ggplot2::facet_wrap(~ gene, scales = "free_y", ncol = 4) +
+  ggplot2::theme(legend.position = "top")
+p_alcam_lig_nb
+
+ggsave(paste0(fig_out, "ALCAM_ligands_NB_no-points.pdf"),
+       p_alcam_lig_nb, width = 10, height = 10, device = cairo_pdf)
+
+p_alcam_lig_nb_pts <- pub_violin(
+  data          = df_alcam_lig_nb,
+  x_col         = "group",
+  y_col         = "value",
+  colors        = COLOR_CODE_GROUP,
+  x_order       = GROUP_ORDER_NB,
+  x_labels      = PUB_GROUP_LABELS,
+  legend_labels = PUB_GROUP_LABELS,
+  y_label       = "RNA expression",
+  ref_group     = NULL,
+  comparisons   = COMPS_NB,
+  stat_label    = "p.signif",
+  hide_ns       = TRUE,
+  show_points   = TRUE, point_size = 0.2, point_alpha = 1
+) +
+  ggplot2::facet_wrap(~ gene, scales = "free_y", ncol = 4) +
+  ggplot2::theme(legend.position = "top")
+p_alcam_lig_nb_pts
+
+ggsave(paste0(fig_out, "ALCAM_ligands_NB_with-points.pdf"),
+       p_alcam_lig_nb_pts, width = 10, height = 10, device = cairo_pdf)
+```
+
+### ___All cell types___
+
+```{r fig.height=32, fig.width=10}
+ALCAM_ALL_GENES <- unique(c("ALCAM", ALCAM_ligands))
+
+df_alcam_all <- Seurat::FetchData(fetahu2023,
+                                   vars  = c(ALCAM_ALL_GENES, "celltype", "group"),
+                                   layer = "data") %>%
+  tidyr::pivot_longer(cols = all_of(ALCAM_ALL_GENES),
+                      names_to = "gene", values_to = "value") %>%
+  dplyr::filter(group %in% GROUP_ORDER_PUB) %>%
+  dplyr::mutate(
+    group = factor(group, levels = GROUP_ORDER_PUB),
+    gene  = factor(gene,  levels = ALCAM_ALL_GENES)
+  )
+
+.ct_lvls_alcam <- levels(factor(df_alcam_all$celltype))
+
+stats_alcam_all <- df_alcam_all %>%
+  dplyr::group_by(gene, celltype) %>%
+  dplyr::group_modify(~ {
+    d <- droplevels(.x)
+    if (length(unique(d$group)) < 2)   return(data.frame())
+    if (!"control" %in% d$group)        return(data.frame())
+    if (length(unique(d$value)) < 2)    return(data.frame())
+    tryCatch(
+      rstatix::wilcox_test(d, value ~ group, ref.group = "control",
+                           p.adjust.method = "BH", exact = FALSE),
+      error = function(e) data.frame()
+    )
+  }) %>%
+  rstatix::add_significance("p.adj", cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1),
+                            symbols = c("****", "***", "**", "*", "ns")) %>%
+  dplyr::ungroup()
+
+.grp_lvls_alcam <- levels(df_alcam_all$group)
+.n_grp_alcam    <- length(.grp_lvls_alcam); .dw_alcam <- 0.85
+.gpos_alcam     <- function(ct, grp)
+  match(ct, .ct_lvls_alcam) +
+  (match(grp, .grp_lvls_alcam) - (.n_grp_alcam + 1) / 2) * .dw_alcam / .n_grp_alcam
+.ymax_alcam <- df_alcam_all %>%
+  dplyr::group_by(gene, celltype) %>%
+  dplyr::summarise(ymax = max(value, na.rm = TRUE), .groups = "drop")
+stats_alcam_all <- stats_alcam_all %>%
+  dplyr::left_join(.ymax_alcam, by = c("gene", "celltype")) %>%
+  dplyr::group_by(gene, celltype) %>%
+  dplyr::mutate(
+    x          = match(celltype, .ct_lvls_alcam),
+    xmin       = mapply(.gpos_alcam, celltype, group1),
+    xmax       = mapply(.gpos_alcam, celltype, group2),
+    y.position = ymax + dplyr::row_number() * pmax(ymax, 0.05) * 0.10
+  ) %>%
+  dplyr::ungroup() %>% dplyr::select(-ymax)
+
+.make_alcam_all_plot <- function(show_pts) {
+  pub_violin(
+    data          = df_alcam_all,
+    x_col         = "celltype",
+    y_col         = "value",
+    fill_col      = "group",
+    colors        = COLOR_CODE_GROUP,
+    x_order       = .ct_lvls_alcam,
+    fill_order    = GROUP_ORDER_PUB,
+    x_labels      = NULL,
+    legend_labels = PUB_GROUP_LABELS,
+    y_label       = "RNA expression",
+    ref_group     = NULL,
+    show_points   = show_pts,
+    point_size    = 0.2, point_alpha = 1,
+    base_size     = 10
+  ) +
+    ggpubr::stat_pvalue_manual(stats_alcam_all, label = "p.adj.signif",
+                               tip.length = 0.01, bracket.size = 0.25, size = 2,
+                               hide.ns = TRUE, inherit.aes = FALSE) +
+    ggplot2::facet_wrap(~ gene, scales = "free_y", ncol = 1) +
+    ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0, 0.05)))
+}
+
+p_alcam_all     <- .make_alcam_all_plot(FALSE)
+p_alcam_all_pts <- .make_alcam_all_plot(TRUE)
+p_alcam_all
+p_alcam_all_pts
+
+ggsave(paste0(fig_out, "ALCAM_allCellTypes_no-points.pdf"),
+       p_alcam_all, width = 10, height = 32, device = cairo_pdf)
+ggsave(paste0(fig_out, "ALCAM_allCellTypes_with-points.pdf"),
+       p_alcam_all_pts, width = 10, height = 32, device = cairo_pdf)
+```
+
+# ___CD160 and CD52 expression in NK cell subsets___
+
+**Reviewer #1, question #7**
+
+```{r fig.height=3, fig.width=7}
+NK_MARKER_GENES <- c("CD160", "CD52")
+
+df_nk_markers <- Seurat::FetchData(ALL_NK,
+                                    vars  = c(NK_MARKER_GENES,
+                                              "predicted_NK_type_de.n350", "group"),
+                                    layer = "data") %>%
+  tidyr::pivot_longer(cols = all_of(NK_MARKER_GENES),
+                      names_to = "gene", values_to = "value") %>%
+  dplyr::filter(group %in% GROUP_ORDER_PUB,
+                predicted_NK_type_de.n350 %in% NK_SUBSET_ORDER) %>%
+  dplyr::mutate(
+    group  = factor(group,  levels = GROUP_ORDER_PUB),
+    subset = factor(predicted_NK_type_de.n350, levels = NK_SUBSET_ORDER),
+    gene   = factor(gene, levels = NK_MARKER_GENES)
+  )
+
+# Plot 1: control samples only, one violin per NK subset
+df_nk_ctrl <- dplyr::filter(df_nk_markers, group == "control")
+
+# NK subset colours (from COLOR_CODE_v2 in setup)
+NK_SUBSET_COLORS <- c(
+  hNK_Bm1 = "#6376AE",
+  hNK_Bm2 = "#679F8F",
+  hNK_Bm3 = "#BF4E4E",
+  hNK_Bm4 = "#CDA646"
+)
+
+# All pairwise comparisons among the 4 NK subsets
+COMPS_NK_SUBSETS <- utils::combn(NK_SUBSET_ORDER, 2, simplify = FALSE)
+
+p_nk_ctrl <- pub_violin(
+  data        = df_nk_ctrl,
+  x_col       = "subset",
+  y_col       = "value",
+  colors      = NK_SUBSET_COLORS,
+  x_order     = NK_SUBSET_ORDER,
+  x_labels    = NULL,
+  y_label     = "RNA expression",
+  ref_group   = NULL,
+  comparisons = COMPS_NK_SUBSETS,
+  stat_label  = "p.signif",
+  hide_ns     = TRUE,
+  show_points = FALSE,
+  base_size   = 10
+) +
+  ggplot2::ggtitle("Control samples") +
+  ggplot2::facet_wrap(~ gene, scales = "free_y", nrow = 1) +
+  ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0, 0.05)))
+p_nk_ctrl
+
+ggsave(paste0(fig_out, "CD160_CD52_NK_control-only.pdf"),
+       p_nk_ctrl, width = 7, height = 3, device = cairo_pdf)
+```
+
+```{r fig.height=3, fig.width=9}
+# Plot 2: x = group, fill = NK subset, stats = hNK_Bm2 vs hNK_Bm3 within each group
+stats_bm2v3 <- df_nk_markers %>%
+  dplyr::filter(subset %in% c("hNK_Bm2", "hNK_Bm3")) %>%
+  dplyr::group_by(gene, group) %>%
+  dplyr::group_modify(~ {
+    d <- droplevels(.x)
+    if (length(unique(d$subset)) < 2)  return(data.frame())
+    if (length(unique(d$value))  < 2)  return(data.frame())
+    tryCatch(
+      rstatix::wilcox_test(d, value ~ subset, p.adjust.method = "BH", exact = FALSE),
+      error = function(e) data.frame()
+    )
+  }) %>%
+  dplyr::ungroup() %>%
+  rstatix::adjust_pvalue(method = "BH") %>%
+  rstatix::add_significance("p.adj", cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1),
+                            symbols = c("****", "***", "**", "*", "ns"))
+
+# Bracket positions: x = group position, xmin/xmax = dodge positions of Bm2 and Bm3
+.grp_lvls_nm <- levels(df_nk_markers$group)
+.sub_lvls_nm <- levels(df_nk_markers$subset)
+.n_sub_nm    <- length(.sub_lvls_nm); .dw_nm <- 0.85
+.spos_nm     <- function(grp, sub)
+  match(grp, .grp_lvls_nm) +
+  (match(sub, .sub_lvls_nm) - (.n_sub_nm + 1) / 2) * .dw_nm / .n_sub_nm
+.ymax_bm2v3 <- df_nk_markers %>%
+  dplyr::filter(subset %in% c("hNK_Bm2", "hNK_Bm3")) %>%
+  dplyr::group_by(gene, group) %>%
+  dplyr::summarise(ymax = max(value, na.rm = TRUE), .groups = "drop")
+stats_bm2v3 <- stats_bm2v3 %>%
+  dplyr::left_join(.ymax_bm2v3, by = c("gene", "group")) %>%
+  dplyr::mutate(
+    x          = match(group, .grp_lvls_nm),
+    xmin       = mapply(.spos_nm, group, group1),
+    xmax       = mapply(.spos_nm, group, group2),
+    y.position = ymax * 1.15
+  ) %>%
+  dplyr::select(-ymax)
+
+.nm2_y_max <- max(max(df_nk_markers$value, na.rm = TRUE),
+                  max(stats_bm2v3$y.position, na.rm = TRUE)) * 1.05
+
+p_nk_grouped <- pub_violin(
+  data          = df_nk_markers,
+  x_col         = "group",
+  y_col         = "value",
+  fill_col      = "subset",
+  colors        = NK_SUBSET_COLORS,
+  x_order       = GROUP_ORDER_PUB,
+  fill_order    = NK_SUBSET_ORDER,
+  x_labels      = PUB_GROUP_LABELS,
+  legend_labels = NULL,
+  y_label       = "RNA expression",
+  ref_group     = NULL,
+  show_points   = FALSE,
+  base_size     = 10
+) +
+  ggpubr::stat_pvalue_manual(stats_bm2v3, label = "p.adj.signif",
+                              tip.length = 0.01, bracket.size = 0.25, size = 2,
+                              hide.ns = TRUE, inherit.aes = FALSE) +
+  ggplot2::facet_wrap(~ gene, scales = "free_y", nrow = 1) +
+  ggplot2::coord_cartesian(ylim = c(0, .nm2_y_max)) +
+  ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0, 0.05)))
+p_nk_grouped
+
+ggsave(paste0(fig_out, "CD160_CD52_NK_per-group.pdf"),
+       p_nk_grouped, width = 9, height = 3, device = cairo_pdf)
+```
+
+# ___New adolescent hBM-NK dataset___
+
+**Paper: Hanemaaijer, E.S., Müskens, K.F., Kal, I.J. et al. (2026). Single-cell multiomic atlas of healthy pediatric bone marrow reveals age-dependent differences in lineage differentiation driven by stromal signaling. Nat Immunol 27, 613–623**
+
+**DOI: 10.1038/s41590-026-02422-9**
+**URL: https://doi.org/10.1038/s41590-026-02422-9**
+
+
+**Data source: Belderbos, M. E. (2026). Scripts and data supporting the manuscript "Single-cell multiomic atlas of healthy pediatric bone marrow reveals age-dependent differences in lineage differentiation driven by stromal signaling". Zenodo**
+
+**DOI: 10.5281/zenodo.18632238**
+**URL: https://doi.org/10.5281/zenodo.18632238**
+
+
+# ___Exploratory analysis___
+
+## ___Other predicted L-R pairs___
+
+```{r fig.height=4, fig.width=6}
+# Predicted interaction:  PRSS3 (on NB cells) - F2R (on NK cells)
+new_candidates <- c("PRSS3", "F2R")     
+
+df_cand <- Seurat::FetchData(fetahu2023,
+                             vars = c(new_candidates, "cell_type", "group"),
+                             layer = "data") %>%
+  tidyr::pivot_longer(cols = all_of(new_candidates),
+                      names_to = "gene", values_to = "value") %>%
+  dplyr::filter(group %in% GROUP_ORDER_PUB) %>%
+  dplyr::mutate(group = factor(group, levels = GROUP_ORDER_PUB))
+
+pub_violin(
+  data          = df_cand,
+  x_col         = "group",
+  y_col         = "value",
+  colors        = COLOR_CODE_GROUP,
+  x_order       = GROUP_ORDER_PUB,
+  x_labels      = PUB_GROUP_LABELS,
+  legend_labels = PUB_GROUP_LABELS,
+  y_label       = "RNA expression",
+  ref_group     = "control",
+  stat_label    = "p.signif",
+  hide_ns       = TRUE
+) +
+  ggplot2::facet_wrap(~ gene, scales = "free_y", nrow = 1) +
+  ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0, 0.05)))
+```
+
+## ___CD39 expression___
+
+**ENTPD1 gene = CD39 protein**
+
+```{r fig.height=4, fig.width=5}
+df_cd39 <- Seurat::FetchData(ALL_NK,
+                             vars = c("ENTPD1", "predicted_NK_type_de.n350", "group"),
+                             layer = "data") %>%
+  dplyr::rename(value = ENTPD1) %>%
+  dplyr::filter(group %in% GROUP_ORDER_PUB,
+                predicted_NK_type_de.n350 %in% NK_SUBSET_ORDER) %>%
+  dplyr::mutate(
+    group  = factor(group,  levels = GROUP_ORDER_PUB),
+    subset = factor(predicted_NK_type_de.n350, levels = NK_SUBSET_ORDER)
+  )
+
+stats_cd39 <- df_cd39 %>%
+  dplyr::group_by(subset) %>%
+  dplyr::group_modify(~ {
+    d <- droplevels(.x)
+    if (length(unique(d$group)) < 2)  return(data.frame())
+    if (!"control" %in% d$group)       return(data.frame())
+    if (length(unique(d$value)) < 2)   return(data.frame())
+    tryCatch(
+      rstatix::wilcox_test(d, value ~ group, ref.group = "control",
+                           p.adjust.method = "BH", exact = FALSE),
+      error = function(e) data.frame()
+    )
+  }) %>%
+  rstatix::add_significance("p.adj", cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1),
+                            symbols = c("****", "***", "**", "*", "ns")) %>%
+  dplyr::ungroup()
+
+# Manual x/y positions — avoids add_xy_position density estimation
+# which fails when all values in a group are 0 (degenerate distribution)
+.sub_lvls  <- levels(df_cd39$subset)
+.grp_lvls  <- levels(df_cd39$group)
+.n_grp     <- length(.grp_lvls)
+.dw        <- 0.85
+.gpos      <- function(sub, grp)
+  match(sub, .sub_lvls) + (match(grp, .grp_lvls) - (.n_grp + 1) / 2) * .dw / .n_grp
+
+.ymax_sub <- df_cd39 %>%
+  dplyr::group_by(subset) %>%
+  dplyr::summarise(ymax = max(value, na.rm = TRUE), .groups = "drop")
+
+stats_cd39 <- stats_cd39 %>%
+  dplyr::left_join(.ymax_sub, by = "subset") %>%
+  dplyr::group_by(subset) %>%
+  dplyr::mutate(
+    x          = match(subset, .sub_lvls),
+    xmin       = mapply(.gpos, subset, group1),
+    xmax       = mapply(.gpos, subset, group2),
+    y.position = ymax + dplyr::row_number() * pmax(ymax, 0.05) * 0.12
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-ymax)
+
+p_cd39 <- pub_violin(
+  data          = df_cd39,
+  x_col         = "subset",
+  y_col         = "value",
+  fill_col      = "group",
+  colors        = COLOR_CODE_GROUP,
+  x_order       = NK_SUBSET_ORDER,
+  fill_order    = GROUP_ORDER_PUB,
+  legend_labels = PUB_GROUP_LABELS,
+  y_label       = "CD39 (ENTPD1) RNA expression",
+  ref_group     = NULL,
+  show_points   = FALSE
+) +
+  ggpubr::stat_pvalue_manual(stats_cd39, label = "p.adj.signif",
+                             tip.length = 0.01, bracket.size = 0.3, size = 2.5,
+                             hide.ns = FALSE, inherit.aes = FALSE)
+p_cd39
+
+ggsave(paste0(fig_out, "CD39_NK_no-points.pdf"),
+       p_cd39, width = 5, height = 4, device = cairo_pdf)
+
+p_cd39_pts <- pub_violin(
+  data          = df_cd39,
+  x_col         = "subset",
+  y_col         = "value",
+  fill_col      = "group",
+  colors        = COLOR_CODE_GROUP,
+  x_order       = NK_SUBSET_ORDER,
+  fill_order    = GROUP_ORDER_PUB,
+  legend_labels = PUB_GROUP_LABELS,
+  y_label       = "CD39 (ENTPD1) RNA expression",
+  ref_group     = NULL,
+  show_points   = TRUE, point_size = 0.3, point_alpha = 1
+) +
+  ggpubr::stat_pvalue_manual(stats_cd39, label = "p.adj.signif",
+                             tip.length = 0.01, bracket.size = 0.3, size = 2.5,
+                             hide.ns = FALSE, inherit.aes = FALSE)
+p_cd39_pts
+
+ggsave(paste0(fig_out, "CD39_NK_with-points.pdf"),
+       p_cd39_pts, width = 5, height = 4, device = cairo_pdf)
+```
+
+## ___Adaptive NK cell signature___
+
+```{r fig.height=4, fig.width=3}
+# adaptive_NK_genes loaded via source(00_NK_paper_setup.R)
+ALL_NK <- Seurat::AddModuleScore(ALL_NK,
+                                 features = list(adaptive = adaptive_NK_genes),
+                                 name     = "AdaptiveNK_score")
+
+df_adapt <- data.frame(
+  value  = ALL_NK$AdaptiveNK_score1,
+  group  = factor(ALL_NK$group, levels = GROUP_ORDER_PUB),
+  subset = factor(ALL_NK$predicted_NK_type_de.n350, levels = NK_SUBSET_ORDER)
+) %>% dplyr::filter(!is.na(group))
+
+p_adapt <- pub_violin(
+  data          = df_adapt,
+  x_col         = "group",
+  y_col         = "value",
+  colors        = COLOR_CODE_GROUP,
+  x_order       = GROUP_ORDER_PUB,
+  x_labels      = PUB_GROUP_LABELS,
+  legend_labels = PUB_GROUP_LABELS,
+  y_label       = "Adaptive NK module score",
+  ref_group     = "control",
+  stat_label    = "p.signif"
+)
+p_adapt
+
+ggsave(paste0(fig_out, "AdaptiveNK_score_no-points.pdf"),
+       p_adapt, width = 3.5, height = 3.5, device = cairo_pdf)
+
+ggsave(paste0(fig_out, "AdaptiveNK_score_with-points.pdf"),
+       pub_violin(
+         data = df_adapt, x_col = "group", y_col = "value",
+         colors = COLOR_CODE_GROUP, x_order = GROUP_ORDER_PUB,
+         x_labels = PUB_GROUP_LABELS, legend_labels = PUB_GROUP_LABELS,
+         y_label = "Adaptive NK module score", ref_group = "control",
+         stat_label = "p.signif",
+         show_points = TRUE, point_size = 0.4, point_alpha = 1
+       ),
+       width = 3.5, height = 3.5, device = cairo_pdf)
+```
+
+
+
+# ___SessionInfo___
+
+```{r}
+sessionInfo()
+```
+

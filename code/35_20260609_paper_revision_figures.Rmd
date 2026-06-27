@@ -1,0 +1,55 @@
+---
+title: "NK project: Paper revision figures, part III"
+subtitle: "snATAC-seq & scRNA-seq combined analysis"
+author: "Dr. Sara Wernig-Zorc"
+date: "2026-06-09"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  out: "/home/rstudio/mnt_out/NK_project/"
+  anno: "/home/rstudio/mnt_resources/"
+  input: "/home/rstudio/mnt_out/Rds/fetahu2023_withNewMetadata.Rds"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE, 
+                      error = FALSE, 
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = 'future::multicore', workers = 80)
+options(future.globals.maxSize = 80 * 10^9)
+print(params)
+```
+
+# ___Project specific setup___
+
+```{r load project specific R packages and color code, echo = FALSE}
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_setup.R")
+source("/home/rstudio/NK-NB_study/code/00_NK_paper_utils.R")
+set.seed(2805)
+```
+
+# ___Load data___
+
+```{r}
+
+```
+
+# ___Session info___
+
+```{r}
+sessionInfo()
+```
+
+
