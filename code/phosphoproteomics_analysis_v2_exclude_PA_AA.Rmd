@@ -1,0 +1,1428 @@
+---
+title: "Phosphoproteomics Analysis v2.3 — NK Cells and Neuroblastoma"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    code_folding: hide
+    theme: flatly
+---
+
+```{r knitr_setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 6,
+                      dev = c('png', 'cairo_pdf'))
+if (!requireNamespace("here", quietly = TRUE)) install.packages("here")
+library(here)
+```
+
+---
+
+## Parameters
+
+```{r params}
+data_file          <- here("../..", "data", "preprocessed", "20260504_Matrix_6.txt")
+gene_map_file      <- here("../..", "data", "metadata", "phosphoSite_MIA_map.txt")
+metadata_file      <- here("../..", "data", "metadata", "metadata.csv")
+raw_data_file      <- here("../..", "data", "raw", "Phospho_(STY)Sites.txt")
+out_dir            <- here("../..", "results","phosphoproteomics_analysis_R","analysis_results_v2_without_pa_aa")
+
+out_dir_nice <- "analysis_results_v2_without_pa_aa"
+
+contrasts_to_test <- c(
+  "conditionA - conditionP",
+  "conditionP - conditionNK",
+  "conditionA - conditionNK",
+  "conditionALCAM - conditionNK",
+  "conditionALCAM - conditionP",
+  "conditionALCAM - conditionA"
+)
+
+adj_p_cutoff <- 0.05
+logfc_cutoff <- 0.5
+
+condition_colours <- c(P = "#FAA21B", A = "#716B9C", ALCAM = "#FF6600", NK = "#6600FF")
+
+n_dot <- 20   # number of top pathways shown in enrichment dotplots
+```
+
+```{r setup_figdir, include=FALSE}
+figures_dir <- file.path(out_dir, "figures")
+dir.create(figures_dir, recursive = TRUE, showWarnings = FALSE)
+knitr::opts_chunk$set(fig.path = file.path(figures_dir, "inline/"))
+
+# Save a ggplot as PNG (for HTML embedding) + PDF (persistent). Returns PNG tempfile path.
+save_fig <- function(p, name, width, height, dpi = 150) {
+  tmp <- tempfile(fileext = ".png")
+  ggsave(tmp, p, width = width, height = height, dpi = dpi, limitsize = FALSE)
+  ggsave(file.path(figures_dir, paste0(name, ".pdf")),
+         p, width = width, height = height, device = grDevices::cairo_pdf, limitsize = FALSE)
+  tmp
+}
+
+# Save a pheatmap grob as PDF alongside an already-saved PNG.
+save_pheatmap_pdf <- function(pm, name, width, height) {
+  grDevices::cairo_pdf(file.path(figures_dir, paste0(name, ".pdf")), width = width, height = height)
+  grid::grid.newpage()
+  grid::grid.draw(pm$gtable)
+  dev.off()
+}
+```
+
+---
+
+## 1. Libraries
+
+```r
+cran_pkgs <- c("tidyverse", "pheatmap", "ggrepel", "UpSetR", "msigdbr", "patchwork")
+bioc_pkgs <- c("PhosR", "limma", "SummarizedExperiment", "RUVSeq", "GSVA")
+new_cran  <- cran_pkgs[!cran_pkgs %in% rownames(installed.packages())]
+if (length(new_cran)) install.packages(new_cran)
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+new_bioc  <- bioc_pkgs[!bioc_pkgs %in% rownames(installed.packages())]
+if (length(new_bioc)) BiocManager::install(new_bioc)
+install.packages("pak")
+pak::pkg_install("pathfindR")
+```
+
+```{r libraries}
+library(tidyverse)
+library(limma)
+library(PhosR)
+library(RUVSeq)
+library(SummarizedExperiment)
+library(pheatmap)
+library(ggrepel)
+library(pathfindR)
+library(UpSetR)
+library(msigdbr)
+library(GSVA)
+library(patchwork)
+library(org.Hs.eg.db)
+```
+
+---
+
+## 2. Data Import
+
+### 2.1 Perseus processed matrix
+
+The exported intensity file from Perseus, processed by the Proteomics team of the Molecular Discovery Platform at CeMM, is used for downstream analysis.
+
+```{r import_matrix}
+raw_lines    <- readLines(data_file)
+group_row    <- raw_lines[startsWith(raw_lines, "#!{C:Grouping1}")]
+group_values <- strsplit(group_row, "\t")[[1]]
+group_values[1] <- sub("#!\\{C:Grouping1\\}", "", group_values[1])
+data_lines   <- raw_lines[!startsWith(raw_lines, "#!")]
+dat <- read.table(text = paste(data_lines, collapse = "\n"), sep = "\t",
+                  header = TRUE, stringsAsFactors = FALSE, check.names = FALSE)
+
+int_cols     <- grep("^Reporter intensity corrected", colnames(dat), value = TRUE)
+channel_nums <- as.integer(str_extract(int_cols, "(?<=corrected )\\d+"))
+int_cols_ord <- int_cols[order(channel_nums)]
+channel_ord  <- sort(channel_nums)
+
+mat               <- as.matrix(dat[, int_cols_ord])
+storage.mode(mat) <- "double"
+site_ids          <- paste(dat$Protein, dat[["Positions within proteins"]], sep = "_")
+rownames(mat)     <- site_ids
+
+cat("Sites:", nrow(mat), "| Samples:", ncol(mat), "| NAs:", sum(is.na(mat)), "\n")
+```
+
+### 2.2 Gene name annotation
+
+Gene symbols are mapped to phosphosite identifiers using a gene map file derived from the Perseus output. Notably, the file's `Gene names` field lists more than one semicolon-separated gene symbol when a site is not uniquely resolved to a single gene. For these sites, only the first-listed gene symbol is retained as the primary annotation. Please see `` `r file.path(out_dir_nice, "gene_annotation", "ambiguous_gene_sites.csv")` `` for a full list of these sites. See section 4.7.1 for ambiguous sites that are found significantly differentially phosphorylated in at least one contrast.
+
+Note: `gene_map` is also deduplicated by `site_id`, to prevent a one-to-many join silently duplicating rows in `row_anno`, should the gene map file ever contain repeated site entries (it currently does not).
+
+```{r gene_map}
+gene_map <- read.table(gene_map_file, sep = "\t", header = TRUE,
+                       stringsAsFactors = FALSE, check.names = FALSE)
+colnames(gene_map)[1] <- "row_idx"
+gene_map <- gene_map |>
+  dplyr::mutate(site_id     = paste(Protein, `Positions within proteins`, sep = "_"),
+                gene_symbol = str_extract(`Gene names`, "^[^;]+")) |>
+  dplyr::select(site_id, gene_symbol, `Protein names`, `Gene names`) |>
+  dplyr::distinct(site_id, .keep_all = TRUE)
+
+row_anno <- data.frame(protein  = dat$Protein,
+                       position = dat[["Positions within proteins"]],
+                       site_id  = site_ids, stringsAsFactors = FALSE) |>
+  dplyr::left_join(dplyr::select(gene_map, -`Gene names`), by = "site_id")
+rownames(row_anno) <- site_ids
+
+# Sanity check: the join must be one-to-one and preserve every site from dat/mat
+stopifnot("row_anno row count must match dat/mat"                   = nrow(row_anno) == nrow(dat),
+          "row_anno rownames must match site_ids exactly, in order" = identical(rownames(row_anno), site_ids),
+          "join must not introduce duplicate site_ids"              = !any(duplicated(row_anno$site_id)))
+
+# Sites with more than one candidate gene name (semicolon-separated in `Gene names`)
+# are written out as a standalone file for documentation
+# it is not annotation used downstream in the analysis.
+ambiguous_sites <- gene_map |>
+  dplyr::filter(grepl(";", `Gene names`)) |>
+  dplyr::select(site_id, gene_symbol_retained = gene_symbol,
+                gene_names_full = `Gene names`, `Protein names`)
+
+dir.create(file.path(out_dir, "gene_annotation"), recursive = TRUE, showWarnings = FALSE)
+write_csv(ambiguous_sites, file.path(out_dir, "gene_annotation", "ambiguous_gene_sites.csv"))
+
+n_unmapped  <- sum(is.na(row_anno$gene_symbol))
+n_ambiguous <- nrow(ambiguous_sites)
+cat("row_anno rows:", nrow(row_anno),
+   "| sites with no gene_map match:", n_unmapped,
+   "| sites with ambiguous gene assignment:", n_ambiguous,
+   sprintf("(%.1f%%)\n", 100 * n_ambiguous / nrow(row_anno)))
+```
+
+`r n_ambiguous` of `r nrow(row_anno)` sites (`r round(100 * n_ambiguous / nrow(row_anno), 1)`%) have ambiguous gene assignment (more than one candidate gene name). These are carried forward through the analysis under their first-listed gene symbol; the subset that are significant in at least one differential phosphorylation analysis contrast is listed in Section 4.7.1.
+
+### 2.3 Sample metadata
+
+Sample metadata (TMT channel, condition, and donor) is loaded from a CSV file and matched to the channel order from the Perseus matrix. Consistency between the Perseus group annotation and the metadata file is verified before sample names are assigned to the matrix columns. Donor information is obtained from the `donor` column in `metadata.csv`.
+
+```{r metadata}
+perseus_conditions <- group_values[order(channel_nums)]
+meta  <- read_csv(metadata_file, show_col_types = FALSE)
+meta  <- meta[match(channel_ord, meta$channel), ]
+stopifnot("Channel order mismatch"   = all(meta$channel == channel_ord),
+          "Condition mismatch (PSP)" = all(meta$condition == perseus_conditions))
+colnames(mat) <- meta$sample_name
+
+# Exclude AA and PA samples
+excl_idx <- meta$condition %in% c("AA", "PA")
+cat("Excluding", sum(excl_idx), "sample(s) with condition AA or PA:",
+    paste(meta$sample_name[excl_idx], collapse = ", "), "\n")
+meta <- meta[!excl_idx, , drop = FALSE]
+mat  <- mat[, !excl_idx, drop = FALSE]
+
+knitr::kable(meta, caption = "Metadata")
+cat("Conditions:", paste(unique(meta$condition), collapse = ", "), "\n")
+cat("Donors:    ", paste(unique(meta$donor),     collapse = ", "), "\n")
+```
+
+---
+
+## 3. Quality Control
+
+### 3.1 Per-sample summaries
+
+```{r qc_summary}
+qc_df <- data.frame(
+  sample    = colnames(mat),
+  condition = meta$condition,
+  donor     = meta$donor,
+  median    = apply(mat, 2, median, na.rm = TRUE),
+  min       = apply(mat, 2, min,    na.rm = TRUE),
+  max       = apply(mat, 2, max,    na.rm = TRUE),
+  n_na      = colSums(is.na(mat))
+)
+knitr::kable(qc_df, digits = 3, caption = "Per-sample intensity summary")
+```
+
+### 3.2 Boxplot
+
+```{r qc_boxplot, fig.height=5}
+mat_long <- as.data.frame(mat) |>
+  tibble::rownames_to_column("site") |>
+  tidyr::pivot_longer(-site, names_to = "sample", values_to = "intensity") |>
+  dplyr::left_join(dplyr::select(meta, sample_name, condition, donor),
+                   by = c("sample" = "sample_name"))
+
+ggplot(mat_long, aes(x = sample, y = intensity, fill = condition)) +
+  geom_boxplot(outlier.size = 0.3, outlier.alpha = 0.3) +
+  scale_fill_manual(values = condition_colours) +
+  labs(title = "Intensity distributions (log2)", x = NULL, y = "log2 intensity") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+```
+
+### 3.3 PCA
+
+PC1 separates samples mostly by condition while PC2 distinctly separates samples by donor.
+
+```{r qc_pca, fig.width=7, fig.height=5}
+pca_res <- prcomp(t(mat), scale. = FALSE)
+var_exp <- round(summary(pca_res)$importance[2, 1:2] * 100, 1)
+pca_df  <- as.data.frame(pca_res$x[, 1:2]) |>
+  tibble::rownames_to_column("sample") |>
+  dplyr::left_join(dplyr::select(meta, sample_name, condition, donor),
+                   by = c("sample" = "sample_name"))
+
+ggplot(pca_df, aes(PC1, PC2, colour = condition, shape = donor, label = sample)) +
+  geom_point(size = 3) +
+  geom_text_repel(size = 2.5, show.legend = FALSE, max.overlaps = 20) +
+  scale_colour_manual(values = condition_colours) +
+  labs(x = paste0("PC1 (", var_exp[1], "%)"), y = paste0("PC2 (", var_exp[2], "%)"),
+       title = "PCA — all phosphosites") +
+  theme_bw()
+```
+
+#### 3.3.1 Top contributing sites per PC
+
+Heatmaps of the 30 phosphosites with the largest absolute loadings on PC1 and PC2. Rows are scaled (z-scored) across samples to highlight relative patterns.
+
+```{r qc_pca_loadings, fig.width=9, fig.height=9}
+n_top <- 30
+anno_col_pca <- data.frame(condition = meta$condition, donor = meta$donor,
+                           row.names = meta$sample_name)
+anno_colors_pca <- list(
+  condition = condition_colours[sort(unique(meta$condition))],
+  donor     = setNames(hcl.colors(length(unique(meta$donor)),     "Earth"),
+                       sort(unique(meta$donor)))
+)
+for (pc in c("PC1", "PC2")) {
+  top_sites  <- names(sort(abs(pca_res$rotation[, pc]), decreasing = TRUE))[seq_len(n_top)]
+  row_labels <- ifelse(!is.na(row_anno[top_sites, "gene_symbol"]) &
+                         row_anno[top_sites, "gene_symbol"] != "",
+                       paste0(row_anno[top_sites, "gene_symbol"], " [", top_sites, "]"),
+                       top_sites)
+  pheatmap(mat[top_sites, ], annotation_col = anno_col_pca,
+           annotation_colors = anno_colors_pca, labels_row = row_labels,
+           main = paste0("Top ", n_top, " sites driving ", pc, " (", var_exp[pc], "%)"),
+           scale = "row", clustering_method = "ward.D2",
+           fontsize_row = 7, fontsize_col = 8,
+           color = colorRampPalette(c("#4575b4", "white", "#d73027"))(100),
+           na_col = "grey90", border_color = NA)
+}
+```
+
+### 3.4 Sample correlation heatmap
+
+Pairwise Pearson correlations between samples are computed using pairwise-complete observations and displayed as a heatmap to assess overall sample clustering by condition and donor.
+
+```{r qc_correlation, fig.width=7, fig.height=6}
+cor_mat    <- cor(mat, use = "pairwise.complete.obs")
+anno_col   <- data.frame(condition = meta$condition, donor = meta$donor,
+                         row.names = meta$sample_name)
+anno_colors <- list(
+  condition = condition_colours[sort(unique(meta$condition))],
+  donor     = setNames(hcl.colors(length(unique(meta$donor)),     "Earth"),
+                       sort(unique(meta$donor)))
+)
+pheatmap(cor_mat, annotation_col = anno_col, annotation_row = anno_col,
+         annotation_colors = anno_colors,
+         main = "Sample-to-sample Pearson correlation",
+         fontsize_row = 8, fontsize_col = 8,
+         breaks = seq(0.85, 1, length.out = 101),
+         color  = colorRampPalette(c("white", "#2166ac"))(100))
+```
+
+---
+
+## 4. PhosR — Differential Phosphorylation
+
+Differential phosphorylation analysis is performed using [PhosR](https://bioconductor.org/packages/PhosR/) and [limma](https://bioconductor.org/packages/limma/). Donor effects and surrogate variables estimated using [RUVseq](https://bioconductor.org/packages/release/bioc/html/RUVSeq.html) were included in the linear model to account for technical and biological confounding factors.
+
+### 4.1 PhosphoExperiment object
+
+A PhosphoExperiment object (based on SummarizedExperiment) is constructed to organise the intensity matrix together with row-level site annotations and column-level sample metadata.
+
+```{r pe}
+col_data <- DataFrame(condition = factor(meta$condition), donor = factor(meta$donor),
+                      row.names = meta$sample_name)
+row_data <- DataFrame(Protein    = row_anno$protein, Site = row_anno$position,
+                      GeneSymbol = row_anno$gene_symbol, row.names = site_ids)
+pe <- PhosphoExperiment(assays     = list(Quantification = mat),
+                        GeneSymbol = row_anno$gene_symbol,
+                        Site       = row_anno$position,
+                        rowData    = row_data, colData = col_data)
+```
+
+### 4.2 RUV — Removing unwanted variation
+
+Stably phosphorylated sites (lowest 10% IQR) serve as negative controls for RUVr.
+
+```{r control_sites}
+site_iqr <- apply(assay(pe, "Quantification"), 1, IQR, na.rm = TRUE)
+ctl_idx  <- which(site_iqr <= quantile(site_iqr, 0.1, na.rm = TRUE))
+ctl_idx  <- ctl_idx[complete.cases(assay(pe, "Quantification")[ctl_idx, ])]
+cat("IQR-based control sites (complete cases):", length(ctl_idx), "\n")
+```
+
+```{r ruv, fig.width=7, fig.height=5}
+mat_raw     <- as.matrix(assay(pe, "Quantification"))
+n_na        <- sum(is.na(mat_raw))
+mat_for_ruv <- if (n_na > 0) PhosR:::tImpute(mat_raw, m = 1.6, s = 0.6) else mat_raw
+
+design_res  <- model.matrix(~ 0 + condition + donor, data = as.data.frame(colData(pe)))
+fit_res     <- lmFit(mat_for_ruv, design_res)
+resid_mat   <- mat_for_ruv - tcrossprod(fit_res$coefficients, design_res)
+k_ruv       <- 1
+ruv_res     <- RUVr(mat_for_ruv, cIdx = ctl_idx, k = k_ruv,
+                    residuals = resid_mat, isLog = TRUE)
+W           <- ruv_res$W
+rownames(W) <- colnames(mat_raw)
+colnames(W) <- paste0("W", seq_len(ncol(W)))
+
+# Donor + W corrected matrix, used for gene-level per-sample scoring below
+mat_corrected <- removeBatchEffect(
+  mat_raw, batch = meta$donor, covariates = W,
+  design = model.matrix(~ 0 + condition, data = as.data.frame(colData(pe)))
+)
+
+# Gene-level matrix: best phosphosite per gene by mean absolute intensity.
+# Built here so it is available in Section 6.1 (pathfindR per-sample term scoring).
+valid_g  <- !is.na(row_anno$gene_symbol) & row_anno$gene_symbol != ""
+mat_g    <- mat_corrected[valid_g, , drop = FALSE]
+gene_ids <- row_anno$gene_symbol[valid_g]
+mean_abs <- rowMeans(abs(mat_g), na.rm = TRUE)
+best_idx <- tapply(seq_len(nrow(mat_g)), gene_ids, function(i) i[which.max(mean_abs[i])])
+mat_gene <- mat_g[unlist(best_idx), , drop = FALSE]
+rownames(mat_gene) <- names(best_idx)
+
+W_df <- cbind(data.frame(sample = meta$sample_name, condition = meta$condition,
+                          donor = meta$donor), as.data.frame(W))
+knitr::kable(W_df, digits = 4,
+             caption = paste0("Surrogate variable(s) per sample (k = ", k_ruv, ")"))
+
+# Before / after PCA (diagnostic only)
+make_pca_df <- function(pca_obj) {
+  as.data.frame(pca_obj$x[, 1:2]) |>
+    tibble::rownames_to_column("sample") |>
+    dplyr::left_join(dplyr::select(meta, sample_name, condition, donor),
+                     by = c("sample" = "sample_name"))
+}
+mat_viz    <- removeBatchEffect(mat_for_ruv, batch = meta$donor, covariates = W)
+pca_before <- prcomp(t(mat_for_ruv), scale. = FALSE)
+pca_after  <- prcomp(t(mat_viz),     scale. = FALSE)
+ve_b <- round(summary(pca_before)$importance[2, 1:2] * 100, 1)
+ve_a <- round(summary(pca_after)$importance[2,  1:2] * 100, 1)
+
+print(
+  ggplot(make_pca_df(pca_before),
+         aes(PC1, PC2, colour = condition, shape = donor, label = sample)) +
+    geom_point(size = 3) + geom_text_repel(size = 2.5, show.legend = FALSE) +
+    scale_colour_manual(values = condition_colours) +
+    labs(x = paste0("PC1 (", ve_b[1], "%)"), y = paste0("PC2 (", ve_b[2], "%)"),
+         title = "Before W correction") + theme_bw()
+)
+print(
+  ggplot(make_pca_df(pca_after),
+         aes(PC1, PC2, colour = condition, shape = donor, label = sample)) +
+    geom_point(size = 3) + geom_text_repel(size = 2.5, show.legend = FALSE) +
+    scale_colour_manual(values = condition_colours) +
+    labs(x = paste0("PC1 (", ve_a[1], "%)"), y = paste0("PC2 (", ve_a[2], "%)"),
+         title = paste0("After W correction (k = ", k_ruv, ") — diagnostic")) + theme_bw()
+)
+
+# W factor diagnostics
+for (wj in paste0("W", seq_len(k_ruv))) {
+  r2_d <- summary(lm(reformulate("donor",     response = wj), data = W_df))$r.squared
+  r2_c <- summary(lm(reformulate("condition", response = wj), data = W_df))$r.squared
+  cat(sprintf("%s  R²(donor)=%.3f  R²(condition)=%.3f\n", wj, r2_d, r2_c))
+
+  p1 <- W_df |> dplyr::arrange(donor, condition) |>
+    dplyr::mutate(sample = factor(sample, levels = sample)) |>
+    ggplot(aes(x = sample, y = .data[[wj]], fill = condition)) +
+    geom_col() +
+    scale_fill_manual(values = condition_colours) +
+    labs(title = paste0(wj, " sorted by donor"),
+         subtitle = sprintf("R²(donor)=%.3f  R²(condition)=%.3f", r2_d, r2_c),
+         x = NULL, y = wj) +
+    theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+
+  p2 <- W_df |> dplyr::arrange(condition, donor) |>
+    dplyr::mutate(sample = factor(sample, levels = sample)) |>
+    ggplot(aes(x = sample, y = .data[[wj]], fill = donor)) +
+    geom_col() +
+    scale_fill_manual(values = setNames(hcl.colors(length(unique(meta$donor)), "Earth"),
+                                        sort(unique(meta$donor)))) +
+    labs(title = paste0(wj, " sorted by condition"), x = NULL, y = wj) +
+    theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+
+  print(p1); print(p2)
+}
+```
+
+### 4.3 Differential analysis — limma (`~ 0 + condition + donor + W`)
+
+Differential phosphorylation is tested using limma. A design matrix including condition (treatment contrast parameterisation), donor, and the RUV surrogate variable(s) W is constructed. Pairwise contrasts of interest are defined, and the model is fitted with `lmFit` followed by empirical Bayes shrinkage with `eBayes`. Sites are considered significant at adjusted p-value < `r adj_p_cutoff` and |log2FC| ≥ `r logfc_cutoff`.
+
+```{r limma}
+design <- cbind(model.matrix(~ 0 + condition + donor, data = as.data.frame(colData(pe))), W)
+colnames(design) <- make.names(colnames(design))
+contrast_mat <- makeContrasts(contrasts = contrasts_to_test, levels = design)
+
+fit  <- lmFit(assay(pe, "Quantification"), design)
+fit2 <- contrasts.fit(fit, contrast_mat)
+fit2 <- eBayes(fit2)
+
+de_results <- setNames(
+  lapply(colnames(contrast_mat), function(coef) {
+    topTable(fit2, coef = coef, number = Inf, sort.by = "P") |>
+      tibble::rownames_to_column("site_id") |>
+      dplyr::mutate(contrast    = coef,
+                    gene_symbol = row_anno[site_id, "gene_symbol"],
+                    protein     = row_anno[site_id, "protein"],
+                    position    = row_anno[site_id, "position"])
+  }),
+  colnames(contrast_mat)
+)
+
+sig_counts <- sapply(de_results, function(df)
+  sum(df$adj.P.Val < adj_p_cutoff & abs(df$logFC) >= logfc_cutoff, na.rm = TRUE))
+knitr::kable(
+  data.frame(contrast = names(sig_counts), n_significant = sig_counts),
+  caption = paste0("Significant sites (adj.p < ", adj_p_cutoff,
+                   ", |logFC| >= ", logfc_cutoff, ")")
+)
+```
+
+### 4.4 Differentially phosphorylated sites
+
+Top 30 per contrast shown; all results written to `r file.path(out_dir_nice,"phosphosites_limma/")`.
+
+```{r limma_tables, results='asis'}
+dir.create(file.path(out_dir, "phosphosites_limma"), recursive = TRUE, showWarnings = FALSE)
+
+for (contrast_name in names(de_results)) {
+  cat("\n####", gsub("\\.", " ", contrast_name), "\n\n")
+  full_df <- de_results[[contrast_name]] |>
+    dplyr::arrange(adj.P.Val) |>
+    dplyr::select(site_id, gene_symbol, protein, position,
+                  logFC, AveExpr, t, P.Value, adj.P.Val)
+
+  file_name <- paste0(gsub("[^A-Za-z0-9]", "_", contrast_name), ".csv")
+  write_csv(full_df, file.path(out_dir, "phosphosites_limma", file_name))
+
+  sig_df <- dplyr::filter(full_df, adj.P.Val < adj_p_cutoff, abs(logFC) >= logfc_cutoff)
+  n_sig  <- nrow(sig_df)
+  if (n_sig > 0) {
+    cat("Showing top", min(n_sig, 30), "of", n_sig, "significant sites.\n\n")
+    head(sig_df, 30) |> knitr::kable(digits = 3) |> print()
+  } else {
+    cat("No significant sites at selected thresholds.\n\n")
+  }
+}
+```
+
+### 4.5 Comparison PCAs
+
+PCA is performed separately for each pairwise contrast using only the samples from the two conditions being compared, restricted to sites with no missing values in those samples. This provides a contrast-specific view of sample separation independent of the full dataset structure.
+
+```{r comp_pcas, fig.width=6, fig.height=5, results='asis'}
+for (contrast_name in names(de_results)) {
+  cat("\n####", gsub("\\.", " ", contrast_name), "\n\n")
+  cond_parts <- str_match(contrast_name, "condition(\\w+).*condition(\\w+)")
+  cond1 <- cond_parts[2]; cond2 <- cond_parts[3]
+  keep     <- meta$condition %in% c(cond1, cond2)
+  mat_sub  <- mat[rowSums(is.na(mat[, keep, drop = FALSE])) == 0, keep, drop = FALSE]
+  meta_sub <- meta[keep, ]
+  if (ncol(mat_sub) < 3 || nrow(mat_sub) < 2) { cat("Too few observations.\n\n"); next }
+  pca_sub  <- prcomp(t(mat_sub), scale. = FALSE)
+  ve_sub   <- round(summary(pca_sub)$importance[2, 1:2] * 100, 1)
+  pca_df_s <- as.data.frame(pca_sub$x[, 1:2]) |>
+    tibble::rownames_to_column("sample") |>
+    dplyr::left_join(dplyr::select(meta_sub, sample_name, condition, donor),
+                     by = c("sample" = "sample_name"))
+  p <- ggplot(pca_df_s, aes(PC1, PC2, colour = condition, label = sample)) +
+    geom_point(size = 3) +
+    geom_text_repel(size = 2.5, show.legend = FALSE, max.overlaps = 20) +
+    scale_color_manual(values = condition_colours[c(cond1, cond2)]) +
+    labs(x = paste0("PC1 (", ve_sub[1], "%)"), y = paste0("PC2 (", ve_sub[2], "%)"),
+         title = paste("PCA:", gsub("\\.", " ", contrast_name))) + theme_bw()
+  print(p); cat("\n\n")
+}
+```
+
+### 4.6 Volcano plots
+
+Volcano plots display the relationship between log2 fold-change and statistical significance for each contrast. Sites exceeding the significance and fold-change thresholds are highlighted in red (upregulated) or blue (downregulated).
+
+```{r volcanos, fig.width=6, fig.height=5, results='asis'}
+for (contrast_name in names(de_results)) {
+  cat("\n####", gsub("\\.", " ", contrast_name), "\n\n")
+  df <- de_results[[contrast_name]] |>
+    dplyr::mutate(direction = dplyr::case_when(
+      adj.P.Val < adj_p_cutoff & logFC >  logfc_cutoff ~ "Up",
+      adj.P.Val < adj_p_cutoff & logFC < -logfc_cutoff ~ "Down",
+      TRUE ~ "NS"))
+  p <- ggplot(df, aes(logFC, -log10(adj.P.Val), colour = direction)) +
+    geom_point(alpha = 0.4, size = 1) +
+    scale_colour_manual(values = c(Up = "#d73027", Down = "#4575b4", NS = "grey70")) +
+    geom_vline(xintercept = c(-logfc_cutoff, logfc_cutoff),
+               linetype = "dashed", colour = "grey50") +
+    geom_hline(yintercept = -log10(adj_p_cutoff),
+               linetype = "dashed", colour = "grey50") +
+    labs(title = gsub("\\.", " ", contrast_name),
+         x = "log2 fold-change", y = "-log10 adjusted p-value") +
+    theme_bw() + theme(legend.title = element_blank())
+  print(p); cat("\n\n")
+}
+```
+
+### 4.7 Summary — significant sites per contrast
+
+```{r butterfly, fig.width=8, fig.height=5}
+butterfly_df <- dplyr::bind_rows(lapply(names(de_results), function(cn) {
+  df <- de_results[[cn]]
+  m  <- str_match(cn, "condition(\\w+)[^\\w]+condition(\\w+)")
+  data.frame(
+    contrast = paste(m[2], "vs", m[3]),
+    n_up     = sum(df$adj.P.Val < adj_p_cutoff & df$logFC >  logfc_cutoff,  na.rm = TRUE),
+    n_down   = sum(df$adj.P.Val < adj_p_cutoff & df$logFC < -logfc_cutoff,  na.rm = TRUE)
+  )
+})) |>
+  dplyr::mutate(contrast = factor(contrast, levels = rev(contrast))) |>
+  tidyr::pivot_longer(c(n_up, n_down), names_to = "direction", values_to = "n") |>
+  dplyr::mutate(
+    n_signed  = ifelse(direction == "n_down", -n, n),
+    direction = dplyr::recode(direction, n_up = "Upregulated", n_down = "Downregulated")
+  )
+
+x_lim <- max(abs(butterfly_df$n_signed), na.rm = TRUE)
+
+ggplot(butterfly_df, aes(x = n_signed, y = contrast, fill = direction)) +
+  geom_col() +
+  geom_text(aes(label = n, hjust = ifelse(direction == "Upregulated", -0.15, 1.15)),
+            size = 3.5) +
+  scale_fill_manual(values = c(Upregulated = "#d73027", Downregulated = "#4575b4")) +
+  scale_x_continuous(limits = c(-x_lim * 1.2, x_lim * 1.2), labels = abs) +
+  geom_vline(xintercept = 0, colour = "grey20", linewidth = 0.4) +
+  labs(x = "Number of phosphosites", y = NULL, fill = NULL,
+       title = "Differentially phosphorylated sites per contrast",
+       subtitle = paste0("adj.p < ", adj_p_cutoff, "  |  |logFC| ≥ ", logfc_cutoff)) +
+  theme_bw() +
+  theme(legend.position  = "bottom",
+        panel.grid.major.y = element_blank())
+```
+
+#### 4.7.1 Significant sites with ambiguous gene assignment
+
+Sites for which Perseus's Gene names field contains multiple candidate genes (Section 2.2) are noted here, as only the first-listed gene symbol was retained for downstream analyses. The table below lists ambiguous sites that were significant in at least one contrast (adj.p < `r adj_p_cutoff`, |log2FC| ≥ `r logfc_cutoff`) together with the complete set of candidate gene names provided by Perseus.
+
+```{r ambiguous_significant, results='asis'}
+ambiguous_sig <- dplyr::bind_rows(de_results) |>
+  dplyr::filter(adj.P.Val < adj_p_cutoff, abs(logFC) >= logfc_cutoff,
+                site_id %in% ambiguous_sites$site_id) |>
+  dplyr::left_join(
+    dplyr::select(ambiguous_sites, site_id, gene_names_full),
+    by = "site_id"
+  ) |>
+  dplyr::select(contrast, site_id, gene_symbol_retained = gene_symbol,
+                gene_names_full, protein, position, logFC, adj.P.Val) |>
+  dplyr::arrange(gene_names_full, contrast)
+
+write_csv(ambiguous_sig, file.path(out_dir, "gene_annotation", "ambiguous_significant_sites.csv"))
+
+n_ambiguous_sig <- dplyr::n_distinct(ambiguous_sig$site_id)
+cat(n_ambiguous_sig,
+  "distinct phosphosite(s) with ambiguous gene assignment were significant in at least one contrast (",
+  nrow(ambiguous_sig),
+  "significant results across all contrasts, as a phosphosite may be significant in more than one contrast). Results were written to `",
+  file.path(out_dir_nice, "gene_annotation", "ambiguous_significant_sites.csv"),
+  "`.\n\n"
+)
+
+if (nrow(ambiguous_sig) > 0) {
+  knitr::kable(ambiguous_sig, digits = 3,
+               caption = "Significant sites with multi-gene candidate assignment")
+} else {
+  cat("No significant sites carry ambiguous gene assignment.\n")
+}
+```
+
+### 4.8 UpSet plot — NK comparisons
+
+Overlaps between significantly differentially phosphorylated sites across all NK cell comparisons are visualised using an UpSet plot, with upregulated and downregulated sites shown separately. Membership tables for each intersection group are written to `` `r file.path(out_dir_nice, "upset_intersections")` ``.
+
+```{r upset_nk, fig.width=10, fig.height=6}
+nk_contrasts  <- grep("conditionNK", names(de_results), value = TRUE)
+short_labels  <- setNames(str_match(nk_contrasts, "condition(\\w+)")[, 2], nk_contrasts)
+
+up_list <- setNames(lapply(nk_contrasts, function(cn)
+  de_results[[cn]] |> dplyr::filter(adj.P.Val < adj_p_cutoff, logFC > logfc_cutoff) |>
+    dplyr::pull(site_id)), paste0(short_labels, " (Up)"))
+down_list <- setNames(lapply(nk_contrasts, function(cn)
+  de_results[[cn]] |> dplyr::filter(adj.P.Val < adj_p_cutoff, logFC < -logfc_cutoff) |>
+    dplyr::pull(site_id)), paste0(short_labels, " (Down)"))
+
+up_list   <- up_list[sapply(up_list,   length) > 0]
+down_list <- down_list[sapply(down_list, length) > 0]
+combined  <- c(up_list, down_list)
+bar_colors <- c(rep("#d73027", length(up_list)), rep("#4575b4", length(down_list)))
+
+upset(fromList(combined), sets = names(combined), nsets = length(combined),
+      keep.order = TRUE, order.by = "freq", sets.bar.color = bar_colors,
+      main.bar.color = "grey40", text.scale = 1.2,
+      mainbar.y.label = "Intersecting sites", sets.x.label = "Significant sites vs NK")
+```
+
+```{r upset_output, results='asis'}
+dir.create(file.path(out_dir, "upset_intersections"), recursive = TRUE, showWarnings = FALSE)
+
+all_sites_upset <- unique(unlist(combined))
+set_cols        <- names(combined)
+membership      <- data.frame(site_id = all_sites_upset, stringsAsFactors = FALSE)
+for (nm in set_cols) membership[[nm]] <- as.integer(membership$site_id %in% combined[[nm]])
+membership$intersection <- apply(membership[, set_cols, drop = FALSE], 1,
+  function(row) paste(set_cols[as.logical(row)], collapse = " & "))
+
+site_anno <- data.frame(site_id     = all_sites_upset,
+                         gene_symbol = row_anno[all_sites_upset, "gene_symbol"],
+                         protein     = row_anno[all_sites_upset, "protein"],
+                         position    = row_anno[all_sites_upset, "position"],
+                         stringsAsFactors = FALSE)
+
+lfc_wide <- lapply(nk_contrasts, function(cn) {
+  lbl <- short_labels[[cn]]
+  de_results[[cn]] |> dplyr::filter(site_id %in% all_sites_upset) |>
+    dplyr::select(site_id, logFC, adj.P.Val) |>
+    stats::setNames(c("site_id", paste0(lbl, "_logFC"), paste0(lbl, "_adj.P.Val")))
+}) |> purrr::reduce(dplyr::full_join, by = "site_id")
+
+output_df <- membership |>
+  dplyr::left_join(site_anno, by = "site_id") |>
+  dplyr::left_join(lfc_wide,  by = "site_id") |>
+  dplyr::select(site_id, gene_symbol, protein, position, intersection, dplyr::everything())
+
+safe_name <- function(x) {
+  x <- gsub(" & ", "_AND_", x); x <- gsub("[() ]", "_", x)
+  x <- gsub("_+", "_", x);      gsub("^_|_$", "", x)
+}
+int_summary <- output_df |> dplyr::count(intersection, name = "n_sites") |>
+  dplyr::arrange(desc(n_sites))
+for (int_name in int_summary$intersection) {
+  int_df <- dplyr::filter(output_df, intersection == int_name) |>
+    dplyr::arrange(gene_symbol) |>
+    dplyr::select(-dplyr::all_of(set_cols), -intersection)
+  write_csv(int_df, file.path(out_dir, "upset_intersections",
+                               paste0(safe_name(int_name), ".csv")))
+}
+cat(nrow(int_summary), "intersection files written to `",file.path(out_dir_nice,"upset_intersections/"), "` \n")
+```
+
+### 4.9 Venn Diagrams — A vs NK and ALCAM vs NK overlap
+
+Venn diagrams illustrating the overlap in differentially phosphorylated sites between the A vs NK and ALCAM vs NK contrasts, shown separately for upregulated sites, downregulated sites, and all differentially phosphorylated sites. Note that the total site counts in the all-DE diagram will not necessarily equal the sum of the upregulated and downregulated diagrams: a site regulated in opposite directions across the two contrasts (e.g. upregulated in A vs NK but downregulated in ALCAM vs NK) appears as unique to each contrast in the directional diagrams but falls in the shared intersection of the all-DE diagram. Such discordantly regulated sites are therefore of particular biological interest.
+
+```{r venn_a_alcam_nk, fig.width=3, fig.height=3, fig.show='hold', out.width='30%'}
+if (!requireNamespace("eulerr", quietly = TRUE)) install.packages("eulerr")
+library(eulerr)
+
+a_nk_name     <- grep("conditionA[^L].*conditionNK", names(de_results), value = TRUE)
+alcam_nk_name <- grep("conditionALCAM.*conditionNK", names(de_results), value = TRUE)
+
+get_sites <- function(contrast_name, direction = c("up", "down", "all")) {
+  df <- de_results[[contrast_name]]
+  switch(direction,
+    up   = df$site_id[df$adj.P.Val < adj_p_cutoff & df$logFC >  logfc_cutoff],
+    down = df$site_id[df$adj.P.Val < adj_p_cutoff & df$logFC < -logfc_cutoff],
+    all  = df$site_id[df$adj.P.Val < adj_p_cutoff & abs(df$logFC) >= logfc_cutoff]
+  )
+}
+
+venn_sets <- list(
+  up   = list("A vs NK"     = get_sites(a_nk_name,    "up"),
+              "ALCAM vs NK" = get_sites(alcam_nk_name, "up")),
+  down = list("A vs NK"     = get_sites(a_nk_name,    "down"),
+              "ALCAM vs NK" = get_sites(alcam_nk_name, "down")),
+  all  = list("A vs NK"     = get_sites(a_nk_name,    "all"),
+              "ALCAM vs NK" = get_sites(alcam_nk_name, "all"))
+)
+
+venn_titles <- c(up = "Upregulated sites", down = "Downregulated sites",
+                 all = "All DE sites")
+venn_subtitles <- c(
+  up   = paste0("adj.p < ", adj_p_cutoff, ", log₂FC ≥ ",   logfc_cutoff),
+  down = paste0("adj.p < ", adj_p_cutoff, ", log₂FC ≤ -",  logfc_cutoff),
+  all  = paste0("adj.p < ", adj_p_cutoff, ", |log₂FC| ≥ ", logfc_cutoff)
+)
+venn_fills <- list(
+  up   = c("#d73027", "#f4a582"),
+  down = c("#4575b4", "#92c5de"),
+  all  = c("#762a83", "#c2a5cf")
+)
+
+venn_fits <- lapply(venn_sets, eulerr::euler)
+
+get_bbox <- function(fit) {
+  e   <- as.data.frame(fit$ellipses)
+  pad <- 0.5
+  list(x = c(min(e$h - e$a) - pad, max(e$h + e$a) + pad),
+       y = c(min(e$k - e$b) - pad, max(e$k + e$b) + pad))
+}
+bboxes   <- lapply(venn_fits, get_bbox)
+global_x <- range(sapply(bboxes, function(b) b$x))
+global_y <- range(sapply(bboxes, function(b) b$y))
+g_scale  <- max(diff(global_x), diff(global_y))
+g_x0     <- global_x[1]
+g_y0     <- global_y[1]
+
+norm_fit <- function(fit) {
+  e            <- as.data.frame(fit$ellipses)
+  e$h          <- (e$h - g_x0) / g_scale
+  e$k          <- (e$k - g_y0) / g_scale
+  e$a          <- e$a / g_scale
+  e$b          <- e$b / g_scale
+  fit$ellipses <- e
+  fit
+}
+venn_fits_norm <- lapply(venn_fits, norm_fit)
+
+for (dir in names(venn_fits_norm)) {
+  fills      <- venn_fills[[dir]]
+  main_label <- paste0(venn_titles[dir], "\n", venn_subtitles[dir])
+  print(plot(venn_fits_norm[[dir]],
+             quantities = list(type = "counts", fontsize = 9),
+             fills      = list(fill = fills, alpha = 0.6),
+             edges      = list(col = "grey30", lwd = 1.5),
+             labels     = list(fontsize = 9),
+             main       = list(label = main_label, fontsize = 8)))
+}
+```
+
+```{r venn_discordant, results='asis'}
+shared_all <- intersect(
+  de_results[[a_nk_name]]$site_id[
+    de_results[[a_nk_name]]$adj.P.Val < adj_p_cutoff &
+    abs(de_results[[a_nk_name]]$logFC) >= logfc_cutoff],
+  de_results[[alcam_nk_name]]$site_id[
+    de_results[[alcam_nk_name]]$adj.P.Val < adj_p_cutoff &
+    abs(de_results[[alcam_nk_name]]$logFC) >= logfc_cutoff]
+)
+
+a_fc     <- de_results[[a_nk_name]] |>
+  dplyr::filter(site_id %in% shared_all) |>
+  dplyr::select(site_id, logFC_a = logFC)
+
+alcam_fc <- de_results[[alcam_nk_name]] |>
+  dplyr::filter(site_id %in% shared_all) |>
+  dplyr::select(site_id, logFC_alcam = logFC)
+
+discordant <- dplyr::inner_join(a_fc, alcam_fc, by = "site_id") |>
+  dplyr::filter(sign(logFC_a) != sign(logFC_alcam))
+
+cat("Of the", length(shared_all), "phosphosites significant in both contrasts,",
+    nrow(discordant), "are regulated in opposite directions (discordant),",
+    "accounting for the difference between the directional and all-DE Venn counts.\n")
+```
+
+```{r venn_phosphosite_tables}
+venn_out_dir <- file.path(out_dir, "venn_phosphosites")
+dir.create(venn_out_dir, recursive = TRUE, showWarnings = FALSE)
+
+for (dir_name in names(venn_sets)) {
+  sets   <- venn_sets[[dir_name]]
+  nm1    <- names(sets)[1]; nm2 <- names(sets)[2]
+  only1  <- setdiff(sets[[1]], sets[[2]])
+  only2  <- setdiff(sets[[2]], sets[[1]])
+  shared <- intersect(sets[[1]], sets[[2]])
+
+  make_tbl <- function(site_ids, group) {
+    if (length(site_ids) == 0) return(NULL)
+    data.frame(site_id     = site_ids,
+               group       = group,
+               gene_symbol = row_anno[site_ids, "gene_symbol"],
+               protein     = row_anno[site_ids, "protein"],
+               position    = row_anno[site_ids, "position"],
+               stringsAsFactors = FALSE)
+  }
+  tbl <- dplyr::bind_rows(
+    make_tbl(only1,  gsub(" ", "_", nm1)),
+    make_tbl(only2,  gsub(" ", "_", nm2)),
+    make_tbl(shared, "shared")
+  )
+  write_csv(tbl, file.path(venn_out_dir, paste0("venn_phosphosites_", dir_name, ".csv")))
+}
+```
+
+### 4.10 Kinase Substrate Scoring
+
+Sites significant in ≥1 contrast with valid 15-mer sequences are passed to
+`kinaseSubstrateScore`, which integrates motif and profile matching. The exact
+input (standardised intensity matrix and 15-mer sequences, keyed by
+`phosR_id`, together with a `site_id`/`phosR_id`/gene symbol/position lookup
+table) is written to `` `r file.path(out_dir_nice, "kinase_score", "kinaseSubstrateScore_input")` ``
+for reproducibility.
+
+```{r ksea_prep}
+# For multi-protein sites, `Positions within proteins` (like `Proteins`) lists one
+# value per matching accession. Pasting it in raw produces a malformed identifier for
+# kinaseSubstrateScore, e.g. "PRKD3;S735;742;" instead of "PRKD3;S735;", by
+# concatenating a second protein's residue numbering into what should be a
+# single-site identifier. This helper picks out just the position belonging to the
+# row's own leading `Protein`, by matching its index within `Proteins` (falling back
+# to a deduplicated value, or the first entry, if the accession isn't found in
+# `Proteins`).
+extract_own_position <- function(protein, proteins_str, positions_str) {
+  accs <- strsplit(proteins_str,  ";", fixed = TRUE)[[1]]
+  pos  <- strsplit(positions_str, ";", fixed = TRUE)[[1]]
+  idx  <- match(protein, accs)
+  if (!is.na(idx) && idx <= length(pos)) return(pos[idx])
+  upos <- unique(pos)
+  if (length(upos) == 1) return(upos)
+  pos[1]
+}
+
+sty <- read.table(raw_data_file, sep = "\t", header = TRUE,
+                  stringsAsFactors = FALSE, check.names = FALSE, quote = "") |>
+  dplyr::mutate(site_id      = paste(Protein, `Positions within proteins`, sep = "_"),
+                seq_15       = substr(`Sequence window`, 9, 23),
+                own_position = purrr::pmap_chr(
+                  list(Protein, Proteins, `Positions within proteins`),
+                  extract_own_position
+                )) |>
+  dplyr::group_by(site_id) |>
+  # In the current raw file, every site_id maps to exactly one row. This step has
+  # no effect on today's data, but is kept as a safeguard: if a future export
+  # ever does contain more than one row for the same real site_id, this ensures
+  # the row with the highest localisation confidence is kept, rather than
+  # whichever row happens to come first in the file.
+  dplyr::slice_max(`Localization prob`, n = 1, with_ties = FALSE) |>
+  dplyr::ungroup()
+
+idx <- match(rownames(mat), sty$site_id)
+seqs       <- sty$seq_15[idx];       names(seqs)       <- rownames(mat)
+own_pos    <- sty$own_position[idx]
+amino_acid <- sty$`Amino acid`[idx]
+
+# gene_symbol is sourced from row_anno (Section 2.2) rather than re-derived
+# independently from raw_data_file, so kinase substrate scoring labels each site
+# with the same gene symbol used everywhere else in the report.
+gene_symbol_ksea <- row_anno[rownames(mat), "gene_symbol"]
+phosR_ids <- paste0(gene_symbol_ksea, ";", amino_acid, own_pos, ";")
+names(phosR_ids) <- rownames(mat)
+
+has_seq <- !is.na(seqs) & nchar(seqs) == 15 & !is.na(phosR_ids)
+sig_any <- unique(unlist(lapply(de_results, function(df)
+  df$site_id[df$adj.P.Val < adj_p_cutoff & abs(df$logFC) >= logfc_cutoff])))
+has_seq_and_sig <- has_seq & (rownames(mat) %in% sig_any)
+
+cat("Sites with valid 15-mer:             ", sum(has_seq), "\n")
+cat("Sites significant in ≥1 contrast:    ", length(sig_any), "\n")
+cat("Sites passed to kinase substrate scoring (both criteria):", sum(has_seq_and_sig), "\n")
+
+mat_ksea  <- as.matrix(mat[has_seq_and_sig, , drop = FALSE])
+storage.mode(mat_ksea) <- "double"
+seqs_ksea <- as.character(seqs[has_seq_and_sig])
+mat_ksea  <- PhosR::standardise(mat_ksea)
+rownames(mat_ksea) <- phosR_ids[has_seq_and_sig]
+
+# Save the exact input passed to kinaseSubstrateScore() (standardised matrix +
+# 15-mer sequences), together with a site_id/phosR_id lookup, so the scoring
+# input is reproducible and auditable independently of the report.
+kinase_input_dir <- file.path(out_dir, "kinase_score", "kinaseSubstrateScore_input")
+dir.create(kinase_input_dir, recursive = TRUE, showWarnings = FALSE)
+
+ksea_input_sites <- data.frame(
+  site_id     = rownames(mat)[has_seq_and_sig],
+  phosR_id    = phosR_ids[has_seq_and_sig],
+  gene_symbol = gene_symbol_ksea[has_seq_and_sig],
+  amino_acid  = amino_acid[has_seq_and_sig],
+  position    = own_pos[has_seq_and_sig],
+  seq_15      = seqs_ksea,
+  stringsAsFactors = FALSE
+)
+write_csv(ksea_input_sites, file.path(kinase_input_dir, "ksea_input_sites.csv"))
+write_csv(as.data.frame(mat_ksea) |> tibble::rownames_to_column("phosR_id"),
+          file.path(kinase_input_dir, "ksea_input_matrix.csv"))
+```
+
+```{r ksea, fig.width=12, fig.height=20, results='asis'}
+data("PhosphoSitePlus", package = "PhosR")
+data("KinaseMotifs",    package = "PhosR")
+
+ksea_scores <- tryCatch(
+  kinaseSubstrateScore(substrate.list = PhosphoSite.human, mat = mat_ksea,
+                       seqs = seqs_ksea, numMotif = 5, numSub = 1,
+                       species = "human", verbose = FALSE),
+  error = function(e) { message("Kinase substrate scoring error: ", e$message); NULL }
+)
+
+if (!is.null(ksea_scores)) {
+  ksea_mat <- ksea_scores[["ksActivityMatrix"]]
+  cat("Kinase activity matrix:", nrow(ksea_mat), "kinases ×", ncol(ksea_mat), "samples\n")
+
+  dir.create(file.path(out_dir, "kinase_score"), recursive = TRUE, showWarnings = FALSE)
+  write_csv(as.data.frame(ksea_mat) |> tibble::rownames_to_column("kinase"),
+            file.path(out_dir, "kinase_score", "kinase_activity_matrix.csv"))
+}
+```
+
+#### 4.10.1 Differential kinase activity
+
+The per-sample kinase activity score matrix from Section 4.8 is used as input to limma, applying the same design model and contrasts as the phosphosite-level analysis, to identify differentially active kinases per contrast.
+
+```{r ksea_limma_fit}
+if (!is.null(ksea_scores)) {
+  fit_ks  <- lmFit(ksea_mat, design)
+  fit_ks2 <- contrasts.fit(fit_ks, contrast_mat)
+  fit_ks2 <- eBayes(fit_ks2)
+
+  ksea_limma_results <- setNames(
+    lapply(colnames(contrast_mat), function(cn) {
+      tbl <- topTable(fit_ks2, coef = cn, number = Inf, sort.by = "P") |>
+        tibble::rownames_to_column("kinase")
+      dir.create(file.path(out_dir, "kinase_score", "kinase_score_limma"), recursive = TRUE, showWarnings = FALSE)
+      write_csv(tbl, file.path(out_dir, "kinase_score", "kinase_score_limma",
+                               paste0(gsub("[^A-Za-z0-9]", "_", cn), "_kinase_activity.csv")))
+      tbl
+    }),
+    colnames(contrast_mat)
+  )
+}
+```
+
+```{r ksea_limma_plots, results='asis'}
+if (!is.null(ksea_scores)) {
+  for (contrast_name in names(ksea_limma_results)) {
+    cat("\n\n####", gsub("\\.", " ", contrast_name), "\n\n")
+
+    # Sort by absolute decreasing logFC; include all significant kinases
+    ksea_de <- ksea_limma_results[[contrast_name]] |>
+      dplyr::filter(adj.P.Val < adj_p_cutoff) |>
+      dplyr::arrange(desc(abs(logFC)))
+
+    if (nrow(ksea_de) > 0) {
+      de_pos <- dplyr::filter(ksea_de, logFC > 0)
+      de_neg <- dplyr::filter(ksea_de, logFC < 0)
+
+      bar_height_per_kinase <- 0.25  # inches per bar — keeps bar thickness fixed regardless of count
+      make_bar <- function(df, colour) {
+        if (nrow(df) == 0) return(NULL)
+        # rev() preserves desc |logFC| sort so largest |logFC| appears at top with coord_flip()
+        df <- dplyr::mutate(df, kinase = factor(kinase, levels = rev(kinase)))
+        ggplot(df, aes(x = kinase, y = logFC)) +
+          geom_col(fill = colour) +
+          coord_flip() +
+          labs(x = NULL, y = "log2FC in kinase activity score") +
+          theme_bw()
+      }
+
+      save_and_show <- function(df, colour, direction) {
+        p <- make_bar(df, colour)
+        if (is.null(p)) return(invisible(NULL))
+        fig_h    <- nrow(df) * bar_height_per_kinase + 1  # +1 for axis title and margins
+        tmp      <- tempfile(fileext = ".png")
+        ggsave(tmp, plot = p, width = 5, height = fig_h, dpi = 150)
+        pdf_name <- paste0("ksea_", gsub("[^A-Za-z0-9]", "_", contrast_name),
+                           "_", direction, ".pdf")
+        ggsave(file.path(figures_dir, pdf_name), plot = p, width = 5, height = fig_h)
+        cat(paste0("![](", normalizePath(tmp), "){width=60%}\n\n"))
+      }
+
+      save_and_show(de_pos, "#6E274A", "upregulated")
+      save_and_show(de_neg, "#385B49", "downregulated")
+    } else {
+      cat("No significantly differential kinases (adj.p <", adj_p_cutoff, ").\n\n")
+    }
+    cat("\n\n")
+  }
+}
+```
+
+#### 4.10.2 Venn Diagrams — differential kinase activity (A vs NK and ALCAM vs NK)
+
+Overlap in significantly differentially active kinases between the A vs NK and ALCAM vs NK contrasts, shown for upregulated activity, downregulated activity, and all significant kinases. Significance is based on adj.p < `r adj_p_cutoff` from the limma kinase activity model; no log2FC threshold is applied. Unlike the phosphosite analysis where logFC represents a log₂ fold change in intensity, the input to limma here is kinase activity scores — dimensionless weighted means of standardised substrate intensities computed by `kinaseSubstrateScore`. Their magnitude depends on factors such as the number of known substrates and their variability across samples, meaning a score difference of 0.5 does not correspond to a fixed biological fold change and an equivalent magnitude threshold would be arbitrary.
+
+```{r venn_kinase, fig.width=3, fig.height=5, fig.show='hold', out.width='30%'}
+if (!is.null(ksea_scores)) {
+  get_kinases <- function(contrast_name, direction = c("up", "down", "all")) {
+    df <- ksea_limma_results[[contrast_name]]
+    switch(direction,
+      up   = df$kinase[df$adj.P.Val < adj_p_cutoff & df$logFC >  0],
+      down = df$kinase[df$adj.P.Val < adj_p_cutoff & df$logFC <  0],
+      all  = df$kinase[df$adj.P.Val < adj_p_cutoff]
+    )
+  }
+
+  kin_venn_sets <- list(
+    up   = list("A vs NK"     = get_kinases(a_nk_name,    "up"),
+                "ALCAM vs NK" = get_kinases(alcam_nk_name, "up")),
+    down = list("A vs NK"     = get_kinases(a_nk_name,    "down"),
+                "ALCAM vs NK" = get_kinases(alcam_nk_name, "down")),
+    all  = list("A vs NK"     = get_kinases(a_nk_name,    "all"),
+                "ALCAM vs NK" = get_kinases(alcam_nk_name, "all"))
+  )
+  kin_titles <- c(up   = "Increased kinase activity",
+                  down = "Decreased kinase activity",
+                  all  = "All DE kinases")
+  kin_subtitles <- c(
+    up   = paste0("adj.p < ", adj_p_cutoff, ", log₂FC > 0"),
+    down = paste0("adj.p < ", adj_p_cutoff, ", log₂FC < 0"),
+    all  = paste0("adj.p < ", adj_p_cutoff)
+  )
+  kin_fills <- list(
+    up   = c("#d73027", "#f4a582"),
+    down = c("#4575b4", "#92c5de"),
+    all  = c("#762a83", "#c2a5cf")
+  )
+
+  kin_fits <- lapply(kin_venn_sets, eulerr::euler)
+
+  get_bbox <- function(fit) {
+    e   <- as.data.frame(fit$ellipses)
+    pad <- 0.5
+    list(x = c(min(e$h - e$a) - pad, max(e$h + e$a) + pad),
+         y = c(min(e$k - e$b) - pad, max(e$k + e$b) + pad))
+  }
+  bboxes   <- lapply(kin_fits, get_bbox)
+  global_x <- range(sapply(bboxes, function(b) b$x))
+  global_y <- range(sapply(bboxes, function(b) b$y))
+  g_scale  <- max(diff(global_x), diff(global_y))
+  g_x0     <- global_x[1]
+  g_y0     <- global_y[1]
+
+  norm_fit <- function(fit) {
+    e            <- as.data.frame(fit$ellipses)
+    e$h          <- (e$h - g_x0) / g_scale
+    e$k          <- (e$k - g_y0) / g_scale
+    e$a          <- e$a / g_scale
+    e$b          <- e$b / g_scale
+    fit$ellipses <- e
+    fit
+  }
+  kin_fits_norm <- lapply(kin_fits, norm_fit)
+
+  for (dir in names(kin_fits_norm)) {
+    fills      <- kin_fills[[dir]]
+    main_label <- paste0(kin_titles[dir], "\n", kin_subtitles[dir])
+    print(plot(kin_fits_norm[[dir]],
+               quantities = list(type = "counts", fontsize = 9),
+               fills      = list(fill = fills, alpha = 0.6),
+               edges      = list(col = "grey30", lwd = 1.5),
+               labels     = list(fontsize = 9),
+               main       = list(label = main_label, fontsize = 8)))
+  }
+  venn_kin_dir <- file.path(out_dir, "venn_kinases")
+  dir.create(venn_kin_dir, recursive = TRUE, showWarnings = FALSE)
+
+  for (dir_name in names(kin_venn_sets)) {
+    sets   <- kin_venn_sets[[dir_name]]
+    nm1    <- names(sets)[1]; nm2 <- names(sets)[2]
+    only1  <- setdiff(sets[[1]], sets[[2]])
+    only2  <- setdiff(sets[[2]], sets[[1]])
+    shared <- intersect(sets[[1]], sets[[2]])
+    tbl <- data.frame(
+      kinase = c(only1, only2, shared),
+      group  = c(rep(gsub(" ", "_", nm1), length(only1)),
+                 rep(gsub(" ", "_", nm2), length(only2)),
+                 rep("shared", length(shared))),
+      stringsAsFactors = FALSE
+    )
+    write_csv(tbl, file.path(venn_kin_dir, paste0("venn_kinases_", dir_name, ".csv")))
+  }
+} else {
+  cat("Kinase substrate score results not available — kinase Venn diagrams skipped.\n")
+}
+```
+
+#### 4.10.3 Summary heatmap — significant kinases
+
+Kinases significant in at least one contrast are selected and their per-sample activity scores are displayed as a clustered heatmap (Ward linkage, Euclidean distance, rows z-scored) to provide an overview of kinase activity patterns across all conditions.
+
+```{r ksea_heatmap, results='asis'}
+if (!is.null(ksea_scores)) {
+  sig_kinases <- unique(unlist(lapply(colnames(contrast_mat), function(coef)
+    topTable(fit_ks2, coef = coef, number = Inf) |>
+      dplyr::filter(adj.P.Val < adj_p_cutoff) |> rownames())))
+
+  if (length(sig_kinases) > 1) {
+    fig_h <- max(4, length(sig_kinases) * 0.35)
+    tmp   <- tempfile(fileext = ".png")
+    pm    <- pheatmap(ksea_mat[sig_kinases, , drop = FALSE],
+                      annotation_col    = data.frame(condition = meta$condition, donor = meta$donor,
+                                                     row.names = meta$sample_name),
+                      annotation_colors = list(
+                        condition = condition_colours[sort(unique(meta$condition))],
+                        donor     = setNames(hcl.colors(length(unique(meta$donor)), "Earth"),
+                                             sort(unique(meta$donor)))),
+                      main = "Kinase activity scores — significant kinases (≥1 contrast)",
+                      scale = "row", clustering_distance_rows = "euclidean",
+                      clustering_distance_cols = "euclidean", clustering_method = "ward.D2",
+                      fontsize_row = 8, fontsize_col = 8,
+                      color = colorRampPalette(c("#4575b4", "white", "#d73027"))(100),
+                      filename = tmp, width = 7, height = fig_h)
+    save_pheatmap_pdf(pm, "ksea_kinase_heatmap", width = 7, height = fig_h)
+    cat(paste0("![](", tmp, ")\n\n"))
+  } else {
+    cat("Too few significant kinases for a summary heatmap.\n")
+  }
+}
+```
+
+---
+
+## 5. NK Gene Set Preparation
+
+NK/immune gene sets from MSigDB C2 KEGG (via `msigdbr`), used to identify NK-relevant
+pathway terms in Section 6.1. Pathway categories are defined by explicit lists of
+MSigDB `gs_name` identifiers.
+
+```{r nk_gene_sets}
+# Explicit MSigDB C2 KEGG gene set names for each NK-relevant category.
+nk_pathway_gs_names <- list(
+  NK_cytotoxicity = c(
+    "KEGG_NATURAL_KILLER_CELL_MEDIATED_CYTOTOXICITY"
+  ),
+  Fc_receptor_signaling = c(
+    "KEGG_FC_EPSILON_RI_SIGNALING_PATHWAY",
+    "KEGG_FC_GAMMA_R_MEDIATED_PHAGOCYTOSIS",
+    "KEGG_B_CELL_RECEPTOR_SIGNALING_PATHWAY"
+  ),
+  Cytokine_signaling = c(
+    "KEGG_JAK_STAT_SIGNALING_PATHWAY",
+    "KEGG_CYTOKINE_CYTOKINE_RECEPTOR_INTERACTION",
+    "KEGG_CHEMOKINE_SIGNALING_PATHWAY"
+  ),
+  PI3K_AKT_mTOR = c(
+    "KEGG_MTOR_SIGNALING_PATHWAY"
+  ),
+  MAPK_cascade = c(
+    "KEGG_MAPK_SIGNALING_PATHWAY"
+  ),
+  TCR_NK_receptor = c(
+    "KEGG_T_CELL_RECEPTOR_SIGNALING_PATHWAY"
+  ),
+  Cytoskeletal_actin = c(
+    "KEGG_REGULATION_OF_ACTIN_CYTOSKELETON"
+  )
+)
+
+all_nk_gs_names <- unique(unlist(nk_pathway_gs_names))
+
+# Load and filter MSigDB KEGG gene sets by exact gs_name
+kegg_ms <- tryCatch(
+  msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG"),
+  error = function(e)
+    msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG_LEGACY")
+) |> dplyr::filter(gs_name %in% all_nk_gs_names)
+
+# Report any requested gs_names not found in MSigDB
+kegg_found <- unique(kegg_ms$gs_name)
+missing_k <- setdiff(all_nk_gs_names, kegg_found)
+if (length(missing_k) > 0)
+  cat("> **KEGG gs_names not found in MSigDB:**",
+      paste(missing_k, collapse = ", "), "\n\n")
+
+# Section 6.1 filter: convert gs_names to Term_Descriptions used by pathfindR.
+# pathfindR uses descriptions that match gs_name with prefix removed and _ → space.
+nk_term_filter <- unique(tolower(gsub("_", " ", sub("^KEGG_", "", c(kegg_found, all_nk_gs_names)))))
+
+# Summary table of gene sets per category
+cat_df <- dplyr::bind_rows(lapply(names(nk_pathway_gs_names), function(cat_name) {
+  gs_names <- nk_pathway_gs_names[[cat_name]]
+  found_k  <- dplyr::filter(kegg_ms, gs_name %in% gs_names) |>
+    dplyr::distinct(gs_name) |> dplyr::pull(gs_name)
+  if (length(found_k) == 0) return(NULL)
+  data.frame(
+    Category = gsub("_", " ", cat_name),
+    Database = "KEGG",
+    Gene_set = found_k,
+    stringsAsFactors = FALSE
+  )
+}))
+if (nrow(cat_df) > 0)
+  knitr::kable(cat_df, caption = "NK pathway categories — gene sets used") |> print()
+```
+
+### 5.1 Supplementary KEGG pathways (not in MSigDB)
+
+hsa04151 (PI3K-Akt signaling pathway) is present in pathfindR KEGG results but absent from
+the MSigDB C2 KEGG collection. Its pathfindR term description is appended explicitly to
+`nk_term_filter` so that Section 6.1 flags it as NK-relevant.
+
+```{r kegg_supplement}
+# pathfindR reports the native KEGG description (hyphenated); add it explicitly
+nk_term_filter <- unique(c(nk_term_filter, "pi3k-akt signaling pathway"))
+```
+
+---
+
+## 6. pathfindR — Pathway Enrichment
+
+PathfindR identifies active subnetworks, defined as connected groups of genes within a protein–protein interaction network (PIN; BioGRID) that are enriched for significantly altered genes. These subnetworks are subsequently used for pathway enrichment analysis using KEGG gene sets. Across multiple iterative searches performed in parallel, enriched terms are filtered by adjusted p-value, with the minimum adjusted p-value per term retained across subnetworks. Summary statistics, including the range of adjusted p-values and the frequency of term occurrence across iterations, are reported for significantly enriched pathways. Full enrichment results are saved to `` `r file.path(out_dir_nice, "pathfindR_KEGG")` ``. Enriched terms matching the NK-relevant pathways defined in Section 5 were extracted per contrast using exact term description matching derived from the curated MSigDB `gs_name` identifiers. Per-sample pathway activity scores for representative NK-relevant pathways were computed using `score_terms()` to quantify pathway-level activity across samples.
+
+The input to pathfindR is constructed separately for each contrast from the limma differential phosphorylation results. Significantly differentially phosphorylated sites (adj.p < `r adj_p_cutoff`, |log2FC| ≥ `r logfc_cutoff`) with a valid gene symbol are retained. Where a gene has multiple significant phosphosites, only the site with the lowest adjusted p-value is kept, collapsing the input to one row per gene. The resulting per-contrast tables — containing gene symbol, log2FC, and adjusted p-value — are passed to `run_pathfindR()`.
+
+```{r pathfindr_setup}
+Sys.setenv(R_LIBS = paste(.libPaths(), collapse = ":"))
+
+pathfindr_input_list <- lapply(de_results, function(df)
+  df |>
+    dplyr::filter(!is.na(gene_symbol), gene_symbol != "",
+                  adj.P.Val < adj_p_cutoff, abs(logFC) >= logfc_cutoff) |>
+    dplyr::group_by(gene_symbol) |>
+    dplyr::slice_min(adj.P.Val, n = 1, with_ties = FALSE) |>
+    dplyr::ungroup() |>
+    dplyr::transmute(Gene.symbol = gene_symbol, logFC = logFC, adj.P.Val = adj.P.Val) |>
+    as.data.frame()
+)
+
+cat("Gene-level matrix:", nrow(mat_gene), "genes ×", ncol(mat_gene), "samples\n")
+```
+
+```{r save_pin}
+pin_path <- tryCatch(getFromNamespace("return_pin_path", "pathfindR")("Biogrid"), error = function(e) stop("Unable to locate bundled BioGRID PIN in pathfindR: ", conditionMessage(e)))
+resources_dir <- here::here("..", "..", "data", "resources")
+dir.create(resources_dir, recursive = TRUE, showWarnings = FALSE)
+dest <- file.path(resources_dir, "biogrid_bundled_pin.sif")
+if (!file.exists(dest)) {
+  file.copy(pin_path, dest)
+} else if (unname(tools::md5sum(pin_path)) != unname(tools::md5sum(dest))) {
+  versioned <- file.path(resources_dir, paste0("biogrid_bundled_pin_", format(Sys.Date(), "%Y%m%d"), ".sif"))
+  file.copy(pin_path, versioned, overwrite = TRUE)
+  cat("PIN file differs from saved copy — written to", basename(versioned), "\n")
+} else {
+  cat("PIN file matches saved copy — no action taken.\n")
+}
+```
+
+```{r enrich_dotplot_fn}
+# Helper: three-panel enrichment dotplot (enrichment_chart base + up-gene + down-gene columns).
+# Returns list(plot, height) where height is a suggested ggsave height in inches.
+enrich_dotplot <- function(df, title, subtitle = NULL, n_top = n_dot) {
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+
+  fmt_genes <- function(x) {
+    if (is.na(x) || x == "") return("")
+    stringr::str_wrap(paste(trimws(strsplit(x, ",")[[1]]), collapse = ", "), width = 40)
+  }
+  n_genes <- function(x) {
+    if (is.na(x) || x == "") return(0L)
+    length(strsplit(x, ",")[[1]])
+  }
+
+  pd <- df |>
+    dplyr::arrange(lowest_p) |>
+    dplyr::slice_head(n = n_top)
+
+  p_base <- enrichment_chart(pd, top_terms = n_top, plot_by_cluster = FALSE) +
+    scale_colour_viridis_c(option = "magma", direction = -1, name = "-log10(p)") +
+    labs(title = title, subtitle = subtitle) +
+    theme(axis.text.y   = element_text(size = 12),
+          axis.text.x   = element_text(size = 11),
+          plot.title    = element_text(size = 14),
+          plot.subtitle = element_text(size = 12),
+          legend.title  = element_text(size = 12),
+          legend.text   = element_text(size = 11))
+
+  # Extract the actual y-axis term order from enrichment_chart's rendered output so
+  # gene columns align correctly regardless of enrichment_chart's internal ordering.
+  term_levels <- levels(ggplot_build(p_base)$plot$data$Term_Description)
+
+  pd_gene <- pd |>
+    dplyr::mutate(
+      Term_label = factor(Term_Description, levels = term_levels),
+      up_text    = sapply(Up_regulated,   fmt_genes),
+      down_text  = sapply(Down_regulated, fmt_genes),
+      max_genes  = pmax(sapply(Up_regulated, n_genes), sapply(Down_regulated, n_genes))
+    ) |>
+    dplyr::arrange(Term_label)
+
+  # Suggested height: approx 3 genes per wrapped line at width=40, 0.22 in per line
+  n_lines     <- ceiling(pd_gene$max_genes / 4)
+  row_heights <- pmax(0.5, n_lines * 0.22)
+  suggested_h <- max(5, sum(row_heights) + 2)
+
+  make_gene_col <- function(col_name, col_title) {
+    ggplot(pd_gene, aes(y = Term_label, x = 0, label = .data[[col_name]])) +
+      geom_text(hjust = 0, vjust = 0.5, size = 3.5, lineheight = 0.9) +
+      xlim(c(0, 1)) +
+      labs(x = NULL, y = NULL, title = col_title) +
+      theme_void() +
+      theme(plot.title  = element_text(size = 12, face = "bold", hjust = 0),
+            plot.margin = margin(t = 0, r = 5, b = 0, l = 8))
+  }
+
+  combined <- p_base + make_gene_col("up_text", "Up-regulated") +
+    make_gene_col("down_text", "Down-regulated") +
+    patchwork::plot_layout(widths = c(3, 2, 2))
+
+  list(plot = combined, height = suggested_h)
+}
+```
+
+### 6.1 KEGG
+
+`run_pathfindR()` returns a data frame of enriched terms with the following columns: **ID** — term identifier; **Term_Description** — term description; **Fold_Enrichment** — fold enrichment calculated using the input genes; **occurrence** — number of iterations the term was found enriched; **lowest_p** / **highest_p** — lowest and highest adjusted p-values across iterations; **Up_regulated** / **Down_regulated** — comma-separated input genes with positive or negative fold-change involved in the term's gene set.
+
+```{r pathfindr_kegg, results='asis'}
+dir.create(file.path(out_dir, "pathfindR_KEGG"), recursive = TRUE, showWarnings = FALSE)
+pathfindr_kegg_results <- list()
+
+for (contrast_name in names(pathfindr_input_list)) {
+  cat("\n####", gsub("\\.", " ", contrast_name), "\n\n")
+  input_df <- pathfindr_input_list[[contrast_name]]
+  if (nrow(input_df) < 3) { cat("Too few genes (n =", nrow(input_df), ") — skipping.\n\n"); next }
+
+  result <- tryCatch({
+    capture.output(res <- suppressMessages(
+      run_pathfindR(input = input_df, gene_sets = "KEGG",
+                    min_gset_size = 10, max_gset_size = 500,
+                    pin_name_path = "Biogrid", p_val_threshold = adj_p_cutoff,
+                    enrichment_threshold = 0.05, plot_enrichment_chart = FALSE,
+                    n_processes = 2,
+                    output_dir = file.path(out_dir, "pathfindR_KEGG",
+                                           gsub("[^A-Za-z0-9]", "_", contrast_name)))),
+      type = "output")
+    res
+  }, error = function(e) { cat("pathfindR (KEGG) error:", e$message, "\n\n"); NULL })
+
+  if (is.null(result) || nrow(result) == 0) { cat("No enriched KEGG pathways.\n\n"); next }
+
+  result <- result |>
+    dplyr::mutate(NK_relevant = tolower(Term_Description) %in% nk_term_filter)
+
+  pathfindr_kegg_results[[contrast_name]] <- result
+  write_csv(result, file.path(out_dir, "pathfindR_KEGG",
+                               paste0(gsub("[^A-Za-z0-9]", "_", contrast_name), ".csv")))
+
+  # Top-N table
+  top_table <- result |>
+    dplyr::arrange(lowest_p) |>
+    dplyr::slice_head(n = n_dot) |>
+    dplyr::select(ID, Term_Description, Fold_Enrichment, lowest_p, Up_regulated, Down_regulated)
+  cat("Top", nrow(top_table), "of", nrow(result), "enriched KEGG pathways.\n\n")
+  knitr::kable(top_table, digits = 3) |> print()
+
+  # Top-N dotplot
+  dot_top <- enrich_dotplot(result, "KEGG — top pathways",
+                            subtitle = gsub("\\.", " ", contrast_name))
+  if (!is.null(dot_top)) {
+    safe_cn <- gsub("[^A-Za-z0-9]", "_", contrast_name)
+    tmp_dot <- save_fig(dot_top$plot, paste0("kegg_dotplot_top_", safe_cn),
+                        width = 16, height = dot_top$height)
+    cat(paste0("![](", tmp_dot, ")\n\n"))
+  }
+
+  nk_hits <- dplyr::filter(result,
+                            tolower(Term_Description) %in% nk_term_filter) |>
+    dplyr::arrange(lowest_p) |>
+    dplyr::select(ID, Term_Description, Fold_Enrichment, lowest_p, Up_regulated, Down_regulated)
+
+  if (nrow(nk_hits) > 0) {
+    cat(nrow(nk_hits), "NK-relevant pathway(s) enriched (of", nrow(result), "total).\n\n")
+    knitr::kable(nk_hits, digits = 3) |> print()
+    # NK-relevant dotplot
+    dot_nk <- enrich_dotplot(nk_hits, "KEGG — NK pathways",
+                             subtitle = gsub("\\.", " ", contrast_name),
+                             n_top = nrow(nk_hits))
+    if (!is.null(dot_nk)) {
+      safe_cn <- gsub("[^A-Za-z0-9]", "_", contrast_name)
+      tmp_nk  <- save_fig(dot_nk$plot, paste0("kegg_dotplot_nk_", safe_cn),
+                          width = 16, height = dot_nk$height)
+      cat(paste0("![](", tmp_nk, ")\n\n"))
+    }
+  } else {
+    cat("No NK-relevant KEGG pathways enriched (", nrow(result), "total pathways found).\n\n")
+  }
+  cat("\n")
+}
+```
+
+---
+
+
+
+## Session Info
+
+```{r session}
+sessionInfo()
+```
