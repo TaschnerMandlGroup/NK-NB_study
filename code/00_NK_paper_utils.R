@@ -174,8 +174,8 @@ pub_violin <- function(
   show_points   = FALSE,
   point_size    = 0.4,
   point_alpha   = 1,
-  show_boxplot  = NULL,   # NULL = auto: TRUE when show_points=FALSE, FALSE otherwise
   violin_scale  = "width",
+  bw_adjust     = 1.5,
   dodge_width   = 0.85,
   base_size     = 10,
   font_family   = "Arial",
@@ -197,7 +197,7 @@ pub_violin <- function(
   data[[fill_col]] <- factor(as.character(data[[fill_col]]), levels = fill_levels)
   data <- data[!is.na(data[[x_col]]) & !is.na(data[[y_col]]), ]
 
-  dodge_pos <- if (grouped) ggplot2::position_dodge(dodge_width) else "identity"
+  dodge_pos <- if (grouped) ggplot2::position_dodge(dodge_width, preserve = "single") else "identity"
 
   # Legend labels for fill scale
   leg_lbl <- if (!is.null(legend_labels)) {
@@ -214,14 +214,21 @@ pub_violin <- function(
                  y    = .data[[y_col]],
                  fill = .data[[fill_col]])
   ) +
+    # trim = FALSE: KDE extends beyond data range, giving rounded violin bases
+    # rather than a sharp spike at y = 0 for zero-inflated scRNA-seq data.
+    # coord_cartesian below clips the below-zero tail from view.
     ggplot2::geom_violin(
       scale     = violin_scale,
-      trim      = TRUE,
+      trim      = FALSE,
+      adjust    = bw_adjust,
       linewidth = 0,
       color     = NA,
       position  = dodge_pos,
       alpha     = 1
     ) +
+    # Clip the below-zero Gaussian tail; calling code can override with a
+    # tighter coord_cartesian(ylim = c(0, specific_max)).
+    ggplot2::coord_cartesian(ylim = c(0, NA)) +
     ggplot2::scale_fill_manual(values = colors, labels = leg_lbl, name = NULL) +
     ggplot2::labs(x = NULL, y = y_label, title = title) +
     ggplot2::theme_classic(base_size = base_size, base_family = font_family) +
@@ -252,19 +259,6 @@ pub_violin <- function(
       strip.text        = ggplot2::element_text(size = base_size, face = "italic")
     )
 
-  # Boxplot: auto-show when no points are drawn; always black lines
-  draw_box <- if (is.null(show_boxplot)) FALSE else show_boxplot
-  if (draw_box) {
-    p <- p + ggplot2::geom_boxplot(
-      width         = if (grouped) 0.08 else 0.14,
-      outlier.shape = NA,
-      position      = dodge_pos,
-      fill          = NA,
-      color         = "black",
-      linewidth     = 0.35
-    )
-  }
-
   # Optional individual data points
   if (show_points) {
     p <- p + ggplot2::geom_point(
@@ -294,7 +288,6 @@ pub_violin <- function(
     comps_to_use <- if (!is.null(comparisons)) {
       comparisons
     } else if (!is.null(ref_group)) {
-      # build explicit ref vs each other level → bracket-line style
       lapply(setdiff(x_levels, ref_group), function(g) c(ref_group, g))
     } else {
       NULL
@@ -314,6 +307,174 @@ pub_violin <- function(
         )
       )
     }
+  }
+
+  p
+}
+
+# ─── pub_dotplot() ────────────────────────────────────────────────────────────
+# Bubble dotplot for scRNA-seq: dot size = % cells expressing (log-norm > 0),
+# dot fill = log2FC(test / ctrl) for a single ctrl vs test comparison.
+# Significance stars (BH-adjusted Wilcoxon) are printed above each dot.
+#
+# Parameters:
+#   data        – long-format data.frame with columns x_col, y_col, group_col,
+#                 and optionally gene_col
+#   x_col       – column for x-axis categories (e.g. NK subset, cell type)
+#   y_col       – column with numeric expression values
+#   gene_col    – column with gene names; NULL if data is already single-gene
+#   group_col   – column with group labels
+#   ctrl        – name of the reference/control group
+#   test_grp    – name of the comparison group
+#   x_order     – display order for x_col levels
+#   gene_order  – display order for gene_col levels (y-axis)
+#   x_labels    – named HTML character vector for x-axis tick labels
+#   fc_limits   – symmetric c(lo, hi) for log2FC colour scale
+#   fc_colors   – length-3 vector: low / mid / high colours
+#   size_range  – c(min, max) dot diameter in mm
+#   base_size   – base font size
+#   font_family – registered font family name
+#
+# Returns: a ggplot object (geom_point, shape 21, no outline)
+pub_dotplot <- function(
+  data,
+  x_col,
+  y_col       = "value",
+  gene_col    = NULL,
+  group_col   = "group",
+  ctrl        = "control",
+  test_grp    = "ATRXdel",
+  x_order     = NULL,
+  gene_order  = NULL,
+  x_labels    = NULL,
+  fc_limits   = c(-2, 2),
+  fc_colors   = c("#0B5394", "white", "#cc0000"),
+  size_range  = c(1, 8),
+  base_size   = 9,
+  font_family = "Arial"
+) {
+  grp_vars  <- c(x_col, group_col)
+  join_vars <- x_col
+  if (!is.null(gene_col)) {
+    grp_vars  <- c(grp_vars, gene_col)
+    join_vars <- c(join_vars, gene_col)
+  }
+
+  d <- dplyr::filter(data, .data[[group_col]] %in% c(ctrl, test_grp))
+
+  # Per-group summary
+  summ <- d %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(grp_vars))) %>%
+    dplyr::summarise(
+      pct_expr = mean(.data[[y_col]] > 0, na.rm = TRUE) * 100,
+      avg_expr = mean(.data[[y_col]], na.rm = TRUE),
+      .groups  = "drop"
+    )
+
+  ctrl_s <- dplyr::filter(summ, .data[[group_col]] == ctrl)
+  test_s <- dplyr::filter(summ, .data[[group_col]] == test_grp)
+
+  fc_df <- dplyr::inner_join(
+    dplyr::select(ctrl_s, dplyr::all_of(c(join_vars, "avg_expr"))),
+    dplyr::select(test_s, dplyr::all_of(c(join_vars, "avg_expr", "pct_expr"))),
+    by = join_vars, suffix = c("_ctrl", "_test")
+  ) %>%
+    dplyr::mutate(
+      log2FC         = log2((avg_expr_test + 0.01) / (avg_expr_ctrl + 0.01)),
+      log2FC_clamped = pmax(pmin(log2FC, fc_limits[2]), fc_limits[1])
+    )
+
+  # BH-adjusted Wilcoxon (ctrl vs test) per join_vars combination
+  stat_df <- d %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(join_vars))) %>%
+    dplyr::group_modify(~ {
+      dd <- droplevels(.x)
+      grps <- unique(dd[[group_col]])
+      if (length(grps) < 2 || length(unique(dd[[y_col]])) < 2)
+        return(data.frame(p = NA_real_, p.adj = NA_real_,
+                          p.adj.signif = "ns", stringsAsFactors = FALSE))
+      tryCatch(
+        rstatix::wilcox_test(dd, as.formula(paste(y_col, "~", group_col)),
+                             p.adjust.method = "BH", exact = FALSE) %>%
+          rstatix::add_significance(
+            "p.adj",
+            cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1),
+            symbols   = c("****", "***", "**", "*", "ns")
+          ) %>%
+          dplyr::select(p, p.adj, p.adj.signif),
+        error = function(e)
+          data.frame(p = NA_real_, p.adj = NA_real_,
+                     p.adj.signif = "ns", stringsAsFactors = FALSE)
+      )
+    }) %>%
+    dplyr::ungroup()
+
+  plot_df <- dplyr::left_join(fc_df, stat_df, by = join_vars)
+
+  # Factor ordering
+  x_present <- unique(as.character(plot_df[[x_col]]))
+  x_lvls    <- if (!is.null(x_order))
+    c(intersect(x_order, x_present), setdiff(x_present, x_order))
+  else x_present
+  plot_df[[x_col]] <- factor(as.character(plot_df[[x_col]]), levels = x_lvls)
+
+  if (!is.null(gene_col)) {
+    g_present <- unique(as.character(plot_df[[gene_col]]))
+    g_lvls    <- if (!is.null(gene_order))
+      c(intersect(gene_order, g_present), setdiff(g_present, gene_order))
+    else g_present
+    plot_df[[gene_col]] <- factor(as.character(plot_df[[gene_col]]), levels = rev(g_lvls))
+  }
+
+  y_aes <- if (!is.null(gene_col)) ggplot2::aes(y = .data[[gene_col]]) else ggplot2::aes(y = "")
+
+  p <- ggplot2::ggplot(
+    plot_df,
+    ggplot2::aes(x = .data[[x_col]], size = pct_expr, fill = log2FC_clamped)
+  ) +
+    y_aes +
+    ggplot2::geom_point(shape = 21, color = NA) +
+    ggplot2::geom_text(
+      ggplot2::aes(label = p.adj.signif),
+      size = 2.5, vjust = -1.5, color = "black"
+    ) +
+    ggplot2::scale_size_continuous(
+      name   = "% expressing",
+      range  = size_range,
+      limits = c(0, 100)
+    ) +
+    ggplot2::scale_fill_gradient2(
+      low      = fc_colors[1],
+      mid      = fc_colors[2],
+      high     = fc_colors[3],
+      midpoint = 0,
+      limits   = fc_limits,
+      oob      = scales::squish,
+      name     = "log₂FC\n(ATRXdel/ctrl)"
+    ) +
+    ggplot2::theme_classic(base_size = base_size, base_family = font_family) +
+    ggplot2::theme(
+      axis.title    = ggplot2::element_blank(),
+      axis.text.x   = ggtext::element_markdown(
+                        angle = 45, hjust = 1, vjust = 1,
+                        size = base_size - 1, color = "black"),
+      axis.text.y   = ggplot2::element_text(
+                        face = "italic", size = base_size - 1, color = "black"),
+      axis.line     = ggplot2::element_line(linewidth = 0.4),
+      axis.ticks    = ggplot2::element_line(linewidth = 0.4),
+      legend.key.size    = ggplot2::unit(3, "mm"),
+      legend.text        = ggplot2::element_text(size = base_size - 2),
+      legend.title       = ggplot2::element_text(size = base_size - 1),
+      legend.background  = ggplot2::element_blank(),
+      strip.background   = ggplot2::element_blank(),
+      strip.text         = ggplot2::element_text(face = "italic", size = base_size),
+      plot.margin        = ggplot2::margin(t = 14, r = 5, b = 3, l = 5)
+    )
+
+  if (!is.null(x_labels)) {
+    lbl <- x_labels[x_lvls]
+    lbl[is.na(lbl)] <- x_lvls[is.na(lbl)]
+    p <- p + ggplot2::scale_x_discrete(labels = lbl)
   }
 
   p

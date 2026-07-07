@@ -1,0 +1,1126 @@
+---
+title: "NK project: snATAC-seq — TF footprinting by cluster and genetic group"
+author: "Dr. Sara Wernig-Zorc"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  out:  "/home/rstudio/mnt_out/NK_project/"
+  anno: "/home/rstudio/mnt_resources/"
+---
+
+Requires: `39_` completed first (saves `Rds/snATAC_NK_v20260625_modules.Rds`).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = FALSE,
+                      error = FALSE,
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = "future::multicore", workers = 20)
+options(future.globals.maxSize = 40 * 10^9)
+print(params)
+```
+
+```{r include=FALSE}
+source("/home/rstudio/00_NK_paper_setup.R")
+source("/home/rstudio/00_NK_paper_utils.R")
+```
+
+```{r include=FALSE}
+suppressPackageStartupMessages({
+  library(ArchR)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  library(JASPAR2024)
+  library(TFBSTools)
+  library(motifmatchr)
+  library(RSQLite)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(ggrepel)
+  library(patchwork)
+  library(tidyverse)
+})
+
+addArchRThreads(threads = 20)
+addArchRGenome("hg38")
+
+filter    <- dplyr::filter
+select    <- dplyr::select
+mutate    <- dplyr::mutate
+summarise <- dplyr::summarise
+rename    <- dplyr::rename
+count     <- dplyr::count
+group_by  <- dplyr::group_by
+ungroup   <- dplyr::ungroup
+arrange   <- dplyr::arrange
+slice_min <- dplyr::slice_min
+sub       <- base::sub
+gsub      <- base::gsub
+
+# Remap group label strings to canonical names used throughout the script.
+# Logic: anything with "atrx" but no "wt" → ATRXdel (catches ATRXdel/ATRXmut/ATRXm/ATRX_del etc.)
+#        anything with "atrx" and "wt"    → ATRXwtMYCNwt
+remap_group <- function(x) {
+  x <- as.character(x)
+  x[grepl("atrx", x, ignore.case = TRUE) & !grepl("wt", x, ignore.case = TRUE)] <- "ATRXdel"
+  x[grepl("atrx", x, ignore.case = TRUE) &  grepl("wt", x, ignore.case = TRUE)] <- "ATRXwtMYCNwt"
+  x[grepl("mycn", x, ignore.case = TRUE) &  grepl("amp", x, ignore.case = TRUE)] <- "MYCNamp"
+  x[grepl("^control$",            x, ignore.case = TRUE)] <- "control"
+  x
+}
+
+# Extract canonical group name from an ArchR clust_group column name.
+# ArchR appends "._.Rep1" to coverage column names, e.g. "C2_control._.Rep1".
+clust_col_to_group <- function(col_names) {
+  # strip cluster prefix (everything up to and including the first "_")
+  suffix <- sub("^[^_]+_", "", col_names)
+  # strip ArchR's rep suffix (e.g. "._.Rep1")
+  suffix <- sub("\\._\\.Rep.*$", "", suffix)
+  remap_group(suffix)
+}
+```
+
+```{r}
+theme_set(pub_theme)
+
+COL_ATAC_CLUSTER <- c(
+  "C1" = "#1B4F8A",
+  "C2" = "#2E7BB5",
+  "C3" = "#6AADD5",
+  "C4" = "#4A9B6F",
+  "C5" = "#8FC494",
+  "C6" = "#C0392B",
+  "C7" = "#E8837A"
+)
+
+COL_GROUP <- c(
+  "control"      = unname(COLOR_CODE_GROUP["control"]),
+  "ATRXdel"      = unname(COLOR_CODE_GROUP["ATRXdel"]),
+  "MYCNamp"      = unname(COLOR_CODE_GROUP["MYCNamp"]),
+  "ATRXwtMYCNwt" = unname(COLOR_CODE_GROUP["ATRXwtMYCNwt"])
+)
+
+GROUP_ORDER   <- c( "control","ATRXdel", "MYCNamp", "ATRXwtMYCNwt")
+CLUSTER_ORDER <- paste0("C", 1:7)
+
+CLUSTER_NAMES <- c(
+  "C1" = "CD56bright 1",
+  "C2" = "CD56bright 2",
+  "C3" = "CD56bright 3",
+  "C4" = "Intermediate 1",
+  "C5" = "Intermediate 2",
+  "C6" = "CD56dim 1",
+  "C7" = "CD56dim 2"
+)
+
+METACLUSTER <- c(
+  "C1" = "CD56bright", "C2" = "CD56bright", "C3" = "CD56bright",
+  "C4" = "Intermediate", "C5" = "Intermediate",
+  "C6" = "CD56dim", "C7" = "CD56dim"
+)
+```
+
+# ___Load ArchR project (from 39a_)___
+
+```{r}
+proj_filt <- readRDS(paste0(params$out, "Rds/snATAC_NK_v20260625_modules.Rds"))
+cat("Loaded proj_filt:", nCells(proj_filt), "cells\n")
+```
+
+# ___TF footprinting: setup___
+
+
+```{r}
+TF_LIST <- unique(TFs)
+cat("TFs to footprint:", paste(TF_LIST, collapse = ", "), "\n")
+
+proj_filt$clust_group <- factor(paste0(
+  as.character(proj_filt$Clusters_res1), "_",
+  as.character(proj_filt$group)
+))
+cat("\nclust_group combinations:\n")
+print(sort(table(proj_filt$clust_group), decreasing = TRUE))
+```
+
+## ___Add group coverages (cluster x group)___
+
+Creates pseudo-bulk coverage tracks for each cluster x genetic group combination.
+`force = FALSE` skips recomputation if coverages already exist.
+
+```{r}
+proj_filt <- addGroupCoverages(
+  ArchRProj    = proj_filt,
+  groupBy      = "clust_group",
+  minCells     = 5,       # lowered from 10 — some clusters have few ATRXdel cells
+  maxCells     = 500,
+  maxFragments = 25 * 10^6,
+  force        = TRUE,    # recompute now that group names are correctly remapped
+  verbose      = TRUE
+)
+```
+
+## ___Match TF names to JASPAR motifs___
+
+```{r}
+# Load motif positions directly — avoids stale internal path stored in the Rds
+motif_pos_path <- paste0(params$out, "ArchR_v20260203/Annotations/Motif-Positions-In-Peaks.rds")
+cat("Motif positions path:", motif_pos_path, "\n")
+cat("File exists:", file.exists(motif_pos_path), "\n")
+
+if (file.exists(motif_pos_path)) {
+  motif_positions <- readRDS(motif_pos_path)
+} else {
+  # Fallback: let ArchR try (may fail if annotation path is also stale)
+  motif_positions <- tryCatch(
+    getPositions(proj_filt),
+    error = function(e) {
+      stop("Cannot load motif positions from disk or via getPositions().\n",
+           "Expected file: ", motif_pos_path, "\n",
+           "Original error: ", conditionMessage(e))
+    }
+  )
+}
+
+motif_names_all <- names(motif_positions)
+cat("Total motifs loaded:", length(motif_names_all), "\n")
+
+match_tf_to_motif <- function(tf, motif_names) {
+  exact <- motif_names[grepl(paste0("_", tf, "$"), motif_names, ignore.case = TRUE)]
+  if (length(exact) > 0) return(exact[1])
+  partial <- motif_names[grepl(tf, motif_names, ignore.case = TRUE)]
+  if (length(partial) > 0) return(partial[1])
+  NA_character_
+}
+
+tf_motif_map <- data.frame(
+  TF         = TF_LIST,
+  motif_name = sapply(TF_LIST, match_tf_to_motif, motif_names = motif_names_all),
+  stringsAsFactors = FALSE
+)
+tf_motif_map_valid <- tf_motif_map[!is.na(tf_motif_map$motif_name), ]
+cat("\nMatched TF -> motif:\n")
+print(tf_motif_map_valid)
+
+tf_motif_names <- tf_motif_map_valid$motif_name
+```
+
+## ___Compute TF footprints___
+
+```{r}
+footprints <- getFootprints(
+  ArchRProj = proj_filt,
+  positions = motif_positions[tf_motif_names],
+  groupBy   = "clust_group",
+  flank     = 250
+)
+cat("Footprint SE dimensions:", dim(footprints), "\n")
+cat("Groups:", paste(colnames(footprints), collapse = ", "), "\n")
+```
+
+# ___Plot footprints by cluster (C1–C7, all groups pooled)___
+
+Compare TF footprints across the 7 ATAC clusters, pooling all genetic groups.
+
+```{r}
+proj_filt <- addGroupCoverages(
+  ArchRProj    = proj_filt,
+  groupBy      = "Clusters_res1",
+  minCells     = 5,
+  maxCells     = 500,
+  maxFragments = 25 * 10^6,
+  force        = TRUE,
+  verbose      = TRUE
+)
+```
+
+```{r}
+footprints_cluster <- getFootprints(
+  ArchRProj = proj_filt,
+  positions = motif_positions[tf_motif_names],
+  groupBy   = "Clusters_res1",
+  flank     = 250
+)
+cat("Cluster footprint columns:", paste(colnames(footprints_cluster), collapse = ", "), "\n")
+```
+
+```{r fig.height=4, fig.width=7}
+cl_col_to_canonical <- function(col_names) {
+  sub("\\._\\..*$", "", col_names)   # "C1._.Rep1" → "C1"
+}
+
+# pal names must match what plotFootprints uses (strips ._.* suffix internally)
+cl_pal <- setNames(
+  COL_ATAC_CLUSTER[cl_col_to_canonical(colnames(footprints_cluster))],
+  cl_col_to_canonical(colnames(footprints_cluster))
+)
+cl_pal[is.na(cl_pal)] <- "gray50"
+
+tryCatch({
+  plotFootprints(
+    seFoot       = footprints_cluster,
+    ArchRProj    = proj_filt,
+    normMethod   = "Subtract",
+    plotName     = "Footprints_by-cluster",
+    addDOC       = FALSE,
+    smoothWindow = 10,
+    pal          = cl_pal
+  )
+  message("Footprint PDF saved: by-cluster")
+}, error = function(e) message("Footprint error (by-cluster): ", conditionMessage(e)))
+```
+
+# ___Custom ggplot2 footprint plots___
+
+```{r fig.height=5, fig.width=10}
+extract_footprint_df <- function(seFoot, tf_motif, groups) {
+  if (!(tf_motif %in% rownames(seFoot))) return(NULL)
+  mat <- assay(seFoot, "footprint")
+  row_i <- which(rownames(mat) == tf_motif)
+  if (length(row_i) == 0) return(NULL)
+  df <- as.data.frame(t(mat[row_i, , drop = FALSE]))
+  df$position <- seq(-250, 250, length.out = nrow(df))
+  colnames(df)[1] <- "footprint_val"
+  # mat is positions x groups in ArchR output
+  df_long <- as.data.frame(mat[row_i, , drop = TRUE])
+  df_long <- data.frame(
+    clust_group = colnames(mat),
+    footprint   = as.numeric(mat[row_i, ]),
+    position    = rep(seq(-250, 250, length.out = ncol(mat)), each = 1)
+  )
+  # Reshape: mat is [motifs x positions], groups are in colnames
+  # ArchR footprint SE: rows=motifs, cols=groups; values are vectors per position
+  # Use the correct structure
+  pos_seq <- seq(-250, 250, length.out = ncol(mat))
+  do.call(rbind, lapply(groups[groups %in% colnames(mat)], function(g) {
+    data.frame(
+      clust_group = g,
+      group       = clust_col_to_group(g),   # strips cluster prefix + ._.Rep suffix, remaps
+      position    = pos_seq,
+      footprint   = as.numeric(mat[row_i, g, drop = FALSE]),
+      stringsAsFactors = FALSE
+    )
+  }))
+}
+
+plot_cluster_footprints <- function(seFoot, cluster_id, tf_motif_map, group_colors,
+                                    cluster_name) {
+  # Match by prefix — handles ATRXm / ATRXdel / ATRXmut naming variants
+  all_groups <- colnames(seFoot)[grepl(paste0("^", cluster_id, "_"), colnames(seFoot))]
+  df_list <- lapply(seq_len(nrow(tf_motif_map)), function(i) {
+    df <- extract_footprint_df(seFoot, tf_motif_map$motif_name[i], all_groups)
+    if (!is.null(df)) df$TF <- tf_motif_map$TF[i]
+    df
+  })
+  df_all <- bind_rows(df_list)
+  if (is.null(df_all) || nrow(df_all) == 0) {
+    message("No footprint data for cluster ", cluster_id); return(invisible(NULL))
+  }
+  df_all$group <- factor(df_all$group, levels = names(group_colors))
+  ggplot(df_all, aes(x = position, y = footprint, color = group)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray60", linewidth = 0.3) +
+    geom_line(linewidth = 0.6, alpha = 0.85) +
+    facet_wrap(~ TF, scales = "free_y", ncol = 4) +
+    scale_color_manual(values = group_colors) +
+    labs(
+      title    = paste0(cluster_id, ": ", cluster_name),
+      subtitle = "TF footprint — genetic groups (bias-subtracted)",
+      x        = "Distance from motif center (bp)",
+      y        = "Normalized insertion frequency",
+      color    = "genetic group"
+    ) +
+    theme(
+      legend.position = "top",
+      strip.text      = element_text(size = 8, face = "italic"),
+      panel.spacing   = unit(2, "mm")
+    )
+}
+
+for (cl in CLUSTER_ORDER) {
+  p <- tryCatch(
+    plot_cluster_footprints(footprints, cl, tf_motif_map_valid, COL_GROUP, CLUSTER_NAMES[cl]),
+    error = function(e) { message("ggplot footprint error for ", cl, ": ", conditionMessage(e)); NULL }
+  )
+  if (!is.null(p)) {
+    tryCatch(print(p), error = function(e) message("print error: ", conditionMessage(e)))
+    tryCatch({
+      pdf(paste0(params$out, "figures/snATAC_NK_footprints_", cl, "_genetic-groups.pdf"),
+          height = 5, width = 10, useDingbats = FALSE)
+      print(p); dev.off()
+    }, error = function(e) { try(dev.off(), silent = TRUE); message(conditionMessage(e)) })
+  }
+}
+```
+
+# ___ChromVAR TF deviation scores___
+
+```{r fig.height=6, fig.width=10}
+tryCatch({
+  chrom_se <- getMatrixFromProject(proj_filt, useMatrix = "MotifMatrix")
+
+  row_idx <- which(rowData(chrom_se)$name %in% tf_motif_map_valid$motif_name)
+  if (length(row_idx) == 0) {
+    row_idx <- which(grepl(paste(TF_LIST, collapse = "|"),
+                           rowData(chrom_se)$name, ignore.case = TRUE))
+  }
+  if (length(row_idx) == 0) stop("No matching TFs in MotifMatrix")
+
+  chrom_sub <- chrom_se[row_idx, ]
+  cell_df <- data.frame(
+    Clusters_res1 = as.character(proj_filt$Clusters_res1),
+    group         = as.character(proj_filt$group),
+    clust_group   = as.character(proj_filt$clust_group),
+    cell          = getCellNames(proj_filt),
+    stringsAsFactors = FALSE
+  )
+  dev_mat <- assay(chrom_sub, 2)
+  rownames(dev_mat) <- rowData(chrom_sub)$name
+
+  clust_group_levels <- levels(proj_filt$clust_group)
+  pb_mat <- vapply(clust_group_levels, function(cg) {
+    cells <- cell_df$cell[cell_df$clust_group == cg]
+    cells <- cells[cells %in% colnames(dev_mat)]
+    if (length(cells) < 5) return(rep(NA_real_, nrow(dev_mat)))
+    rowMeans(dev_mat[, cells, drop = FALSE], na.rm = TRUE)
+  }, numeric(nrow(dev_mat)))
+
+  motif_to_tf    <- setNames(tf_motif_map_valid$TF, tf_motif_map_valid$motif_name)
+  rownames(pb_mat) <- ifelse(rownames(pb_mat) %in% names(motif_to_tf),
+                             motif_to_tf[rownames(pb_mat)], rownames(pb_mat))
+  pb_mat <- pb_mat[, colSums(is.na(pb_mat)) < nrow(pb_mat) / 2, drop = FALSE]
+
+  col_ann_df <- data.frame(
+    cluster   = sub("_.*", "", colnames(pb_mat)),
+    group     = sub("^[^_]+_", "", colnames(pb_mat)),
+    row.names = colnames(pb_mat)
+  )
+  col_ha <- HeatmapAnnotation(
+    cluster = col_ann_df$cluster,
+    group   = col_ann_df$group,
+    col     = list(
+      cluster = COL_ATAC_CLUSTER[unique(col_ann_df$cluster)],
+      group   = COL_GROUP[unique(col_ann_df$group)]
+    ),
+    annotation_name_gp = gpar(fontsize = 8)
+  )
+
+  pb_z <- t(scale(t(pb_mat)))
+  pb_z[pb_z >  2] <-  2
+  pb_z[pb_z < -2] <- -2
+
+  ht <- Heatmap(
+    pb_z,
+    name              = "deviation\nz-score",
+    top_annotation    = col_ha,
+    row_names_gp      = gpar(fontsize = 8, fontface = "italic"),
+    column_names_gp   = gpar(fontsize = 7),
+    col               = colorRamp2(c(-2, 0, 2),
+                                   c(COL_GROUP["control"], "white", COL_GROUP["ATRXdel"])),
+    cluster_rows      = TRUE,
+    cluster_columns   = FALSE,
+    column_order      = colnames(pb_mat),
+    show_column_names = TRUE,
+    border            = TRUE,
+    column_title      = "ChromVAR TF deviation: NK ATAC clusters x genetic groups",
+    column_title_gp   = gpar(fontsize = 10, fontface = "bold")
+  )
+  draw(ht)
+  pdf(paste0(params$out, "figures/snATAC_NK_chromVAR_TF_deviation_heatmap.pdf"),
+      height = 6, width = 10, useDingbats = FALSE)
+  draw(ht); dev.off()
+  cat("ChromVAR heatmap saved. TFs:", paste(rownames(pb_z), collapse = ", "), "\n")
+
+}, error = function(e) {
+  message("ChromVAR MotifMatrix not available or error: ", conditionMessage(e))
+  message("Run addDeviationsMatrix() on the ArchR project if needed.")
+})
+```
+
+# ___Footprint depth summary heatmap___
+
+```{r fig.height=6, fig.width=9}
+compute_footprint_score <- function(seFoot, tf_motif, groups, center_bp = 25) {
+  if (!(tf_motif %in% rownames(seFoot))) return(NULL)
+  mat   <- assay(seFoot, "footprint")
+  row_i <- which(rownames(mat) == tf_motif)
+  if (length(row_i) == 0) return(NULL)
+  pos        <- seq(-250, 250, length.out = ncol(mat))
+  center_idx <- abs(pos) <= center_bp
+  flank_idx  <- abs(pos) >= 100 & abs(pos) <= 200
+  sapply(groups, function(g) {
+    if (!(g %in% colnames(mat))) return(NA_real_)
+    mean(mat[row_i, flank_idx], na.rm = TRUE) -
+    mean(mat[row_i, center_idx], na.rm = TRUE)
+  })
+}
+
+all_cg <- colnames(footprints)
+score_df <- bind_rows(lapply(seq_len(nrow(tf_motif_map_valid)), function(i) {
+  sc <- compute_footprint_score(footprints, tf_motif_map_valid$motif_name[i], all_cg)
+  if (is.null(sc)) return(NULL)
+  data.frame(TF = tf_motif_map_valid$TF[i], clust_group = names(sc),
+             score = as.numeric(sc), stringsAsFactors = FALSE)
+}))
+
+score_df <- score_df %>%
+  filter(!is.na(score)) %>%
+  mutate(
+    cluster = factor(base::sub("_.*", "", clust_group), levels = CLUSTER_ORDER),
+    group   = factor(clust_col_to_group(clust_group), levels = GROUP_ORDER)
+  )
+
+score_wide <- score_df %>%
+  mutate(col_id = paste0(cluster, "|", group)) %>%
+  dplyr::select(TF, col_id, score) %>%
+  pivot_wider(names_from = col_id, values_from = score) %>%
+  tibble::column_to_rownames("TF")
+
+x_levels <- as.vector(outer(CLUSTER_ORDER, GROUP_ORDER, paste, sep = "|"))
+x_levels <- x_levels[x_levels %in% colnames(score_wide)]
+score_wide <- score_wide[, x_levels, drop = FALSE]
+
+score_z <- t(scale(t(as.matrix(score_wide))))
+score_z[score_z >  2] <-  2
+score_z[score_z < -2] <- -2
+
+col_ann_sc <- data.frame(
+  cluster   = base::sub("\\|.*", "", colnames(score_wide)),
+  group     = base::sub(".*\\|", "", colnames(score_wide)),
+  row.names = colnames(score_wide)
+)
+ha_sc <- HeatmapAnnotation(
+  cluster = col_ann_sc$cluster,
+  group   = col_ann_sc$group,
+  col     = list(
+    cluster = COL_ATAC_CLUSTER[unique(col_ann_sc$cluster)],
+    group   = COL_GROUP[unique(col_ann_sc$group)]
+  ),
+  annotation_name_gp = gpar(fontsize = 8)
+)
+
+ht_score <- Heatmap(
+  score_z,
+  name             = "footprint\ndepth (z)",
+  top_annotation   = ha_sc,
+  row_names_gp     = gpar(fontsize = 8, fontface = "italic"),
+  column_names_gp  = gpar(fontsize = 7),
+  col              = colorRamp2(c(-2, 0, 2), c("#2166AC", "white", "#B2182B")),
+  cluster_rows     = TRUE,
+  cluster_columns  = FALSE,
+  column_split     = col_ann_sc$cluster,
+  border           = TRUE,
+  column_title     = "TF footprint depth: 7 ATAC clusters x genetic groups",
+  column_title_gp  = gpar(fontsize = 10, fontface = "bold")
+)
+draw(ht_score)
+pdf(paste0(params$out, "figures/snATAC_NK_TF_footprintDepth_heatmap.pdf"),
+    height = 6, width = 9, useDingbats = FALSE)
+draw(ht_score); dev.off()
+```
+
+# ___TF footprinting: by genetic group (all clusters pooled)___
+
+Compare footprints between ATRXdel / control / MYCNamp / ATRXwtMYCNwt across all NK cells, ignoring cluster identity.
+
+## ___Group coverages — by group only___
+
+```{r}
+proj_filt <- addGroupCoverages(
+  ArchRProj    = proj_filt,
+  groupBy      = "group",
+  minCells     = 5,
+  maxCells     = 500,
+  maxFragments = 25 * 10^6,
+  force        = TRUE,
+  verbose      = TRUE
+)
+```
+
+## ___Footprints — by group___
+
+```{r}
+footprints_group <- getFootprints(
+  ArchRProj = proj_filt,
+  positions = motif_positions[tf_motif_names],
+  groupBy   = "group",
+  flank     = 250
+)
+cat("Group footprint columns:", paste(colnames(footprints_group), collapse = ", "), "\n")
+```
+
+## ___Plot: by group (ArchR native)___
+
+```{r fig.height=4, fig.width=7}
+# Map "._.Rep1"-suffixed column names to canonical group names for colors
+grp_col_to_canonical <- function(col_names) {
+  x <- sub("\\._\\.Rep.*$", "", col_names)
+  remap_group(x)
+}
+
+grp_pal <- setNames(
+  COL_GROUP[grp_col_to_canonical(colnames(footprints_group))],
+  colnames(footprints_group)
+)
+grp_pal[is.na(grp_pal)] <- "gray50"
+
+tryCatch({
+  plotFootprints(
+    seFoot       = footprints_group,
+    ArchRProj    = proj_filt,
+    normMethod   = "Subtract",
+    plotName     = "Footprints_all-clusters_by-group",
+    addDOC       = FALSE,
+    smoothWindow = 10,
+    pal          = grp_pal,
+    plotDir      = paste0(params$out, "figures/footprints/")
+  )
+  message("Footprint PDF saved: by-group")
+}, error = function(e) message("Footprint error (by-group): ", conditionMessage(e)))
+```
+
+## ___Plot: by group (ggplot2)___
+
+```{r fig.height=5, fig.width=10}
+mat_grp <- assay(footprints_group, "footprint")
+pos_seq <- seq(-250, 250, length.out = ncol(mat_grp))
+
+df_grp <- bind_rows(lapply(seq_len(nrow(tf_motif_map_valid)), function(i) {
+  motif <- tf_motif_map_valid$motif_name[i]
+  tf    <- tf_motif_map_valid$TF[i]
+  if (!(motif %in% rownames(mat_grp))) return(NULL)
+  row_i <- which(rownames(mat_grp) == motif)
+  bind_rows(lapply(colnames(mat_grp), function(g) {
+    data.frame(
+      TF        = tf,
+      group     = grp_col_to_canonical(g),
+      position  = pos_seq,
+      footprint = as.numeric(mat_grp[row_i, g]),
+      stringsAsFactors = FALSE
+    )
+  }))
+})) %>%
+  filter(!is.na(group)) %>%
+  mutate(group = factor(group, levels = GROUP_ORDER))
+
+p_grp <- ggplot(df_grp, aes(x = position, y = footprint, color = group)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60", linewidth = 0.3) +
+  geom_line(linewidth = 0.6, alpha = 0.85) +
+  facet_wrap(~ TF, scales = "free_y", ncol = 4) +
+  scale_color_manual(values = COL_GROUP) +
+  labs(
+    title    = "TF footprints — all NK cells, by genetic group",
+    subtitle = "bias-subtracted, all clusters pooled",
+    x        = "Distance from motif center (bp)",
+    y        = "Normalized insertion frequency",
+    color    = "genetic group"
+  ) +
+  theme(legend.position = "top", strip.text = element_text(size = 8, face = "italic"),
+        panel.spacing = unit(2, "mm"))
+
+tryCatch(print(p_grp), error = function(e) message(conditionMessage(e)))
+tryCatch({
+  pdf(paste0(params$out, "figures/snATAC_NK_footprints_by-group.pdf"),
+      height = 5, width = 10, useDingbats = FALSE)
+  print(p_grp); dev.off()
+}, error = function(e) { try(dev.off(), silent = TRUE); message(conditionMessage(e)) })
+```
+
+# ___TF footprinting: by cluster (ggplot2)___
+
+```{r fig.height=5, fig.width=10}
+mat_cl  <- assay(footprints_cluster, "footprint")
+pos_seq <- seq(-250, 250, length.out = ncol(mat_cl))
+
+df_cl <- bind_rows(lapply(seq_len(nrow(tf_motif_map_valid)), function(i) {
+  motif <- tf_motif_map_valid$motif_name[i]
+  tf    <- tf_motif_map_valid$TF[i]
+  if (!(motif %in% rownames(mat_cl))) return(NULL)
+  row_i <- which(rownames(mat_cl) == motif)
+  bind_rows(lapply(colnames(mat_cl), function(g) {
+    data.frame(
+      TF        = tf,
+      cluster   = cl_col_to_canonical(g),
+      position  = pos_seq,
+      footprint = as.numeric(mat_cl[row_i, g]),
+      stringsAsFactors = FALSE
+    )
+  }))
+})) %>%
+  filter(!is.na(cluster)) %>%
+  mutate(cluster = factor(cluster, levels = CLUSTER_ORDER))
+
+p_cl <- ggplot(df_cl, aes(x = position, y = footprint, color = cluster)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60", linewidth = 0.3) +
+  geom_line(linewidth = 0.6, alpha = 0.85) +
+  facet_wrap(~ TF, scales = "free_y", ncol = 4) +
+  scale_color_manual(values = COL_ATAC_CLUSTER) +
+  labs(
+    title    = "TF footprints — all genetic groups, by ATAC cluster",
+    subtitle = "bias-subtracted, all groups pooled",
+    x        = "Distance from motif center (bp)",
+    y        = "Normalized insertion frequency",
+    color    = "cluster"
+  ) +
+  theme(legend.position = "top", strip.text = element_text(size = 8, face = "italic"),
+        panel.spacing = unit(2, "mm"))
+
+tryCatch(print(p_cl), error = function(e) message(conditionMessage(e)))
+tryCatch({
+  pdf(paste0(params$out, "figures/snATAC_NK_footprints_by-cluster.pdf"),
+      height = 5, width = 10, useDingbats = FALSE)
+  print(p_cl); dev.off()
+}, error = function(e) { try(dev.off(), silent = TRUE); message(conditionMessage(e)) })
+```
+
+# ___TF footprinting: control samples only, by cluster (C1–C7)___
+
+Healthy donor NK cells only — isolates cluster-intrinsic TF binding differences
+from any confounding effect of genetic group (ATRXdel / MYCNamp / ATRXwtMYCNwt).
+
+```{r}
+# ctrl_cluster = Clusters_res1 for control cells, NA for all others
+# ArchR skips NA cells during addGroupCoverages
+proj_filt$ctrl_cluster <- ifelse(
+  as.character(proj_filt$group) == "control",
+  as.character(proj_filt$Clusters_res1),
+  NA_character_
+)
+cat("Control cells per cluster:\n")
+print(table(proj_filt$ctrl_cluster, useNA = "always"))
+```
+
+```{r}
+proj_filt <- addGroupCoverages(
+  ArchRProj    = proj_filt,
+  groupBy      = "ctrl_cluster",
+  minCells     = 5,
+  maxCells     = 500,
+  maxFragments = 25 * 10^6,
+  force        = TRUE,
+  verbose      = TRUE
+)
+```
+
+```{r}
+footprints_ctrl <- getFootprints(
+  ArchRProj = proj_filt,
+  positions = motif_positions[tf_motif_names],
+  groupBy   = "ctrl_cluster",
+  flank     = 250
+)
+cat("Control footprint columns:", paste(colnames(footprints_ctrl), collapse = ", "), "\n")
+```
+
+```{r fig.height=4, fig.width=7}
+# ArchR native plot — pal names must match stripped colnames (no ._.Rep* suffix)
+ctrl_cl_canonical <- sub("\\._\\..*$", "", colnames(footprints_ctrl))
+ctrl_pal <- setNames(
+  COL_ATAC_CLUSTER[ctrl_cl_canonical],
+  ctrl_cl_canonical
+)
+ctrl_pal[is.na(ctrl_pal)] <- "gray50"
+
+tryCatch({
+  plotFootprints(
+    seFoot       = footprints_ctrl,
+    ArchRProj    = proj_filt,
+    normMethod   = "Subtract",
+    plotName     = "Footprints_control-only_by-cluster",
+    addDOC       = FALSE,
+    smoothWindow = 10,
+    pal          = ctrl_pal
+  )
+  message("Footprint PDF saved: control-only by-cluster")
+}, error = function(e) message("Footprint error (ctrl by-cluster): ", conditionMessage(e)))
+```
+
+```{r fig.height=5, fig.width=10}
+mat_ctrl <- assay(footprints_ctrl, "footprint")
+pos_seq  <- seq(-250, 250, length.out = ncol(mat_ctrl))
+
+df_ctrl <- bind_rows(lapply(seq_len(nrow(tf_motif_map_valid)), function(i) {
+  motif <- tf_motif_map_valid$motif_name[i]
+  tf    <- tf_motif_map_valid$TF[i]
+  if (!(motif %in% rownames(mat_ctrl))) return(NULL)
+  row_i <- which(rownames(mat_ctrl) == motif)
+  bind_rows(lapply(colnames(mat_ctrl), function(g) {
+    data.frame(
+      TF        = tf,
+      cluster   = sub("\\._\\..*$", "", g),
+      position  = pos_seq,
+      footprint = as.numeric(mat_ctrl[row_i, g]),
+      stringsAsFactors = FALSE
+    )
+  }))
+})) %>%
+  dplyr::filter(!is.na(cluster)) %>%
+  dplyr::mutate(cluster = factor(cluster, levels = CLUSTER_ORDER))
+
+p_ctrl <- ggplot(df_ctrl, aes(x = position, y = footprint, color = cluster)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60", linewidth = 0.3) +
+  geom_line(linewidth = 0.6, alpha = 0.85) +
+  facet_wrap(~ TF, scales = "free_y", ncol = 4) +
+  scale_color_manual(values = COL_ATAC_CLUSTER) +
+  labs(
+    title    = "TF footprints — control samples only, by ATAC cluster",
+    subtitle = "bias-subtracted; healthy donor NK cells",
+    x        = "Distance from motif center (bp)",
+    y        = "Normalized insertion frequency",
+    color    = "cluster"
+  ) +
+  theme(legend.position = "top", strip.text = element_text(size = 8, face = "italic"),
+        panel.spacing = unit(2, "mm"))
+
+tryCatch(print(p_ctrl), error = function(e) message(conditionMessage(e)))
+tryCatch({
+  pdf(paste0(params$out, "figures/snATAC_NK_footprints_control-only_by-cluster.pdf"),
+      height = 5, width = 10, useDingbats = FALSE)
+  print(p_ctrl); dev.off()
+}, error = function(e) { try(dev.off(), silent = TRUE); message(conditionMessage(e)) })
+```
+
+# ___TF motif activity: quantitative analysis (MotifMatrix z-scores)___
+
+Per-cell chromVAR deviation z-scores provide statistical power to test group and
+cluster differences for each TF motif.
+
+## ___Extract MotifMatrix z-scores___
+
+```{r}
+mm   <- getMatrixFromProject(proj_filt, useMatrix = "MotifMatrix")
+zMat <- assays(mm)[["z"]]
+rownames(zMat) <- sub("^z:", "", rownames(zMat))
+cat("MotifMatrix z dimensions:", dim(zMat), "\n")
+
+# Subset to our TF list
+tf_names_z <- intersect(tf_motif_map_valid$motif_name, rownames(zMat))
+cat("TFs in our list found in MotifMatrix:", length(tf_names_z), "/",
+    nrow(tf_motif_map_valid), "\n")
+zMat_sub <- zMat[tf_names_z, , drop = FALSE]
+
+# Map motif name → TF display name
+motif_to_tf <- setNames(tf_motif_map_valid$TF,
+                        tf_motif_map_valid$motif_name)[tf_names_z]
+
+# Per-cell metadata aligned to zMat columns
+cell_meta_z <- data.frame(
+  cell    = colnames(zMat_sub),
+  group   = factor(remap_group(as.character(proj_filt$group)),   levels = GROUP_ORDER),
+  cluster = factor(as.character(proj_filt$Clusters_res1),        levels = CLUSTER_ORDER),
+  stringsAsFactors = FALSE
+)
+cat("Cells with group annotation:", sum(!is.na(cell_meta_z$group)), "\n")
+```
+
+## ___Statistical tests: by genetic group___
+
+```{r}
+res_group <- bind_rows(lapply(tf_names_z, function(motif) {
+  df <- data.frame(
+    z     = as.numeric(zMat_sub[motif, ]),
+    group = cell_meta_z$group
+  ) %>% dplyr::filter(!is.na(group))
+
+  kw  <- tryCatch(kruskal.test(z ~ group, data = df), error = function(e) NULL)
+  pw  <- tryCatch(
+    pairwise.wilcox.test(df$z, df$group, p.adjust.method = "BH"),
+    error = function(e) NULL
+  )
+
+  kw_p  <- if (!is.null(kw))  kw$p.value  else NA_real_
+  kw_adj <- p.adjust(kw_p, method = "BH", n = length(tf_names_z))
+
+  pw_df <- if (!is.null(pw)) {
+    p_mat <- pw$p.value
+    pairs <- which(!is.na(p_mat), arr.ind = TRUE)
+    data.frame(
+      motif      = motif,
+      TF         = motif_to_tf[motif],
+      comparison = "group",
+      kw_p       = kw_p,
+      kw_p_adj   = kw_adj,
+      pair       = paste0(rownames(p_mat)[pairs[, 1]], "_vs_",
+                          colnames(p_mat)[pairs[, 2]]),
+      pw_p       = p_mat[pairs],
+      stringsAsFactors = FALSE
+    )
+  } else {
+    data.frame(motif = motif, TF = motif_to_tf[motif], comparison = "group",
+               kw_p = kw_p, kw_p_adj = kw_adj,
+               pair = NA_character_, pw_p = NA_real_, stringsAsFactors = FALSE)
+  }
+  pw_df
+}))
+
+res_group$pw_p_adj <- p.adjust(res_group$pw_p, method = "BH")
+cat("Significant TFs (Kruskal-Wallis BH < 0.05) by genetic group:",
+    sum(res_group$kw_p_adj < 0.05, na.rm = TRUE), "\n")
+print(res_group %>% dplyr::filter(kw_p_adj < 0.05) %>%
+      dplyr::distinct(TF, kw_p, kw_p_adj) %>% dplyr::arrange(kw_p_adj))
+```
+
+## ___Statistical tests: by cluster (all groups)___
+
+```{r}
+res_cluster <- bind_rows(lapply(tf_names_z, function(motif) {
+  df <- data.frame(
+    z       = as.numeric(zMat_sub[motif, ]),
+    cluster = cell_meta_z$cluster
+  ) %>% dplyr::filter(!is.na(cluster))
+
+  kw  <- tryCatch(kruskal.test(z ~ cluster, data = df), error = function(e) NULL)
+  pw  <- tryCatch(
+    pairwise.wilcox.test(df$z, df$cluster, p.adjust.method = "BH"),
+    error = function(e) NULL
+  )
+
+  kw_p  <- if (!is.null(kw)) kw$p.value else NA_real_
+  kw_adj <- p.adjust(kw_p, method = "BH", n = length(tf_names_z))
+
+  pw_df <- if (!is.null(pw)) {
+    p_mat <- pw$p.value
+    pairs <- which(!is.na(p_mat), arr.ind = TRUE)
+    data.frame(
+      motif      = motif,
+      TF         = motif_to_tf[motif],
+      comparison = "cluster",
+      kw_p       = kw_p,
+      kw_p_adj   = kw_adj,
+      pair       = paste0(rownames(p_mat)[pairs[, 1]], "_vs_",
+                          colnames(p_mat)[pairs[, 2]]),
+      pw_p       = p_mat[pairs],
+      stringsAsFactors = FALSE
+    )
+  } else {
+    data.frame(motif = motif, TF = motif_to_tf[motif], comparison = "cluster",
+               kw_p = kw_p, kw_p_adj = kw_adj,
+               pair = NA_character_, pw_p = NA_real_, stringsAsFactors = FALSE)
+  }
+  pw_df
+}))
+
+res_cluster$pw_p_adj <- p.adjust(res_cluster$pw_p, method = "BH")
+cat("Significant TFs (Kruskal-Wallis BH < 0.05) by cluster:",
+    sum(res_cluster$kw_p_adj < 0.05, na.rm = TRUE), "\n")
+print(res_cluster %>% dplyr::filter(kw_p_adj < 0.05) %>%
+      dplyr::distinct(TF, kw_p, kw_p_adj) %>% dplyr::arrange(kw_p_adj))
+```
+
+## ___Statistical tests: by cluster, control cells only___
+
+```{r}
+ctrl_mask <- !is.na(cell_meta_z$group) & cell_meta_z$group == "control"
+
+res_ctrl_cluster <- bind_rows(lapply(tf_names_z, function(motif) {
+  df <- data.frame(
+    z       = as.numeric(zMat_sub[motif, ctrl_mask]),
+    cluster = cell_meta_z$cluster[ctrl_mask]
+  ) %>% dplyr::filter(!is.na(cluster))
+
+  if (length(unique(df$cluster)) < 2) {
+    return(data.frame(motif = motif, TF = motif_to_tf[motif],
+                      comparison = "cluster_ctrl",
+                      kw_p = NA_real_, kw_p_adj = NA_real_,
+                      pair = NA_character_, pw_p = NA_real_,
+                      stringsAsFactors = FALSE))
+  }
+
+  kw  <- tryCatch(kruskal.test(z ~ cluster, data = df), error = function(e) NULL)
+  pw  <- tryCatch(
+    pairwise.wilcox.test(df$z, df$cluster, p.adjust.method = "BH"),
+    error = function(e) NULL
+  )
+
+  kw_p  <- if (!is.null(kw)) kw$p.value else NA_real_
+  kw_adj <- p.adjust(kw_p, method = "BH", n = length(tf_names_z))
+
+  pw_df <- if (!is.null(pw)) {
+    p_mat <- pw$p.value
+    pairs <- which(!is.na(p_mat), arr.ind = TRUE)
+    data.frame(
+      motif      = motif,
+      TF         = motif_to_tf[motif],
+      comparison = "cluster_ctrl",
+      kw_p       = kw_p,
+      kw_p_adj   = kw_adj,
+      pair       = paste0(rownames(p_mat)[pairs[, 1]], "_vs_",
+                          colnames(p_mat)[pairs[, 2]]),
+      pw_p       = p_mat[pairs],
+      stringsAsFactors = FALSE
+    )
+  } else {
+    data.frame(motif = motif, TF = motif_to_tf[motif], comparison = "cluster_ctrl",
+               kw_p = kw_p, kw_p_adj = kw_adj,
+               pair = NA_character_, pw_p = NA_real_, stringsAsFactors = FALSE)
+  }
+  pw_df
+}))
+
+res_ctrl_cluster$pw_p_adj <- p.adjust(res_ctrl_cluster$pw_p, method = "BH")
+cat("Significant TFs (Kruskal-Wallis BH < 0.05) by cluster in controls:",
+    sum(res_ctrl_cluster$kw_p_adj < 0.05, na.rm = TRUE), "\n")
+print(res_ctrl_cluster %>% dplyr::filter(kw_p_adj < 0.05) %>%
+      dplyr::distinct(TF, kw_p, kw_p_adj) %>% dplyr::arrange(kw_p_adj))
+```
+
+## ___Save results___
+
+```{r}
+out_dir_stats <- paste0(params$out, "tables/TF_motif_stats/")
+dir.create(out_dir_stats, showWarnings = FALSE, recursive = TRUE)
+
+write.csv(res_group,        paste0(out_dir_stats, "TF_motif_z_by_group.csv"),        row.names = FALSE)
+write.csv(res_cluster,      paste0(out_dir_stats, "TF_motif_z_by_cluster.csv"),      row.names = FALSE)
+write.csv(res_ctrl_cluster, paste0(out_dir_stats, "TF_motif_z_by_cluster_ctrl.csv"), row.names = FALSE)
+message("Saved stats tables to ", out_dir_stats)
+```
+
+## ___Heatmap: median z-score per TF × group___
+
+```{r fig.height=6, fig.width=5}
+z_by_group <- t(apply(zMat_sub, 1, function(z) {
+  tapply(z, cell_meta_z$group, median, na.rm = TRUE)
+}))[, GROUP_ORDER, drop = FALSE]
+rownames(z_by_group) <- motif_to_tf[rownames(z_by_group)]
+
+# Keep only TFs significant by group (kw_p_adj < 0.05), or all if none pass
+sig_tfs_group <- res_group %>%
+  dplyr::filter(kw_p_adj < 0.05) %>%
+  dplyr::pull(TF) %>% unique()
+z_plot_group  <- if (length(sig_tfs_group) > 1) z_by_group[sig_tfs_group, , drop = FALSE] else z_by_group
+
+zsc_group <- t(scale(t(z_plot_group)))
+zsc_group <- pmin(pmax(zsc_group, -z_cap), z_cap)
+
+col_fun_g <- colorRamp2(c(-z_cap, 0, z_cap),
+                        c("#2166AC", "white", "#D6604D"))
+
+ht_group <- Heatmap(
+  zsc_group,
+  name            = "z-score\n(row-scaled)",
+  col             = col_fun_g,
+  top_annotation  = HeatmapAnnotation(
+    Group = GROUP_ORDER,
+    col   = list(Group = COL_GROUP),
+    show_annotation_name = FALSE
+  ),
+  cluster_columns = FALSE,
+  cluster_rows    = TRUE,
+  show_row_names  = TRUE,
+  row_names_gp    = gpar(fontsize = 7),
+  column_names_gp = gpar(fontsize = 8),
+  column_title    = "TF motif activity by genetic group",
+  heatmap_legend_param = list(title_gp = gpar(fontsize = 8),
+                              labels_gp = gpar(fontsize = 7))
+)
+draw(ht_group)
+pdf(paste0(params$out, "figures/TF_motif_z_heatmap_by_group.pdf"),
+    width = 5, height = 6, useDingbats = FALSE)
+draw(ht_group); dev.off()
+```
+
+## ___Heatmap: median z-score per TF × cluster___
+
+```{r fig.height=6, fig.width=5}
+z_by_cluster <- t(apply(zMat_sub, 1, function(z) {
+  tapply(z, cell_meta_z$cluster, median, na.rm = TRUE)
+}))[, CLUSTER_ORDER, drop = FALSE]
+rownames(z_by_cluster) <- motif_to_tf[rownames(z_by_cluster)]
+
+sig_tfs_cluster <- res_cluster %>%
+  dplyr::filter(kw_p_adj < 0.05) %>%
+  dplyr::pull(TF) %>% unique()
+z_plot_cluster  <- if (length(sig_tfs_cluster) > 1) z_by_cluster[sig_tfs_cluster, , drop = FALSE] else z_by_cluster
+
+zsc_cluster <- t(scale(t(z_plot_cluster)))
+zsc_cluster <- pmin(pmax(zsc_cluster, -z_cap), z_cap)
+
+col_fun_cl <- colorRamp2(c(-z_cap, 0, z_cap),
+                         c("#2166AC", "white", "#D6604D"))
+
+ht_cluster <- Heatmap(
+  zsc_cluster,
+  name            = "z-score\n(row-scaled)",
+  col             = col_fun_cl,
+  top_annotation  = HeatmapAnnotation(
+    Cluster = CLUSTER_ORDER,
+    col     = list(Cluster = COL_ATAC_CLUSTER),
+    show_annotation_name = FALSE
+  ),
+  cluster_columns = FALSE,
+  cluster_rows    = TRUE,
+  show_row_names  = TRUE,
+  row_names_gp    = gpar(fontsize = 7),
+  column_names_gp = gpar(fontsize = 8),
+  column_title    = "TF motif activity by ATAC cluster",
+  heatmap_legend_param = list(title_gp = gpar(fontsize = 8),
+                              labels_gp = gpar(fontsize = 7))
+)
+draw(ht_cluster)
+pdf(paste0(params$out, "figures/TF_motif_z_heatmap_by_cluster.pdf"),
+    width = 5, height = 6, useDingbats = FALSE)
+draw(ht_cluster); dev.off()
+```
+
+## ___Heatmap: median z-score per TF × cluster, control cells only___
+
+```{r fig.height=6, fig.width=5}
+z_by_ctrl_cl <- t(apply(zMat_sub[, ctrl_mask, drop = FALSE], 1, function(z) {
+  tapply(z, cell_meta_z$cluster[ctrl_mask], median, na.rm = TRUE)
+}))
+# Keep only CLUSTER_ORDER columns that exist
+ctrl_cl_cols <- intersect(CLUSTER_ORDER, colnames(z_by_ctrl_cl))
+z_by_ctrl_cl <- z_by_ctrl_cl[, ctrl_cl_cols, drop = FALSE]
+rownames(z_by_ctrl_cl) <- motif_to_tf[rownames(z_by_ctrl_cl)]
+
+sig_tfs_ctrl_cl <- res_ctrl_cluster %>%
+  dplyr::filter(kw_p_adj < 0.05) %>%
+  dplyr::pull(TF) %>% unique()
+z_plot_ctrl_cl  <- if (length(sig_tfs_ctrl_cl) > 1) z_by_ctrl_cl[sig_tfs_ctrl_cl, , drop = FALSE] else z_by_ctrl_cl
+
+zsc_ctrl_cl <- t(scale(t(z_plot_ctrl_cl)))
+zsc_ctrl_cl <- pmin(pmax(zsc_ctrl_cl, -z_cap), z_cap)
+
+ht_ctrl_cl <- Heatmap(
+  zsc_ctrl_cl,
+  name            = "z-score\n(row-scaled)",
+  col             = colorRamp2(c(-z_cap, 0, z_cap), c("#2166AC", "white", "#D6604D")),
+  top_annotation  = HeatmapAnnotation(
+    Cluster = ctrl_cl_cols,
+    col     = list(Cluster = COL_ATAC_CLUSTER[ctrl_cl_cols]),
+    show_annotation_name = FALSE
+  ),
+  cluster_columns = FALSE,
+  cluster_rows    = TRUE,
+  show_row_names  = TRUE,
+  row_names_gp    = gpar(fontsize = 7),
+  column_names_gp = gpar(fontsize = 8),
+  column_title    = "TF motif activity by cluster — control cells only",
+  heatmap_legend_param = list(title_gp = gpar(fontsize = 8),
+                              labels_gp = gpar(fontsize = 7))
+)
+draw(ht_ctrl_cl)
+pdf(paste0(params$out, "figures/TF_motif_z_heatmap_by_cluster_ctrl.pdf"),
+    width = 5, height = 6, useDingbats = FALSE)
+draw(ht_ctrl_cl); dev.off()
+```
+
+
+# ___The End___
+
+```{r render, eval=FALSE, include=FALSE}
+rmarkdown::render(
+  "/home/rstudio/code/NK-NB_study/code/39b_20260625_snATAC_NK_TF_footprinting.Rmd",
+  output_file = paste0(params$out, "html/39b_20260625_snATAC_NK_TF_footprinting.html")
+)
+```

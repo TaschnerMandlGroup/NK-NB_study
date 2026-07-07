@@ -1,0 +1,1602 @@
+---
+title: "NK project: snATAC-seq — Module scoring and GRN analysis"
+author: "Dr. Sara Wernig-Zorc"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  out:  "/home/rstudio/mnt_out/NK_project/"
+  anno: "/home/rstudio/mnt_resources/"
+---
+
+PROJECT DESCRIPTION
+
+NK cell snATAC-seq re-analysed with unsupervised LSI + clustering at resolution 1,
+yielding 7 distinct chromatin-accessibility clusters (C1-C7).
+Clusters are annotated as CD56bright (C1-C3), Intermediate (C4-C5), and CD56dim (C6-C7).
+
+Questions:
+1. Do TFs relevant to NK cell development and function show differential footprinting
+   between genetic patient groups (ATRXdel, control, MYCNamp, ATRXwtMYCNwt) within
+   each of the 7 ATAC clusters?
+2. Is the GSK3B gene locus and promoter differentially accessible between genetic groups
+   within each cluster?
+   
+Requires: `39_` completed first (saves `Rds/snATAC_NK_v20260625_modules.Rds`).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = FALSE,
+                      error = FALSE,
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = "future::multicore", workers = 20)
+options(future.globals.maxSize = 40 * 10^9)
+print(params)
+```
+
+```{r include=FALSE}
+source("/home/rstudio/00_NK_paper_setup.R")
+source("/home/rstudio/00_NK_paper_utils.R")
+```
+
+# ___Load packages___
+
+```{r include=FALSE}
+suppressPackageStartupMessages({
+  library(ArchR)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  library(JASPAR2024)
+  library(TFBSTools)
+  library(motifmatchr)
+  library(RSQLite)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(ggrepel)
+  library(patchwork)
+  library(tidyverse)
+})
+
+addArchRThreads(threads = 20)
+addArchRGenome("hg38")
+
+filter    <- dplyr::filter
+select    <- dplyr::select
+mutate    <- dplyr::mutate
+summarise <- dplyr::summarise
+rename    <- dplyr::rename
+count     <- dplyr::count
+group_by  <- dplyr::group_by
+ungroup   <- dplyr::ungroup
+arrange   <- dplyr::arrange
+slice_min <- dplyr::slice_min
+sub       <- base::sub
+gsub      <- base::gsub
+
+# Remap group label strings to canonical names used throughout the script.
+# Logic: anything with "atrx" but no "wt" → ATRXdel (catches ATRXdel/ATRXmut/ATRXm/ATRX_del etc.)
+#        anything with "atrx" and "wt"    → ATRXwtMYCNwt
+remap_group <- function(x) {
+  x <- as.character(x)
+  x[grepl("atrx", x, ignore.case = TRUE) & !grepl("wt", x, ignore.case = TRUE)] <- "ATRXdel"
+  x[grepl("atrx", x, ignore.case = TRUE) &  grepl("wt", x, ignore.case = TRUE)] <- "ATRXwtMYCNwt"
+  x[grepl("mycn", x, ignore.case = TRUE) &  grepl("amp", x, ignore.case = TRUE)] <- "MYCNamp"
+  x[grepl("^control$",            x, ignore.case = TRUE)] <- "control"
+  x
+}
+
+# Extract canonical group name from an ArchR clust_group column name.
+# ArchR appends "._.Rep1" to coverage column names, e.g. "C2_control._.Rep1".
+clust_col_to_group <- function(col_names) {
+  # strip cluster prefix (everything up to and including the first "_")
+  suffix <- sub("^[^_]+_", "", col_names)
+  # strip ArchR's rep suffix (e.g. "._.Rep1")
+  suffix <- sub("\\._\\.Rep.*$", "", suffix)
+  remap_group(suffix)
+}
+```
+
+```{r}
+theme_set(pub_theme)
+
+COL_ATAC_CLUSTER <- c(
+  "C1" = "#1B4F8A",
+  "C2" = "#2E7BB5",
+  "C3" = "#6AADD5",
+  "C4" = "#4A9B6F",
+  "C5" = "#8FC494",
+  "C6" = "#C0392B",
+  "C7" = "#E8837A"
+)
+
+COL_GROUP <- c(
+  "control"      = unname(COLOR_CODE_GROUP["control"]),
+  "ATRXdel"      = unname(COLOR_CODE_GROUP["ATRXdel"]),
+  "MYCNamp"      = unname(COLOR_CODE_GROUP["MYCNamp"]),
+  "ATRXwtMYCNwt" = unname(COLOR_CODE_GROUP["ATRXwtMYCNwt"])
+)
+
+GROUP_ORDER   <- c( "control","ATRXdel", "MYCNamp", "ATRXwtMYCNwt")
+CLUSTER_ORDER <- paste0("C", 1:7)
+
+CLUSTER_NAMES <- c(
+  "C1" = "CD56bright 1",
+  "C2" = "CD56bright 2",
+  "C3" = "CD56bright 3",
+  "C4" = "Intermediate 1",
+  "C5" = "Intermediate 2",
+  "C6" = "CD56dim 1",
+  "C7" = "CD56dim 2"
+)
+
+METACLUSTER <- c(
+  "C1" = "CD56bright", "C2" = "CD56bright", "C3" = "CD56bright",
+  "C4" = "Intermediate", "C5" = "Intermediate",
+  "C6" = "CD56dim", "C7" = "CD56dim"
+)
+```
+
+# ___Load from prep script (39_00_)___
+
+Requires `39_00_20260625_snATAC_NK_prep.Rmd` to have been rendered first.
+
+```{r}
+proj_filt <- readRDS(paste0(params$out, "Rds/snATAC_NK_v20260625_modules.Rds"))
+score_df  <- readRDS(paste0(params$out, "Rds/snATAC_NK_score_df_v20260625.Rds"))
+
+# Restore Arrow file paths to current mount point
+proj_filt@projectMetadata$outputDirectory <- paste0(params$out, "ArchR_v20260203")
+proj_filt@sampleColData$ArrowFiles <- paste0(
+  params$out, "ArchR_v20260203/ArrowFiles/",
+  basename(as.character(proj_filt@sampleColData$ArrowFiles))
+)
+
+cat("Loaded proj_filt:", nCells(proj_filt), "cells\n")
+cat("Loaded score_df:", nrow(score_df), "rows,",
+    sum(grepl("^M\\d+$", colnames(score_df))), "module columns\n")
+print(table(proj_filt$Clusters_res1, proj_filt$group))
+```
+
+# ___PART I___
+
+# ___UMAP: cluster overview___
+
+```{r fig.height=4.5, fig.width=9}
+p_umap_cluster <- plotEmbedding(
+  proj_filt,
+  colorBy    = "cellColData",
+  name       = "Clusters_res1",
+  embedding  = "UMAP",
+  pal        = COL_ATAC_CLUSTER,
+  labelMeans = TRUE,
+  rastr      = FALSE
+) + ggtitle("snATAC-seq NK cells — 7 clusters") + pub_theme
+
+p_umap_group <- plotEmbedding(
+  proj_filt,
+  colorBy    = "cellColData",
+  name       = "group",
+  embedding  = "UMAP",
+  pal        = COL_GROUP,
+  rastr      = FALSE
+) + ggtitle("Genetic group") + pub_theme
+
+p_umap_cluster | p_umap_group
+
+pdf(paste0(params$out, "figures/snATAC_NK_UMAP_clusters-and-groups.pdf"),
+    height = 4.5, width = 9, useDingbats = FALSE)
+p_umap_cluster | p_umap_group; dev.off()
+```
+
+
+# ___Cell composition: genetic groups per cluster___
+
+```{r fig.height=4, fig.width=5}
+cell_meta <- data.frame(
+  Clusters_res1 = factor(as.character(proj_filt$Clusters_res1), levels = CLUSTER_ORDER),
+  group         = factor(as.character(proj_filt$group), levels = GROUP_ORDER),
+  row.names     = getCellNames(proj_filt),
+  stringsAsFactors = FALSE
+)
+
+comp_df <- cell_meta %>%
+  count(Clusters_res1, group) %>%
+  group_by(Clusters_res1) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup()
+
+p_comp <- ggplot(comp_df, aes(x = Clusters_res1, y = pct, fill = group)) +
+  geom_col(width = 0.75) +
+  scale_fill_manual(values = COL_GROUP) +
+  labs(title    = "Cell composition per ATAC cluster",
+       subtitle = "Percentage of cells per genetic group",
+       x = "ATAC cluster", y = "% cells", fill = "genetic group") +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+p_comp
+
+pdf(paste0(params$out, "figures/snATAC_NK_composition_per_cluster.pdf"),
+    height = 4, width = 5, useDingbats = FALSE)
+p_comp; dev.off()
+```
+
+# ___Cell composition: NK functional subsets (label transfer)___
+
+Label-transfer from matched scRNA-seq data assigns each snATAC-seq cell to one of the
+four NK maturation states (hNK_Bm1–4).
+- **Immunomodulatory**: hNK_Bm2 (CD56bright immature), hNK_Bm3 (transitional)
+- **Cytotoxic**: hNK_Bm1 (CD56dim mature), hNK_Bm4 (CD56dim highly cytotoxic)
+
+```{r}
+NK_SUBSET_ORDER <- c("hNK_Bm1", "hNK_Bm2", "hNK_Bm3", "hNK_Bm4")
+COL_NK_SUBSET   <- COLOR_CODE_v2[NK_SUBSET_ORDER]
+
+FUNCTIONAL_MAP <- c(
+  "hNK_Bm1" = "cytotoxic",
+  "hNK_Bm2" = "immunomodulatory",
+  "hNK_Bm3" = "immunomodulatory",
+  "hNK_Bm4" = "cytotoxic"
+)
+COL_FUNCTIONAL   <- c("immunomodulatory" = "#4A9B6F", "cytotoxic" = "#C0392B")
+FUNCTIONAL_ORDER <- c("immunomodulatory", "cytotoxic")
+
+# Build metadata — majority_vote_label = label transfer column
+lt_meta <- data.frame(
+  Clusters_res1  = factor(as.character(proj_filt$Clusters_res1), levels = CLUSTER_ORDER),
+  group          = factor(as.character(proj_filt$group), levels = GROUP_ORDER),
+  nk_subset      = factor(as.character(proj_filt$majority_vote_label), levels = NK_SUBSET_ORDER),
+  row.names      = getCellNames(proj_filt),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(functional = factor(FUNCTIONAL_MAP[as.character(nk_subset)],
+                             levels = FUNCTIONAL_ORDER))
+
+cat("Label transfer subset distribution:\n")
+print(table(lt_meta$nk_subset, useNA = "always"))
+cat("\nFunctional category distribution:\n")
+print(table(lt_meta$functional, useNA = "always"))
+```
+
+## ___NK subset per ATAC cluster___
+
+```{r fig.height=4, fig.width=9}
+df_cl_sub <- lt_meta %>%
+  filter(!is.na(nk_subset)) %>%
+  count(Clusters_res1, nk_subset) %>%
+  group_by(Clusters_res1) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup()
+
+p_cl_sub <- ggplot(df_cl_sub, aes(x = Clusters_res1, y = pct, fill = nk_subset)) +
+  geom_col(width = 0.75, colour = "white", linewidth = 0.2) +
+  scale_fill_manual(values = COL_NK_SUBSET) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(title = "NK maturation subset per ATAC cluster",
+       x = "ATAC cluster", y = "% cells", fill = "NK subset") +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+df_cl_func <- lt_meta %>%
+  filter(!is.na(functional)) %>%
+  count(Clusters_res1, functional) %>%
+  group_by(Clusters_res1) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup()
+
+p_cl_func <- ggplot(df_cl_func, aes(x = Clusters_res1, y = pct, fill = functional)) +
+  geom_col(width = 0.75, colour = "white", linewidth = 0.2) +
+  scale_fill_manual(values = COL_FUNCTIONAL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(title = "Cytotoxic vs immunomodulatory per ATAC cluster",
+       x = "ATAC cluster", y = "% cells", fill = NULL) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+p_cl_sub | p_cl_func
+
+pdf(paste0(params$out, "figures/snATAC_NK_NKsubset_per_cluster.pdf"),
+    height = 4, width = 9, useDingbats = FALSE)
+p_cl_sub | p_cl_func; dev.off()
+```
+
+## ___NK subset per genetic group___
+
+```{r fig.height=4, fig.width=9}
+df_grp_sub <- lt_meta %>%
+  filter(!is.na(nk_subset), !is.na(group)) %>%
+  count(group, nk_subset) %>%
+  group_by(group) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup()
+
+p_grp_sub <- ggplot(df_grp_sub, aes(x = group, y = pct, fill = nk_subset)) +
+  geom_col(width = 0.75, colour = "white", linewidth = 0.2) +
+  scale_fill_manual(values = COL_NK_SUBSET) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(title = "NK maturation subset per genetic group",
+       x = NULL, y = "% cells", fill = "NK subset") +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+df_grp_func <- lt_meta %>%
+  filter(!is.na(functional), !is.na(group)) %>%
+  count(group, functional) %>%
+  group_by(group) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup()
+
+p_grp_func <- ggplot(df_grp_func, aes(x = group, y = pct, fill = functional)) +
+  geom_col(width = 0.75, colour = "white", linewidth = 0.2) +
+  scale_fill_manual(values = COL_FUNCTIONAL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(title = "Cytotoxic vs immunomodulatory per genetic group",
+       x = NULL, y = "% cells", fill = NULL) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+p_grp_sub | p_grp_func
+
+pdf(paste0(params$out, "figures/snATAC_NK_NKsubset_per_group.pdf"),
+    height = 4, width = 9, useDingbats = FALSE)
+p_grp_sub | p_grp_func; dev.off()
+```
+
+
+# ___NK cell gene modules___
+
+I defined 25 gene modules based on integrated ATAC and RNA data. Here I want to
+address the function of each modules. 
+
+```{r}
+library(ArchR)
+library(SummarizedExperiment)
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+
+set.seed(42)
+
+# Resolve Bioconductor/plyr conflicts with dplyr
+filter    <- dplyr::filter
+select    <- dplyr::select
+mutate    <- dplyr::mutate
+summarise <- dplyr::summarise
+rename    <- dplyr::rename
+count     <- dplyr::count
+
+module_dir   <- "/home/rstudio/mnt_out/NK_project/tables/NK_module_genes"
+cluster_col  <- "Clusters_res1"
+group_col    <- "group"
+z_cap        <- 2.0
+
+group_order   <- c("control", "ATRXdel", "MYCNamp", "ATRXwtMYCNwt")
+cluster_order <- paste0("C", 1:7)
+
+# Load gene lists for M1-M25
+module_files <- list.files(module_dir, pattern = "module_\\d+_genes\\.csv",
+                           full.names = TRUE)
+module_nums  <- as.integer(gsub(".*module_(\\d+)_genes\\.csv", "\\1",
+                                basename(module_files)))
+module_files <- module_files[order(module_nums)]
+module_genes <- lapply(module_files, function(f) read.csv(f)$gene)
+names(module_genes) <- paste0("M", sort(module_nums))
+message("Loaded ", length(module_genes), " modules: ",
+        paste(names(module_genes), collapse = ", "))
+
+# M1-M25 module scores already computed by 39_00_ and loaded via score_df above.
+message("score_df: ", nrow(score_df), " cells, ",
+        sum(!is.na(score_df$M1)), " with M1 scores")
+
+# AGGREGATE: MEAN PER CLUSTER × GROUP
+agg <- score_df %>%
+  pivot_longer(cols = all_of(names(module_genes)),
+               names_to  = "Module",
+               values_to = "Score") %>%
+  filter(!is.na(cluster), !is.na(group), !is.na(Score)) %>%
+  group_by(cluster, group, Module) %>%
+  summarise(MeanScore = mean(Score, na.rm = TRUE),
+            nCells    = dplyr::n(),
+            .groups   = "drop")
+
+# warn if any combination has very few cells
+sparse <- filter(agg, nCells < 10)
+if (nrow(sparse) > 0) {
+  message("Warning: ", nrow(sparse),
+          " cluster × group × module combos have <10 cells — interpret with caution!!")
+}
+
+# Z-SCORE PER MODULE ACROSS ALL CLUSTER×GROUP COMBOS
+agg <- agg %>%
+  group_by(Module) %>%
+  mutate(ZScore = as.numeric(scale(MeanScore))) %>%
+  ungroup() %>%
+  mutate(ZScore = pmax(pmin(ZScore, z_cap), -z_cap))   # cap extremes
+
+# FACTOR ORDERING
+agg$Module  <- factor(agg$Module,  levels = paste0("M", 1:25))
+agg$cluster <- factor(agg$cluster, levels = cluster_order)
+agg$group   <- factor(agg$group,   levels = group_order)
+
+# x-axis labels: "C1|ATRXdel", sorted cluster-first, group-second
+agg <- agg %>%
+  mutate(clust_group = paste0(cluster, "|", group))
+
+x_levels <- agg %>%
+  distinct(clust_group, cluster, group) %>%
+  arrange(cluster, group) %>%
+  pull(clust_group)
+
+agg$clust_group <- factor(agg$clust_group, levels = x_levels)
+
+mat <- agg %>%
+  select(Module, clust_group, ZScore) %>%
+  pivot_wider(names_from  = clust_group,
+              values_from = ZScore) %>%
+  column_to_rownames("Module") %>%
+  as.matrix()
+
+mat <- mat[intersect(paste0("M", 1:25), rownames(mat)),
+           intersect(x_levels,          colnames(mat)),
+           drop = FALSE]
+
+# column anno
+col_meta <- agg %>%
+  distinct(clust_group, cluster, group) %>%
+  arrange(factor(clust_group, levels = x_levels))
+
+# Extract unique present values as plain character — avoids NA-in-levels from ArchR factors
+clust_levels <- intersect(cluster_order,
+                          unique(na.omit(as.character(col_meta$cluster))))
+group_levels <- intersect(group_order,
+                          unique(na.omit(as.character(col_meta$group))))
+
+ha_top <- HeatmapAnnotation(
+  Cluster = factor(as.character(col_meta$cluster), levels = clust_levels),
+  Group   = factor(as.character(col_meta$group),   levels = group_levels),
+  col     = list(
+    "Cluster" = COLOR_CODE_perCLUST[clust_levels],
+    "Group"   = COLOR_CODE_GROUP[group_levels]
+  ),
+  annotation_name_side = "left",
+  annotation_name_gp   = gpar(fontsize = 8),
+  simple_anno_size     = unit(3, "mm"),
+  gap                  = unit(1, "mm")
+)
+
+# color scale
+col_fun <- colorRamp2(
+  c(-z_cap, 0, z_cap),
+  c("#9B59B6","#FFFFFF","#1E8449")
+)
+
+# plot heatmap
+# column_split by cluster creates visual separation between the 7 cluster blocks
+
+ht <- Heatmap(
+  mat,
+  name                  = "RNA Z-score",
+  col                   = col_fun,
+  top_annotation        = ha_top,
+
+  # Row order: fixed M1→M25 (change to TRUE to cluster modules)
+  cluster_rows          = FALSE,
+  row_names_side        = "left",
+  row_names_gp          = gpar(fontsize = 9),
+  row_title             = NULL,
+
+  # Column order: fixed, split by cluster
+  cluster_columns       = FALSE,
+  column_split          = col_meta$cluster,    # gap between clusters
+  column_gap            = unit(2, "mm"),
+  column_title_gp       = gpar(fontsize = 9, fontface = "bold"),
+  column_names_gp       = gpar(fontsize = 7),
+  column_names_rot      = 60,
+
+  # Visuals
+  border                = TRUE,
+  rect_gp               = gpar(col = "white", lwd = 0.3),
+
+  # Legend
+  heatmap_legend_param  = list(
+    title          = "Z-score",
+    at             = c(-2, -1, 0, 1, 2),
+    legend_height  = unit(3, "cm"),
+    title_gp       = gpar(fontsize = 9),
+    labels_gp      = gpar(fontsize = 8)
+  ),
+
+  width  = unit(22, "cm"),
+  height = unit(14, "cm")
+)
+
+# save
+pdf(paste0(params$out,"figures/module_activity_cluster_group.pdf"), 
+    width = 16, height = 9)
+draw(ht,
+     heatmap_legend_side   = "right",
+     annotation_legend_side = "right",
+     padding = unit(c(5, 5, 5, 5), "mm"))
+dev.off()
+
+# export the scored matrix as CSV
+write.csv(agg, paste0(params$out,"tables/module_scores_cluster_group_long.csv"), 
+                      row.names = FALSE)
+```
+
+# ___NK cell cluster annotation based on functional NK cell gene modules___
+
+Barplot with annotated ATAC clusters
+
+```{r}
+proj_filt$Cluster_names     <- CLUSTER_NAMES[proj_filt$Clusters_res1]
+proj_filt$Metacluster_names <- METACLUSTER[proj_filt$Clusters_res1]
+
+unique(proj_filt$Cluster_names)
+unique(proj_filt$group)
+```
+
+
+## ___Barplot per cluster___
+
+```{r}
+meta <- as.data.frame(getCellColData(proj_filt, 
+                                     select = c("sample", "group", "Cluster_names")))
+
+cluster_order <- c(
+  "CD56bright 1", "CD56bright 2", "CD56bright 3",
+  "Intermediate 1", "Intermediate 2",
+  "CD56dim 1", "CD56dim 2")
+
+meta$Cluster_names <- factor(meta$Cluster_names, levels = cluster_order)
+meta$sample <- factor(meta$sample, levels = PATIENT_ORDER)
+meta$group <- factor(meta$group, levels = GROUP_ORDER)
+
+# per group
+df_group <- meta %>%
+  count(group, Cluster_names, name = "n_cells") %>%
+  group_by(group) %>%
+  mutate(pct = n_cells / sum(n_cells) * 100) %>%
+  ungroup()
+
+p_group <- ggplot(df_group, aes(x = group, y = pct, fill = Cluster_names)) +
+  geom_bar(stat = "identity", width = 0.7, colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = COLOR_CODE_perCLUST_v2, breaks = cluster_order) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    title = "NK-cell cluster composition per group",
+    x     = NULL,
+    y     = "% of cells",
+    fill  = "Cluster"
+  ) +
+  pub_theme +
+  theme(
+    axis.text.x    = element_text(angle = 35, hjust = 1, size = 8),
+    legend.position = "right"
+  )
+
+# per sample
+df_sample <- meta %>%
+  count(sample, Cluster_names, name = "n_cells") %>%
+  group_by(sample) %>%
+  mutate(pct = n_cells / sum(n_cells) * 100) %>%
+  ungroup()
+
+p_sample <- ggplot(df_sample, aes(x = sample, y = pct, fill = Cluster_names)) +
+  geom_bar(stat = "identity", width = 0.7, colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = COLOR_CODE_perCLUST_v2, breaks = cluster_order) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    title = "NK-cell cluster composition per sample",
+    x     = NULL,
+    y     = "% of cells",
+    fill  = "Cluster"
+  ) +
+  pub_theme +
+  theme(
+    axis.text.x    = element_text(angle = 35, hjust = 1, size = 8),
+    legend.position = "right"
+  )
+
+# plots
+library(patchwork)
+combined <- p_group | p_sample
+
+ggsave(paste0(params$out,"figures/NK_cluster_barplots.pdf"), combined,
+       width = 10, height = 4, device = cairo_pdf)
+ggsave(paste0(params$out,"figures/NK_cluster_barplots.png"), combined,
+       width = 10, height = 4, dpi = 300)
+```
+
+## ___Bar plot per metacluster___
+
+```{r}
+meta <- as.data.frame(getCellColData(proj_filt, 
+                                     select = c("sample", "group", "Metacluster_names")))
+
+cluster_order <- c(
+  "CD56bright",
+  "Intermediate",
+  "CD56dim")
+
+meta$Metacluster_names <- factor(meta$Metacluster_names, levels = cluster_order)
+meta$sample <- factor(meta$sample, levels = PATIENT_ORDER)
+meta$group <- factor(meta$group, levels = GROUP_ORDER)
+
+# per group
+df_group <- meta %>%
+  count(group, Metacluster_names, name = "n_cells") %>%
+  group_by(group) %>%
+  mutate(pct = n_cells / sum(n_cells) * 100) %>%
+  ungroup()
+
+p_group <- ggplot(df_group, aes(x = group, y = pct, fill = Metacluster_names)) +
+  geom_bar(stat = "identity", width = 0.7, colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = COLOR_CODE_perMETACLUST, breaks = cluster_order) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    title = "NK-cell cluster composition per group",
+    x     = NULL,
+    y     = "% of cells",
+    fill  = "Cluster"
+  ) +
+  pub_theme +
+  theme(
+    axis.text.x    = element_text(angle = 35, hjust = 1, size = 8),
+    legend.position = "right"
+  )
+
+# per sample
+df_sample <- meta %>%
+  count(sample, Metacluster_names, name = "n_cells") %>%
+  group_by(sample) %>%
+  mutate(pct = n_cells / sum(n_cells) * 100) %>%
+  ungroup()
+
+p_sample <- ggplot(df_sample, aes(x = sample, y = pct, fill = Metacluster_names)) +
+  geom_bar(stat = "identity", width = 0.7, colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = COLOR_CODE_perMETACLUST, breaks = cluster_order) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    title = "NK-cell cluster composition per sample",
+    x     = NULL,
+    y     = "% of cells",
+    fill  = "Cluster"
+  ) +
+  pub_theme +
+  theme(
+    axis.text.x    = element_text(angle = 35, hjust = 1, size = 8),
+    legend.position = "right"
+  )
+
+# plots
+library(patchwork)
+combined <- p_group | p_sample
+
+ggsave(paste0(params$out,"figures/NK_metacluster_barplots.pdf"), combined,
+       width = 10, height = 4, device = cairo_pdf)
+ggsave(paste0(params$out,"figures/NK_metacluster_barplots.png"), combined,
+       width = 10, height = 4, dpi = 300)
+```
+
+
+### ___with the label transfer from RNA___
+
+```{r}
+meta <- as.data.frame(getCellColData(proj_filt, 
+                                     select = c("sample", "group", "majority_vote_label")))
+
+cluster_order <- c(
+  "hNK_Bm1",
+  "hNK_Bm2",
+  "hNK_Bm3",
+  "hNK_Bm4")
+
+meta$majority_vote_label <- factor(meta$majority_vote_label, levels = cluster_order)
+meta$sample <- factor(meta$sample, levels = PATIENT_ORDER)
+meta$group <- factor(meta$group, levels = GROUP_ORDER)
+
+# per group
+df_group <- meta %>%
+  count(group, majority_vote_label, name = "n_cells") %>%
+  group_by(group) %>%
+  mutate(pct = n_cells / sum(n_cells) * 100) %>%
+  ungroup()
+
+p_group <- ggplot(df_group, aes(x = group, y = pct, fill = majority_vote_label)) +
+  geom_bar(stat = "identity", width = 0.7, colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = COLOR_CODE_v2, breaks = cluster_order) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    title = "NK-cell cluster composition per group",
+    x     = NULL,
+    y     = "% of cells",
+    fill  = "Cluster"
+  ) +
+  pub_theme +
+  theme(
+    axis.text.x    = element_text(angle = 35, hjust = 1, size = 8),
+    legend.position = "right"
+  )
+
+# per sample
+df_sample <- meta %>%
+  count(sample, majority_vote_label, name = "n_cells") %>%
+  group_by(sample) %>%
+  mutate(pct = n_cells / sum(n_cells) * 100) %>%
+  ungroup()
+
+p_sample <- ggplot(df_sample, aes(x = sample, y = pct, fill = majority_vote_label)) +
+  geom_bar(stat = "identity", width = 0.7, colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = COLOR_CODE_v2, breaks = cluster_order) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    title = "NK-cell cluster composition per sample",
+    x     = NULL,
+    y     = "% of cells",
+    fill  = "Cluster"
+  ) +
+  pub_theme +
+  theme(
+    axis.text.x    = element_text(angle = 35, hjust = 1, size = 8),
+    legend.position = "right"
+  )
+
+# plots
+library(patchwork)
+combined <- p_group | p_sample
+
+ggsave(paste0(params$out,"figures/NK_metacluster_labelTransfer_barplots.pdf"), combined,
+       width = 10, height = 4, device = cairo_pdf)
+ggsave(paste0(params$out,"figures/NK_metacluster_labelTransfer_barplots.png"), combined,
+       width = 10, height = 4, dpi = 300)
+```
+
+```{r}
+saveRDS(proj_filt, file = paste0(params$out,"/Rds/snATAC_NK_v20260401.Rds"))
+```
+
+
+# ___Publication-ready module score violin plots___
+
+Publication-quality violin plots matching the figure style: pure violins colored per
+genetic group, Wilcoxon significance vs control, expression-formatted x-axis labels,
+colored y-axis title identifying the NK subset or module.
+
+```{r}
+library(ggsignif)
+library(ggtext)
+
+GROUP_ORDER_PUB <- c("control", "ATRXdel", "MYCNamp", "ATRXwtMYCNwt")
+
+COL_GROUP_PUB <- c(
+  "control"      = unname(COLOR_CODE_GROUP["control"]),
+  "ATRXdel"      = unname(COLOR_CODE_GROUP["ATRXdel"]),
+  "MYCNamp"      = unname(COLOR_CODE_GROUP["MYCNamp"]),
+  "ATRXwtMYCNwt" = unname(COLOR_CODE_GROUP["ATRXwtMYCNwt"])
+)
+
+# Group label normalizer — handles ATRXm/ATRXmut/ATRXdel spelling variants
+remap_group_32 <- remap_group
+
+# x-axis label formatter — returns a parsed expression for ggplot2 label rendering
+pub_x_labels <- function(breaks) {
+  label_map <- list(
+    "control"      = "CTRL",
+    "ATRXdel"      = expression(ATRX^del),
+    "MYCNamp"      = expression(MYCN^amp),
+    "ATRXwtMYCNwt" = expression(ATRX^wt~MYCN^wt)
+  )
+  lapply(breaks, function(b) {
+    if (b %in% names(label_map)) label_map[[b]] else b
+  })
+}
+
+# Helper: publication violin for one module/score column, comparing all groups vs control
+pub_violin_module <- function(data, score_col, y_label, title_label,
+                               title_color = "black",
+                               ref_group   = "control",
+                               base_size   = 9) {
+  df <- data %>%
+    dplyr::select(group, score = dplyr::all_of(score_col)) %>%
+    dplyr::filter(!is.na(group), !is.na(score)) %>%
+    dplyr::mutate(group = factor(group, levels = GROUP_ORDER_PUB))
+
+  non_ref <- setdiff(levels(df$group), ref_group)
+
+  # Wilcoxon tests vs reference group
+  stat_res <- lapply(non_ref, function(g) {
+    x1 <- df$score[df$group == ref_group]
+    x2 <- df$score[df$group == g]
+    if (length(x1) < 3 || length(x2) < 3) return(NULL)
+    p <- wilcox.test(x1, x2)$p.value
+    symb <- dplyr::case_when(
+      p < 1e-4 ~ "****", p < 0.001 ~ "***",
+      p < 0.01 ~ "**",   p < 0.05  ~ "*",
+      TRUE     ~ "ns"
+    )
+    list(pair = c(ref_group, g), label = symb)
+  })
+  stat_res <- Filter(Negate(is.null), stat_res)
+
+  comparisons  <- lapply(stat_res, `[[`, "pair")
+  annotations  <- sapply(stat_res, `[[`, "label")
+
+  ggplot(df, aes(x = group, y = score, fill = group)) +
+    geom_violin(scale = "width", trim = FALSE, alpha = 0.95, linewidth = 0) +
+    {if (length(comparisons) > 0)
+       ggsignif::geom_signif(
+         comparisons      = comparisons,
+         annotations      = annotations,
+         map_signif_level = FALSE,
+         step_increase    = 0.10,
+         tip_length       = 0.01,
+         textsize         = 3,
+         color            = "black",
+         vjust            = 0.3
+       )} +
+    scale_fill_manual(values = COL_GROUP_PUB) +
+    scale_x_discrete(labels = pub_x_labels) +
+    labs(
+      title = title_label,
+      x     = NULL,
+      y     = y_label
+    ) +
+    theme_classic(base_size = base_size) +
+    theme(
+      legend.position = "none",
+      axis.text.x     = element_text(angle = 45, hjust = 1, size = base_size - 1),
+      axis.text.y     = element_text(size = base_size - 1),
+      axis.title.y    = element_text(size = base_size, face = "plain"),
+      axis.line       = element_line(linewidth = 0.4),
+      axis.ticks      = element_line(linewidth = 0.4),
+      plot.title      = element_text(size = base_size, face = "bold",
+                                     color = title_color, hjust = 0),
+      plot.margin     = margin(t = 25, r = 8, b = 5, l = 8)
+    )
+}
+```
+
+## ___Module scores within immunomodulatory NK subsets (Bm2 and Bm3)___
+
+For cells labeled as hNK_Bm2 or hNK_Bm3 by label transfer, show a defined
+"Mature NK" gene module score across genetic groups — recapitulating the figure style.
+
+```{r}
+# ArchR native addModuleScore for mature NK signature (GeneScoreMatrix)
+mature_NK_genes_valid <- intersect(mature_NK_genes,
+                                   getFeatures(proj_filt, useMatrix = "GeneScoreMatrix"))
+cat("Mature NK genes in GeneScoreMatrix:", length(mature_NK_genes_valid),
+    "/", length(mature_NK_genes), "\n")
+proj_filt <- addModuleScore(
+  ArchRProj = proj_filt,
+  useMatrix = "GeneScoreMatrix",
+  name      = "MatureNK",
+  features  = list(score = mature_NK_genes_valid)
+)
+
+# Retrieve score — column is "MatureNK.score"
+mature_cd <- as.data.frame(
+  getCellColData(proj_filt, select = c("MatureNK.score", "group", "majority_vote_label"))
+)
+
+df_mature_atac <- data.frame(
+  cell     = rownames(mature_cd),
+  score    = mature_cd[["MatureNK.score"]],
+  group    = remap_group(as.character(mature_cd[["group"]])),
+  nk_label = as.character(mature_cd[["majority_vote_label"]]),
+  stringsAsFactors = FALSE
+)
+cat("NK label transfer counts:\n")
+print(table(df_mature_atac$nk_label, useNA = "always"))
+
+NK_SUBSET_COLORS <- COLOR_CODE_v2[c("hNK_Bm2", "hNK_Bm3")]
+```
+
+```{r fig.height=7, fig.width=3.5}
+nk_score_plots <- lapply(c("hNK_Bm2", "hNK_Bm3"), function(subset) {
+  df <- df_mature_atac %>%
+    dplyr::filter(nk_label == subset, !is.na(group)) %>%
+    dplyr::select(group, score)
+
+  pub_violin_module(
+    data        = df,
+    score_col   = "score",
+    y_label     = "Mature NK gene score (ATAC)",
+    title_label = paste0("Immunomodulatory ", subset),
+    title_color = unname(NK_SUBSET_COLORS[subset])
+  )
+})
+
+combined_nk <- patchwork::wrap_plots(nk_score_plots, ncol = 1)
+combined_nk
+
+ggsave(paste0(params$out, "figures/MatureNK_ATACscore_Bm2-Bm3_pub.pdf"),
+       combined_nk, width = 3.5, height = 7, device = cairo_pdf)
+```
+
+## ___All NK cells: module scores per genetic group (all 25 modules)___
+
+```{r fig.height=18, fig.width=14}
+# score_df columns: M1..M25, cell, cluster, group (from module scoring section above)
+
+score_df_pub <- score_df %>%
+  dplyr::filter(!is.na(group)) %>%
+  dplyr::mutate(group = factor(remap_group(group), levels = GROUP_ORDER_PUB))
+
+plots_by_group <- lapply(paste0("M", 1:25), function(mod) {
+  pub_violin_module(
+    data        = score_df_pub,
+    score_col   = mod,
+    y_label     = "Module score",
+    title_label = mod,
+    title_color = "black"
+  ) + theme(plot.margin = margin(t = 25, r = 4, b = 4, l = 4))
+})
+
+patchwork::wrap_plots(plots_by_group, ncol = 5)
+
+ggsave(paste0(params$out, "figures/NK_module_scores_M1-M25_per_group_pub.pdf"),
+       patchwork::wrap_plots(plots_by_group, ncol = 5),
+       width = 14, height = 18, device = cairo_pdf)
+```
+
+## ___All NK cells: module scores per ATAC cluster (all 25 modules)___
+
+```{r}
+pub_violin_cluster <- function(data, score_col, y_label, title_label, base_size = 9) {
+  df <- data %>%
+    dplyr::select(cluster, score = dplyr::all_of(score_col)) %>%
+    dplyr::filter(!is.na(cluster), !is.na(score)) %>%
+    dplyr::mutate(cluster = factor(cluster, levels = CLUSTER_ORDER))
+
+  ggplot(df, aes(x = cluster, y = score, fill = cluster)) +
+    geom_violin(scale = "width", trim = FALSE, alpha = 0.95, linewidth = 0) +
+    scale_fill_manual(values = COLOR_CODE_perCLUST[CLUSTER_ORDER]) +
+    labs(title = title_label, x = NULL, y = y_label) +
+    theme_classic(base_size = base_size) +
+    theme(
+      legend.position = "none",
+      axis.text.x     = element_text(angle = 45, hjust = 1, size = base_size - 1),
+      axis.text.y     = element_text(size = base_size - 1),
+      axis.title.y    = element_text(size = base_size),
+      axis.line       = element_line(linewidth = 0.4),
+      axis.ticks      = element_line(linewidth = 0.4),
+      plot.title      = element_text(size = base_size, face = "bold", hjust = 0),
+      plot.margin     = margin(t = 10, r = 4, b = 4, l = 4)
+    )
+}
+```
+
+```{r fig.height=18, fig.width=14}
+score_df_cl <- score_df %>%
+  dplyr::filter(!is.na(cluster)) %>%
+  dplyr::mutate(cluster = factor(cluster, levels = CLUSTER_ORDER))
+
+plots_by_cluster <- lapply(paste0("M", 1:25), function(mod) {
+  pub_violin_cluster(
+    data        = score_df_cl,
+    score_col   = mod,
+    y_label     = "Module score",
+    title_label = mod
+  )
+})
+
+patchwork::wrap_plots(plots_by_cluster, ncol = 5)
+
+ggsave(paste0(params$out, "figures/NK_module_scores_M1-M25_per_cluster_pub.pdf"),
+       patchwork::wrap_plots(plots_by_cluster, ncol = 5),
+       width = 14, height = 18, device = cairo_pdf)
+```
+
+## ___Module–cluster activity heatmap (cluster annotation sanity check)___
+
+Mean module score per cluster collapsed across genetic groups, Z-scored per module
+across clusters. Rows cluster automatically — modules active in the same NK states
+should group together.
+
+```{r fig.height=8, fig.width=5}
+# Collapse score_df to mean per cluster × module (ignore group here)
+agg_cl <- score_df %>%
+  pivot_longer(cols      = all_of(names(module_genes)),
+               names_to  = "Module",
+               values_to = "Score") %>%
+  dplyr::filter(!is.na(cluster), !is.na(Score)) %>%
+  dplyr::group_by(cluster, Module) %>%
+  dplyr::summarise(MeanScore = mean(Score, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::mutate(Module  = factor(Module,  levels = paste0("M", 1:25)),
+                cluster = factor(cluster, levels = CLUSTER_ORDER))
+
+mat_cl <- agg_cl %>%
+  pivot_wider(names_from = cluster, values_from = MeanScore) %>%
+  column_to_rownames("Module") %>%
+  as.matrix()
+cl_cols_avail <- intersect(CLUSTER_ORDER, colnames(mat_cl))
+mat_cl <- mat_cl[intersect(paste0("M", 1:25), rownames(mat_cl)),
+                 cl_cols_avail,
+                 drop = FALSE]
+storage.mode(mat_cl) <- "numeric"
+
+# Z-score each module across clusters (highlights relative enrichment per cluster)
+mat_cl_z <- t(scale(t(mat_cl)))
+mat_cl_z[is.nan(mat_cl_z)] <- 0
+
+ha_cl <- HeatmapAnnotation(
+  Cluster = cl_cols_avail,
+  col     = list(Cluster = COLOR_CODE_perCLUST[cl_cols_avail]),
+  simple_anno_size     = unit(3, "mm"),
+  annotation_name_side = "left",
+  annotation_name_gp   = gpar(fontsize = 8)
+)
+
+ht_cl <- Heatmap(
+  mat_cl_z,
+  name              = "Z-score",
+  col               = colorRamp2(c(-2, 0, 2), c("#4575b4", "white", "#d73027")),
+  top_annotation    = ha_cl,
+  cluster_rows      = TRUE,
+  cluster_columns   = FALSE,
+  row_names_side    = "left",
+  row_names_gp      = gpar(fontsize = 9),
+  column_names_side = "top",
+  column_names_gp   = gpar(fontsize = 9),
+  border            = TRUE,
+  rect_gp           = gpar(col = "white", lwd = 0.5),
+  heatmap_legend_param = list(title = "Z-score", at = c(-2, 0, 2),
+                               title_gp = gpar(fontsize = 9),
+                               labels_gp = gpar(fontsize = 8)),
+  width  = unit(5,  "cm"),
+  height = unit(12, "cm")
+)
+
+pdf(paste0(params$out, "figures/NK_module_cluster_heatmap_sanity.pdf"),
+    width = 5, height = 8)
+draw(ht_cl, padding = unit(c(5, 5, 5, 5), "mm"))
+dev.off()
+
+draw(ht_cl)
+```
+
+## ___Pathway enrichment analysis for M1-M25 (GO:BP + KEGG)___
+
+```{r}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# Run GO:BP enrichment for each module
+enrich_list <- lapply(names(module_genes), function(mod) {
+  genes   <- unique(module_genes[[mod]])
+  id_map  <- tryCatch(
+    bitr(genes, fromType = "SYMBOL", toType = "ENTREZID",
+         OrgDb = org.Hs.eg.db, drop = TRUE),
+    error = function(e) NULL
+  )
+  if (is.null(id_map) || nrow(id_map) < 5) return(NULL)
+
+  res <- tryCatch(
+    enrichGO(gene          = id_map$ENTREZID,
+             OrgDb         = org.Hs.eg.db,
+             ont           = "BP",
+             pAdjustMethod = "BH",
+             pvalueCutoff  = 0.05,
+             qvalueCutoff  = 0.2,
+             readable      = TRUE),
+    error = function(e) NULL
+  )
+  if (is.null(res) || nrow(as.data.frame(res)) == 0) return(NULL)
+  as.data.frame(res) %>% dplyr::mutate(Module = mod)
+})
+names(enrich_list) <- names(module_genes)
+
+enrich_df <- dplyr::bind_rows(Filter(Negate(is.null), enrich_list))
+cat("Modules with GO:BP hits:", sum(sapply(enrich_list, Negate(is.null))),
+    "/", length(module_genes), "\n")
+
+write.csv(enrich_df,
+          paste0(params$out, "tables/NK_module_GO_enrichment.csv"),
+          row.names = FALSE)
+```
+
+```{r fig.height=8, fig.width=6}
+# Top 3 terms per module → dot plot
+top_terms <- enrich_df %>%
+  dplyr::mutate(Module = factor(Module, levels = paste0("M", 1:25))) %>%
+  dplyr::group_by(Module) %>%
+  dplyr::slice_min(p.adjust, n = 3, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    Description = stringr::str_wrap(Description, width = 45),
+    log10p      = -log10(p.adjust)
+  )
+
+ggplot(top_terms, aes(x = Module, y = Description, size = Count,
+                      colour = log10p)) +
+  geom_point() +
+  scale_colour_gradient(low = "#fee090", high = "#d73027",
+                        name = expression(-log[10](p[adj]))) +
+  scale_size_continuous(range = c(2, 6), name = "Gene count") +
+  labs(x = NULL, y = NULL,
+       title = "Top GO:BP terms per module") +
+  theme_classic(base_size = 9) +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1),
+    axis.text.y  = element_text(size = 7),
+    panel.grid.major.y = element_line(colour = "grey92", linewidth = 0.3),
+    plot.title   = element_text(face = "bold", size = 10)
+  )
+
+ggsave(paste0(params$out, "figures/NK_module_GO_dotplot.pdf"),
+       width = 6, height = 8, device = cairo_pdf)
+```
+
+## ___Combined GRN module scores___
+
+Modules grouped into seven biologically defined GRN programmes (based on module gene content
+and NK cell biology):
+
+| GRN | NK state | Modules |
+|-----|----------|---------|
+| Immunomodulatory GRN | CD56bright / Immature | M2, M4 |
+| Cytotoxic GRN | CD56dim Cytotoxic | M8, M10, M15, M19, M20 |
+| Adaptive GRN | Adaptive / Memory-like | M12, M13, M16 |
+| IFN Response GRN | IFN Response | M7, M11 |
+| Antigen licensing GRN | MHC-I / Antigen Processing | M9, M14, M18 |
+| Tissue Resident GRN | Tissue Resident | M17 |
+| Transitional GRN | Developmental / Transitional | M1, M3, M5, M6 |
+
+```{r}
+GRN_MODULES <- list(
+  "Immunomodulatory GRN"  = paste0("M", c(2, 4)),
+  "Cytotoxic GRN"         = paste0("M", c(8, 10, 15, 19, 20)),
+  "Adaptive GRN"          = paste0("M", c(12, 13, 16)),
+  "IFN Response GRN"      = paste0("M", c(7, 11)),
+  "Antigen licensing GRN" = paste0("M", c(9, 14, 18)),
+  "Tissue Resident GRN"   = paste0("M", c(17)),
+  "Transitional GRN"      = paste0("M", c(1, 3, 5, 6))
+)
+
+GRN_COLORS <- c(
+  "Immunomodulatory GRN"  = unname(COL_FUNCTIONAL["immunomodulatory"]),  # #4A9B6F — matches COL_FUNCTIONAL
+  "Cytotoxic GRN"         = unname(COL_FUNCTIONAL["cytotoxic"]),          # #C0392B — matches COL_FUNCTIONAL
+  "Adaptive GRN"          = "#7B241C",                                     # dark maroon — deeper shade of cytotoxic red, adaptive = terminally mature
+  "IFN Response GRN"      = unname(COLOR_CODE_v2["hNK_Bm4"]),             # #CDA646 — gold
+  "Antigen licensing GRN" = unname(COLOR_CODE_v2["hNK_Bm1"]),             # #6376AE — slate blue
+  "Tissue Resident GRN"   = unname(COLOR_CODE_GROUP["MYCNamp"]),           # #A7563C — warm terracotta
+  "Transitional GRN"      = unname(COLOR_CODE_GROUP["control"])            # #7EA3AC — muted steel blue, neutral
+)
+
+GRN_ORDER <- c(
+  "Immunomodulatory GRN", "Cytotoxic GRN", "Adaptive GRN",
+  "IFN Response GRN", "Antigen licensing GRN",
+  "Tissue Resident GRN", "Transitional GRN"
+)
+
+# Compute per-cell GRN score = mean of constituent module scores
+mod_cols <- names(module_genes)
+for (grn in names(GRN_MODULES)) {
+  mods_use <- intersect(GRN_MODULES[[grn]], mod_cols)
+  score_df[[grn]] <- rowMeans(score_df[, mods_use, drop = FALSE], na.rm = TRUE)
+}
+
+grn_df <- score_df %>%
+  dplyr::select(cell, cluster, group, all_of(GRN_ORDER)) %>%
+  dplyr::mutate(
+    group   = factor(remap_group(group),                   levels = GROUP_ORDER_PUB),
+    cluster = factor(as.character(cluster), levels = CLUSTER_ORDER)
+  )
+
+cat("GRN score summary:\n")
+print(summary(grn_df[, GRN_ORDER]))
+```
+
+```{r fig.height=4, fig.width=10}
+# Violin: GRN score per genetic group
+grn_group_plots <- lapply(GRN_ORDER, function(grn) {
+  df <- grn_df %>%
+    dplyr::filter(!is.na(group)) %>%
+    dplyr::select(group, score = dplyr::all_of(grn))
+
+  pub_violin_module(
+    data        = df,
+    score_col   = "score",
+    y_label     = "GRN score",
+    title_label = grn,
+    title_color = GRN_COLORS[grn]
+  )
+})
+
+p_grn_group <- patchwork::wrap_plots(grn_group_plots, ncol = 4)
+p_grn_group
+
+ggsave(paste0(params$out, "figures/NK_GRN_scores_per_group_pub.pdf"),
+       p_grn_group, width = 14, height = 8, device = cairo_pdf)
+```
+
+```{r fig.height=4, fig.width=10}
+# Violin: GRN score per ATAC cluster
+
+pub_violin_grn_cluster <- function(data, score_col, grn_name, base_size = 9) {
+  df <- data %>%
+    dplyr::filter(!is.na(cluster)) %>%
+    dplyr::select(cluster, score = dplyr::all_of(score_col))
+
+  ggplot(df, aes(x = cluster, y = score, fill = cluster)) +
+    geom_violin(scale = "width", trim = FALSE, alpha = 0.95, linewidth = 0) +
+    scale_fill_manual(values = COLOR_CODE_perCLUST[CLUSTER_ORDER]) +
+    labs(title = grn_name, x = NULL, y = "GRN score") +
+    pub_theme +
+    theme(
+      legend.position = "none",
+      axis.text.x  = element_text(angle = 45, hjust = 1, size = base_size - 1),
+      axis.text.y  = element_text(size = base_size - 1),
+      axis.line    = element_line(linewidth = 0.4),
+      axis.ticks   = element_line(linewidth = 0.4),
+      plot.title   = element_text(size = base_size, face = "bold",
+                                  color = GRN_COLORS[grn_name], hjust = 0),
+      plot.margin  = margin(t = 10, r = 4, b = 4, l = 4)
+    )
+}
+
+grn_cluster_plots <- lapply(GRN_ORDER, function(grn) {
+  pub_violin_grn_cluster(grn_df, grn, grn)
+})
+
+p_grn_cluster <- patchwork::wrap_plots(grn_cluster_plots, ncol = 4)
+p_grn_cluster
+
+ggsave(paste0(params$out, "figures/NK_GRN_scores_per_cluster_pub.pdf"),
+       p_grn_cluster, width = 14, height = 8, device = cairo_pdf)
+```
+
+```{r fig.height=5, fig.width=6}
+# Heatmap: mean GRN score per cluster × GRN (compact overview)
+grn_cl_mat <- sapply(GRN_ORDER, function(grn) {
+  grn_df %>%
+    dplyr::filter(!is.na(cluster)) %>%
+    dplyr::group_by(cluster) %>%
+    dplyr::summarise(m = mean(.data[[grn]], na.rm = TRUE), .groups = "drop") %>%
+    dplyr::arrange(factor(cluster, levels = CLUSTER_ORDER)) %>%
+    dplyr::pull(m)
+})
+cl_avail <- intersect(CLUSTER_ORDER, unique(na.omit(as.character(grn_df$cluster))))
+rownames(grn_cl_mat) <- cl_avail
+
+grn_cl_z <- scale(grn_cl_mat)   # Z-score across GRNs per cluster
+
+# t(grn_cl_z): rows = GRNs, cols = clusters — row annotation marks GRN category by colour
+grn_row_order <- intersect(GRN_ORDER, rownames(t(grn_cl_z)))
+
+ra_grn <- rowAnnotation(
+  GRN  = grn_row_order,
+  col  = list(GRN = GRN_COLORS),
+  simple_anno_size     = unit(3, "mm"),
+  annotation_name_gp   = gpar(fontsize = 8),
+  show_annotation_name = FALSE
+)
+
+ht_grn <- Heatmap(
+  t(grn_cl_z)[grn_row_order, , drop = FALSE],
+  name              = "Z-score",
+  col               = colorRamp2(c(-1.5, 0, 1.5), c("#4575b4", "white", "#d73027")),
+  left_annotation   = ra_grn,
+  cluster_rows      = FALSE,
+  cluster_columns   = FALSE,
+  row_names_side    = "right",
+  row_names_gp      = gpar(fontsize = 8),
+  column_names_side = "top",
+  column_names_gp   = gpar(fontsize = 9),
+  border            = TRUE,
+  rect_gp           = gpar(col = "white", lwd = 1),
+  heatmap_legend_param = list(title = "Z-score",
+                               title_gp = gpar(fontsize = 9),
+                               labels_gp = gpar(fontsize = 8)),
+  width  = unit(5, "cm"),
+  height = unit(7, "cm")
+)
+
+pdf(paste0(params$out, "figures/NK_GRN_cluster_heatmap.pdf"), width = 6, height = 7)
+draw(ht_grn, padding = unit(c(5, 5, 5, 5), "mm"))
+dev.off()
+
+draw(ht_grn)
+```
+
+## ___Dotplot: GRN scores per NK subset × genetic group___
+
+```{r fig.height=5.5, fig.width=10}
+# Join NK label-transfer subset (majority_vote_label) into GRN data via cell names
+grn_dot_df <- grn_df %>%
+  dplyr::mutate(
+    nk_subset = factor(
+      as.character(lt_meta[cell, "nk_subset"]),
+      levels = NK_SUBSET_ORDER
+    ),
+    group = factor(as.character(group), levels = GROUP_ORDER_PUB)
+  ) %>%
+  dplyr::filter(!is.na(nk_subset), !is.na(group))
+
+# Aggregate mean score + % positive per NK subset × group × GRN,
+# then z-score each GRN across all NK subset × group combinations
+dot_agg <- grn_dot_df %>%
+  tidyr::pivot_longer(cols = dplyr::all_of(GRN_ORDER),
+                      names_to = "GRN", values_to = "score") %>%
+  dplyr::filter(!is.na(score)) %>%
+  dplyr::group_by(nk_subset, group, GRN) %>%
+  dplyr::summarise(
+    mean_score = mean(score, na.rm = TRUE),
+    pct_pos    = mean(score > 0, na.rm = TRUE) * 100,
+    n_cells    = dplyr::n(),
+    .groups    = "drop"
+  ) %>%
+  dplyr::filter(n_cells >= 5) %>%
+  dplyr::group_by(GRN) %>%
+  dplyr::mutate(z_score = as.numeric(scale(mean_score))) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    z_score = pmax(pmin(z_score, 2), -2),   # cap at ±2
+    GRN     = factor(GRN, levels = rev(GRN_ORDER))
+  )
+
+p_grn_dot <- ggplot(dot_agg,
+                    aes(x = nk_subset, y = GRN,
+                        size = pct_pos, colour = z_score)) +
+  geom_point() +
+  facet_grid(. ~ group, scales = "free_x", space = "free_x") +
+  scale_size_continuous(range = c(0.5, 5),
+                        name  = "% cells\n(score > 0)",
+                        limits = c(0, 100)) +
+  scale_colour_gradient2(
+    low      = "#4575b4",
+    mid      = "white",
+    high     = "#d73027",
+    midpoint = 0,
+    limits   = c(-2, 2),
+    name     = "GRN score\n(z-score)"
+  ) +
+  labs(
+    title = "GRN scores per NK subset and genetic group",
+    x = NULL, y = NULL
+  ) +
+  theme(
+    axis.text.x   = element_text(angle = 45, hjust = 1, size = 7,
+                                  face = "italic"),
+    axis.text.y   = element_text(size = 8),
+    strip.text    = element_text(size = 8, face = "bold"),
+    panel.spacing = unit(1, "mm"),
+    panel.border  = element_rect(colour = "grey80", fill = NA, linewidth = 0.4)
+  )
+
+p_grn_dot
+
+ggsave(paste0(params$out, "figures/NK_GRN_scores_NKsubset-group_dotplot.pdf"),
+       p_grn_dot, width = 10, height = 5.5, device = cairo_pdf)
+```
+
+## ___Dotplot: all module scores (M1–M25) per NK subset × genetic group___
+
+```{r fig.height=12, fig.width=10}
+# Reuse grn_dot_df (already has nk_subset + group); add all module scores
+mod_dot_df <- score_df %>%
+  dplyr::mutate(
+    nk_subset = factor(
+      as.character(lt_meta[cell, "nk_subset"]),
+      levels = NK_SUBSET_ORDER
+    ),
+    group = factor(remap_group(as.character(group)), levels = GROUP_ORDER_PUB)
+  ) %>%
+  dplyr::filter(!is.na(nk_subset), !is.na(group))
+
+mod_dot_agg <- mod_dot_df %>%
+  tidyr::pivot_longer(cols = dplyr::all_of(names(module_genes)),
+                      names_to = "Module", values_to = "score") %>%
+  dplyr::filter(!is.na(score)) %>%
+  dplyr::group_by(nk_subset, group, Module) %>%
+  dplyr::summarise(
+    mean_score = mean(score, na.rm = TRUE),
+    pct_pos    = mean(score > 0, na.rm = TRUE) * 100,
+    n_cells    = dplyr::n(),
+    .groups    = "drop"
+  ) %>%
+  dplyr::filter(n_cells >= 5) %>%
+  dplyr::group_by(Module) %>%
+  dplyr::mutate(z_score = as.numeric(scale(mean_score))) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    z_score = pmax(pmin(z_score, 2), -2),
+    Module  = factor(Module, levels = rev(paste0("M", 1:25)))
+  )
+
+p_mod_dot <- ggplot(mod_dot_agg,
+                    aes(x = nk_subset, y = Module,
+                        size = pct_pos, colour = z_score)) +
+  geom_point() +
+  facet_grid(. ~ group, scales = "free_x", space = "free_x") +
+  scale_size_continuous(range = c(0.3, 4),
+                        name  = "% cells\n(score > 0)",
+                        limits = c(0, 100)) +
+  scale_colour_gradient2(
+    low      = "#4575b4",
+    mid      = "white",
+    high     = "#d73027",
+    midpoint = 0,
+    limits   = c(-2, 2),
+    name     = "Module score\n(z-score)"
+  ) +
+  labs(
+    title = "Module scores per NK subset and genetic group",
+    x = NULL, y = NULL
+  ) +
+  theme(
+    axis.text.x   = element_text(angle = 45, hjust = 1, size = 7, face = "italic"),
+    axis.text.y   = element_text(size = 7),
+    strip.text    = element_text(size = 8, face = "bold"),
+    panel.spacing = unit(1, "mm"),
+    panel.border  = element_rect(colour = "grey80", fill = NA, linewidth = 0.4)
+  )
+
+p_mod_dot
+
+ggsave(paste0(params$out, "figures/NK_module_scores_NKsubset-group_dotplot.pdf"),
+       p_mod_dot, width = 10, height = 12, device = cairo_pdf)
+```
+
+# ___Adaptive NK cell signature: ModuleScore___
+
+The question we want to answer here is if we have any adaptive NK cells in the
+ATAC data. When doing the label transfer from RNA data of matched patients,
+we saw a clear signature for adaptive NK cells in a small proportion of NK cells,
+however in the ATAC data, the label transfer did not identify any adaptive NK cells.
+
+```{r}
+# ArchR native addModuleScore for adaptive NK signature (GeneScoreMatrix)
+adaptive_NK_genes_valid <- intersect(adaptive_NK_genes,
+                                     getFeatures(proj_filt, useMatrix = "GeneScoreMatrix"))
+cat("Adaptive NK genes in GeneScoreMatrix:", length(adaptive_NK_genes_valid),
+    "/", length(adaptive_NK_genes), "\n")
+proj_filt <- addModuleScore(
+  ArchRProj = proj_filt,
+  useMatrix = "GeneScoreMatrix",
+  name      = "AdaptiveNK",
+  features  = list(score = adaptive_NK_genes_valid)
+)
+
+# Retrieve score — column is "AdaptiveNK.score"
+adapt_cd <- as.data.frame(
+  getCellColData(proj_filt,
+                 select = c("AdaptiveNK.score", "group", "Clusters_res1",
+                            "majority_vote_label"))
+)
+
+df_adapt_atac <- data.frame(
+  cell     = rownames(adapt_cd),
+  score    = adapt_cd[["AdaptiveNK.score"]],
+  group    = factor(remap_group(as.character(adapt_cd[["group"]])),
+                    levels = GROUP_ORDER_PUB),
+  cluster  = factor(as.character(adapt_cd[["Clusters_res1"]]), levels = CLUSTER_ORDER),
+  nk_label = as.character(adapt_cd[["majority_vote_label"]]),
+  stringsAsFactors = FALSE
+)
+```
+
+```{r fig.height=3.5, fig.width=3.5}
+# Adaptive NK score per genetic group
+p_adapt_group <- pub_violin_module(
+  data        = df_adapt_atac %>% dplyr::filter(!is.na(group)),
+  score_col   = "score",
+  y_label     = "Adaptive NK gene score (ATAC)",
+  title_label = "Adaptive NK signature — per group",
+  title_color = "#2C7BB6"
+)
+p_adapt_group
+
+ggsave(paste0(params$out, "figures/AdaptiveNK_ATACscore_per_group_pub.pdf"),
+       p_adapt_group, width = 3.5, height = 3.5, device = cairo_pdf)
+```
+
+```{r fig.height=3.5, fig.width=4}
+# Adaptive NK score per ATAC cluster C1-C7
+p_adapt_cluster <- pub_violin_cluster(
+  data        = df_adapt_atac %>% dplyr::filter(!is.na(cluster)),
+  score_col   = "score",
+  y_label     = "Adaptive NK gene score (ATAC)",
+  title_label = "Adaptive NK signature — per ATAC cluster"
+)
+p_adapt_cluster
+
+ggsave(paste0(params$out, "figures/AdaptiveNK_ATACscore_per_ATACcluster_pub.pdf"),
+       p_adapt_cluster, width = 4, height = 3.5, device = cairo_pdf)
+```
+
+```{r fig.height=3.5, fig.width=5}
+# Adaptive NK score per NK label-transfer subset, split by genetic group
+p_adapt_nk <- df_adapt_atac %>%
+  dplyr::filter(!is.na(nk_label), !is.na(group)) %>%
+  dplyr::mutate(nk_label = factor(nk_label,
+                                  levels = c("hNK_Bm1","hNK_Bm2","hNK_Bm3","hNK_Bm4"))) %>%
+  ggplot(aes(x = nk_label, y = score, fill = group)) +
+  geom_violin(scale = "width", position = position_dodge(0.85),
+              trim = FALSE, alpha = 0.85, linewidth = 0) +
+  scale_fill_manual(values = COL_GROUP_PUB) +
+  labs(title = "Adaptive NK signature — per NK subset (ATAC)",
+       x = NULL, y = "Adaptive NK gene score (ATAC)", fill = "genetic group") +
+  theme_classic(base_size = 9) +
+  theme(axis.text.x    = element_text(angle = 35, hjust = 1),
+        axis.line      = element_line(linewidth = 0.4),
+        axis.ticks     = element_line(linewidth = 0.4),
+        plot.title     = element_text(face = "bold", size = 9),
+        legend.key.size = unit(3, "mm"),
+        legend.text    = element_text(size = 8))
+p_adapt_nk
+
+ggsave(paste0(params$out, "figures/AdaptiveNK_ATACscore_per_NKsubset_pub.pdf"),
+       p_adapt_nk, width = 5, height = 3.5, device = cairo_pdf)
+```
+
+```{r}
+# Extract GeneScoreMatrix for per-gene accessibility plots (KLRC2, FCER1G)
+se_markers  <- getMatrixFromProject(proj_filt, useMatrix = "GeneScoreMatrix")
+gene_names  <- rowData(se_markers)$name
+if (is.null(gene_names)) gene_names <- rownames(se_markers)
+rownames(se_markers) <- gene_names
+full_expr   <- as.matrix(assay(se_markers))
+```
+
+```{r fig.height=3.5, fig.width=7}
+# Gene accessibility for key adaptive NK markers: KLRC2 (gained) and FCER1G (lost)
+marker_genes <- intersect(c("KLRC2", "FCER1G"), gene_names)
+
+dplyr::bind_rows(lapply(marker_genes, function(g) {
+  data.frame(
+    gene     = g,
+    score    = as.numeric(full_expr[g, ]),
+    nk_label = as.character(proj_filt$majority_vote_label),
+    group    = factor(remap_group(as.character(proj_filt$group)), levels = GROUP_ORDER_PUB),
+    stringsAsFactors = FALSE
+  )
+})) %>%
+  dplyr::filter(!is.na(nk_label), !is.na(group)) %>%
+  dplyr::mutate(nk_label = factor(nk_label,
+                                  levels = c("hNK_Bm1","hNK_Bm2","hNK_Bm3","hNK_Bm4"))) %>%
+  ggplot(aes(x = nk_label, y = score, fill = group)) +
+  geom_violin(scale = "width", position = position_dodge(0.85),
+              trim = FALSE, alpha = 0.85, linewidth = 0) +
+  facet_wrap(~ gene, scales = "free_y", nrow = 1) +
+  scale_fill_manual(values = COL_GROUP_PUB) +
+  labs(x = NULL, y = "Gene accessibility score (ATAC)", fill = "genetic group") +
+  theme_classic(base_size = 9) +
+  theme(axis.text.x    = element_text(angle = 35, hjust = 1),
+        strip.text     = element_text(face = "bold", size = 9),
+        legend.key.size = unit(3, "mm"),
+        legend.text    = element_text(size = 8)) ->
+  p_markers
+p_markers
+
+ggsave(paste0(params$out, "figures/AdaptiveNK_KLRC2_FCER1G_ATACscore_pub.pdf"),
+       p_markers, width = 7, height = 3.5, device = cairo_pdf)
+```
+
+
+
+# ___Save intermediate ArchR project and score data___
+
+```{r}
+saveRDS(proj_filt,
+        file = paste0(params$out, "Rds/snATAC_NK_v20260625_modules.Rds"))
+saveRDS(score_df,
+        file = paste0(params$out, "Rds/snATAC_NK_score_df_v20260625.Rds"))
+cat("Saved proj_filt and score_df.\n")
+```
+
+# ___The End___
+
+```{r render, eval=FALSE, include=FALSE}
+rmarkdown::render(
+  "/home/rstudio/code/NK-NB_study/code/39a_20260625_snATAC_NK_module_scoring.Rmd",
+  output_file = paste0(params$out, "html/39a_20260625_snATAC_NK_module_scoring.html")
+)
+```

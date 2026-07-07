@@ -83,6 +83,7 @@ cat("Groups (NK):", paste(unique(ALL_NK$group), collapse = ", "), "\n")
 cat("Groups (NB):", paste(unique(ALL_NB$group), collapse = ", "), "\n")
 ```
 
+
 # ___CD6 receptor - ligand axis___
 
 **Reviewer #1 question #2**
@@ -147,7 +148,7 @@ p_cd6 <- pub_violin(
   y_label       = "CD6 RNA expression",
   ref_group     = NULL,
   show_points   = FALSE,
-  base_size     = 12
+  base_size     = 9
 ) +
   ggpubr::stat_pvalue_manual(stats_cd6, label = "p.adj.signif",
                              tip.length = 0.01, bracket.size = 0.3, size = 2.5,
@@ -172,7 +173,7 @@ p_cd6_pts <- pub_violin(
   y_label       = "CD6 RNA expression",
   ref_group     = NULL,
   show_points   = TRUE, point_size = 0.3, point_alpha = 1,
-  base_size     = 12
+  base_size     = 9
 ) +
   ggpubr::stat_pvalue_manual(stats_cd6, label = "p.adj.signif",
                              tip.length = 0.01, bracket.size = 0.3, size = 2.5,
@@ -191,7 +192,7 @@ ggsave(paste0(fig_out, "CD6_per_NKsubset_with-points.pdf"),
 ### ___On NK cells___
 
 ```{r fig.height=6, fig.width=9}
-CD6_receptors <- c("CDCP1", "CD44", "LCP2")
+CD6_receptors <- c("ALCAM","CDCP1", "CD44", "LCP2")
 
 df_cd6r_nk <- Seurat::FetchData(ALL_NK,
                                 vars = c(CD6_receptors,
@@ -206,7 +207,16 @@ df_cd6r_nk <- Seurat::FetchData(ALL_NK,
     subset = factor(predicted_NK_type_de.n350, levels = NK_SUBSET_ORDER),
     gene   = dplyr::recode(gene, CDCP1 = "CDCP1 (= CD318 protein)")
   )
+```
 
+```{r}
+# dotplot
+# showing only Ctrl and ATRXdel group
+
+```
+
+
+```{r fig.height=6, fig.width=9}
 .cd6r_nk_violin <- function(show_pts) {
   pub_violin(
     data          = df_cd6r_nk,
@@ -223,7 +233,7 @@ df_cd6r_nk <- Seurat::FetchData(ALL_NK,
     show_points   = show_pts,
     point_size    = 0.3,
     point_alpha   = 1,
-    base_size     = 12,
+    base_size     = 9,
     x_angle       = 45
   ) + ggplot2::facet_wrap(~ gene, scales = "free_y", nrow = 1)
 }
@@ -246,8 +256,8 @@ ggsave(paste0(fig_out, "CD6_receptors_NK_stacked.pdf"),
 
 **Testing for tumor-tumor interactions**
 
-```{r fig.height=4, fig.width=7}
-CD6_receptors_nb <- c("ALCAM", "CDCP1", "CD44", "LCP2")
+```{r fig.height=3, fig.width=5.5}
+CD6_receptors_nb <- c("ALCAM", "CDCP1", "CD44")
 
 df_cd6r_nb <- Seurat::FetchData(ALL_NB,
                                 vars = c(CD6_receptors_nb, "group"),
@@ -275,7 +285,7 @@ p_cd6r_nb <- pub_violin(
 p_cd6r_nb
 
 ggsave(paste0(fig_out, "CD6_receptors_NB_no-points.pdf"),
-       p_cd6r_nb, width = 7, height = 4, device = cairo_pdf)
+       p_cd6r_nb, width = 5.5, height = 3, device = cairo_pdf)
 
 ggsave(paste0(fig_out, "CD6_receptors_NB_with-points.pdf"),
        pub_violin(
@@ -286,7 +296,7 @@ ggsave(paste0(fig_out, "CD6_receptors_NB_with-points.pdf"),
          comparisons = COMPS_NB, stat_label = "p.signif", hide_ns = FALSE,
          show_points = TRUE, point_size = 1, point_alpha = 1
        ) + ggplot2::facet_wrap(~ gene, scales = "free_y", nrow = 1),
-       width = 7, height = 4, device = cairo_pdf)
+       width = 5.5, height = 3, device = cairo_pdf)
 ```
 
 ### ___All cell types___
@@ -359,7 +369,7 @@ stats_cd6r_all <- stats_cd6r_all %>%
     ref_group     = NULL,
     show_points   = show_pts,
     point_size    = 0.2, point_alpha = 1,
-    base_size     = 10
+    base_size     = 9
   ) +
     ggpubr::stat_pvalue_manual(stats_cd6r_all, label = "p.adj.signif",
                                tip.length = 0.01, bracket.size = 0.25, size = 2,
@@ -406,7 +416,7 @@ p_alcam_nb <- pub_violin(
   stat_label    = "p.signif",
   hide_ns       = FALSE,
   show_points   = FALSE,
-  base_size     = 12
+  base_size     = 9
 )
 p_alcam_nb
 
@@ -427,7 +437,7 @@ p_alcam_nb_pts <- pub_violin(
   stat_label    = "p.signif",
   hide_ns       = FALSE,
   show_points   = TRUE, point_size = 0.3, point_alpha = 1,
-  base_size     = 12
+  base_size     = 9
 )
 p_alcam_nb_pts
 
@@ -630,7 +640,7 @@ stats_alcam_all <- stats_alcam_all %>%
     ref_group     = NULL,
     show_points   = show_pts,
     point_size    = 0.2, point_alpha = 1,
-    base_size     = 10
+    base_size     = 9
   ) +
     ggpubr::stat_pvalue_manual(stats_alcam_all, label = "p.adj.signif",
                                tip.length = 0.01, bracket.size = 0.25, size = 2,
@@ -648,6 +658,62 @@ ggsave(paste0(fig_out, "ALCAM_allCellTypes_no-points.pdf"),
        p_alcam_all, width = 10, height = 32, device = cairo_pdf)
 ggsave(paste0(fig_out, "ALCAM_allCellTypes_with-points.pdf"),
        p_alcam_all_pts, width = 10, height = 32, device = cairo_pdf)
+```
+
+# ___ALCAM + CD6 combined figure___
+
+Combines ALCAM (from `df_alcam_all`) and CD6 (from `df_cd6r_all`) into a single data frame
+and plots them with `facet_wrap(~ gene, ncol = 1, scales = "free_y")` — identical structure
+to the working all-gene plots so violin bandwidth normalisation and rendering match exactly.
+
+```{r fig.height=6, fig.width=10}
+# Combine ALCAM and CD6 rows into one data frame — same source data, same bandwidth
+df_alcam_cd6 <- dplyr::bind_rows(
+  dplyr::filter(df_alcam_all, gene == "ALCAM"),
+  dplyr::filter(df_cd6r_all,  gene == "CD6")
+) %>%
+  dplyr::mutate(gene = factor(gene, levels = c("ALCAM", "CD6")))
+
+# Combine stats — both sets were computed against the same .ct_lvls positions
+stats_alcam_cd6 <- dplyr::bind_rows(
+  dplyr::filter(stats_alcam_all, gene == "ALCAM"),
+  dplyr::filter(stats_cd6r_all,  gene == "CD6")
+) %>%
+  dplyr::mutate(gene = factor(gene, levels = c("ALCAM", "CD6")))
+
+.make_alcam_cd6_plot <- function(show_pts) {
+  pub_violin(
+    data          = df_alcam_cd6,
+    x_col         = "celltype",
+    y_col         = "value",
+    fill_col      = "group",
+    colors        = COLOR_CODE_GROUP,
+    x_order       = .ct_lvls_alcam,
+    fill_order    = GROUP_ORDER_PUB,
+    x_labels      = NULL,
+    legend_labels = PUB_GROUP_LABELS,
+    y_label       = "RNA expression",
+    ref_group     = NULL,
+    show_points   = show_pts,
+    point_size    = 0.2, point_alpha = 1,
+    base_size     = 9
+  ) +
+    ggpubr::stat_pvalue_manual(stats_alcam_cd6, label = "p.adj.signif",
+                               tip.length = 0.01, bracket.size = 0.25, size = 2,
+                               hide.ns = TRUE, inherit.aes = FALSE) +
+    ggplot2::facet_wrap(~ gene, scales = "free_y", ncol = 1) +
+    ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0, 0.05)))
+}
+
+p_alcam_cd6_combined     <- .make_alcam_cd6_plot(FALSE)
+p_alcam_cd6_combined_pts <- .make_alcam_cd6_plot(TRUE)
+p_alcam_cd6_combined
+p_alcam_cd6_combined_pts
+
+ggsave(paste0(fig_out, "ALCAM_CD6_allCellTypes_no-points.pdf"),
+       p_alcam_cd6_combined, width = 10, height = 6, device = cairo_pdf)
+ggsave(paste0(fig_out, "ALCAM_CD6_allCellTypes_with-points.pdf"),
+       p_alcam_cd6_combined_pts, width = 10, height = 6, device = cairo_pdf)
 ```
 
 # ___CD160 and CD52 expression in NK cell subsets___
@@ -698,7 +764,7 @@ p_nk_ctrl <- pub_violin(
   stat_label  = "p.signif",
   hide_ns     = TRUE,
   show_points = FALSE,
-  base_size   = 10
+  base_size   = 9
 ) +
   ggplot2::ggtitle("Control samples") +
   ggplot2::facet_wrap(~ gene, scales = "free_y", nrow = 1) +
@@ -765,7 +831,7 @@ p_nk_grouped <- pub_violin(
   y_label       = "RNA expression",
   ref_group     = NULL,
   show_points   = FALSE,
-  base_size     = 10
+  base_size     = 9
 ) +
   ggpubr::stat_pvalue_manual(stats_bm2v3, label = "p.adj.signif",
                               tip.length = 0.01, bracket.size = 0.25, size = 2,
@@ -779,25 +845,12 @@ ggsave(paste0(fig_out, "CD160_CD52_NK_per-group.pdf"),
        p_nk_grouped, width = 9, height = 3, device = cairo_pdf)
 ```
 
-# ___New adolescent hBM-NK dataset___
-
-**Paper: Hanemaaijer, E.S., Müskens, K.F., Kal, I.J. et al. (2026). Single-cell multiomic atlas of healthy pediatric bone marrow reveals age-dependent differences in lineage differentiation driven by stromal signaling. Nat Immunol 27, 613–623**
-
-**DOI: 10.1038/s41590-026-02422-9**
-**URL: https://doi.org/10.1038/s41590-026-02422-9**
-
-
-**Data source: Belderbos, M. E. (2026). Scripts and data supporting the manuscript "Single-cell multiomic atlas of healthy pediatric bone marrow reveals age-dependent differences in lineage differentiation driven by stromal signaling". Zenodo**
-
-**DOI: 10.5281/zenodo.18632238**
-**URL: https://doi.org/10.5281/zenodo.18632238**
-
 
 # ___Exploratory analysis___
 
 ## ___Other predicted L-R pairs___
 
-```{r fig.height=4, fig.width=6}
+```{r eval=FALSE, fig.height=4, fig.width=6, include=FALSE}
 # Predicted interaction:  PRSS3 (on NB cells) - F2R (on NK cells)
 new_candidates <- c("PRSS3", "F2R")     
 
@@ -830,7 +883,7 @@ pub_violin(
 
 **ENTPD1 gene = CD39 protein**
 
-```{r fig.height=4, fig.width=5}
+```{r eval=FALSE, fig.height=4, fig.width=5, include=FALSE}
 df_cd39 <- Seurat::FetchData(ALL_NK,
                              vars = c("ENTPD1", "predicted_NK_type_de.n350", "group"),
                              layer = "data") %>%
@@ -929,7 +982,7 @@ ggsave(paste0(fig_out, "CD39_NK_with-points.pdf"),
 
 ## ___Adaptive NK cell signature___
 
-```{r fig.height=4, fig.width=3}
+```{r eval=FALSE, fig.height=4, fig.width=3, include=FALSE}
 # adaptive_NK_genes loaded via source(00_NK_paper_setup.R)
 ALL_NK <- Seurat::AddModuleScore(ALL_NK,
                                  features = list(adaptive = adaptive_NK_genes),
@@ -969,7 +1022,6 @@ ggsave(paste0(fig_out, "AdaptiveNK_score_with-points.pdf"),
        ),
        width = 3.5, height = 3.5, device = cairo_pdf)
 ```
-
 
 
 # ___SessionInfo___

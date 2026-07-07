@@ -1,0 +1,757 @@
+---
+title: "NK project: Manuscript Main figure 4"
+subtitle: "CD6 - ALCAM, other R - L pairs"
+author: "Dr. Sara Wernig-Zorc"
+date: "2026-07-02"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  out: "/home/rstudio/mnt_out/NK_project/"
+  anno: "/home/rstudio/mnt_resources/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, tidy = TRUE, error = FALSE,
+                      messages = FALSE, warning = FALSE)
+library(parallel)
+future::plan("sequential")
+options(future.globals.maxSize = 80 * 10^9)
+options(Seurat.object.assay.version = "v5")
+print(params)
+```
+
+# Setup
+
+```{r env, echo=FALSE, include=FALSE}
+source("/home/rstudio/00_NK_paper_setup.R")
+source("/home/rstudio/00_NK_paper_utils.R")
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+library(dplyr)
+set.seed(2805)
+
+fig_out <- paste0(params$out, "figures/revision/")
+dir.create(fig_out, showWarnings = FALSE, recursive = TRUE)
+
+NK_SUBSET_ORDER <- c("hNK_Bm1", "hNK_Bm2", "hNK_Bm3", "hNK_Bm4")
+ALCAM_NK_GENES  <- c("CD6", "LGALS1", "LGALS8", "S100B","LILRB4", "L1CAM", "ALCAM")
+CD6_NB_GENES    <- c("ALCAM",  "CD44", "CDCP1")
+CTRL_ATRX       <- list(c("control", "ATRXdel"))
+
+GRADIENT_COLORS <- c(low = "#5B283D", 
+                     mid = "white", 
+                     high = "#375344")
+
+GRADIENT_COLORS_v2 <- c("#375344", 
+                        "#ADCB9C",
+                        "white",
+                        "#B99FBD",
+                        "#5B283D")
+```
+
+```{r dotplot function, echo=FALSE, include=FALSE}
+fc_dotplot <- function(seurat_obj, genes, group_col = "group", x_col = NULL,
+                       ctrl = "control", test = "ATRXdel",
+                       fc_limits = c(-2, 2), base_size = 9) {
+  vars <- c(genes, group_col, if (!is.null(x_col)) x_col)
+  df   <- Seurat::FetchData(seurat_obj, vars = vars, layer = "data")
+
+  grp_vars  <- c(group_col, if (!is.null(x_col)) x_col)
+  join_vars <- if (!is.null(x_col)) x_col else character(0)
+
+  summ <- df %>%
+    tidyr::pivot_longer(cols = dplyr::all_of(genes),
+                        names_to = "gene", values_to = "expr") %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(c("gene", grp_vars)))) %>%
+    dplyr::summarise(pct  = mean(expr > 0) * 100,
+                     avg  = mean(expr),
+                     .groups = "drop")
+
+  ctrl_s <- dplyr::filter(summ, .data[[group_col]] == ctrl)
+  test_s <- dplyr::filter(summ, .data[[group_col]] == test)
+  by_cols <- c("gene", join_vars)
+
+  fc_df <- dplyr::inner_join(
+    dplyr::select(ctrl_s, dplyr::all_of(c(by_cols, "avg"))),
+    dplyr::select(test_s, dplyr::all_of(c(by_cols, "avg", "pct"))),
+    by = by_cols, suffix = c("_ctrl", "_test")
+  ) %>%
+    dplyr::mutate(
+      log2FC  = log2((avg_test + 0.01) / (avg_ctrl + 0.01)),
+      log2FC  = pmax(pmin(log2FC, fc_limits[2]), fc_limits[1])
+    )
+
+  # BH-adjusted Wilcoxon per gene × x_col group
+  .empty_stat <- data.frame(p = NA_real_, p.adj = NA_real_,
+                             p.adj.signif = NA_character_)
+  stat_df <- df %>%
+    tidyr::pivot_longer(cols = dplyr::all_of(genes),
+                        names_to = "gene", values_to = "expr") %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(c("gene", join_vars)))) %>%
+    dplyr::group_modify(~ {
+      dd <- .x
+      if (length(unique(dd[[group_col]])) < 2) return(.empty_stat)
+      tryCatch(
+        rstatix::wilcox_test(dd, expr ~ !!rlang::sym(group_col),
+                             exact = FALSE) %>%
+          rstatix::adjust_pvalue(method = "BH") %>%
+          rstatix::add_significance("p.adj",
+            cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1),
+            symbols   = c("****", "***", "**", "*", "ns")) %>%
+          dplyr::select(p, p.adj, p.adj.signif),
+        error = function(e) .empty_stat
+      )
+    }) %>%
+    dplyr::ungroup()
+
+  plot_df <- dplyr::left_join(fc_df, stat_df, by = by_cols) %>%
+    dplyr::mutate(gene = factor(gene, levels = rev(genes)))
+
+  # guard: ensure column exists even if all stat tests failed
+  if (!"p.adj.signif" %in% names(plot_df)) plot_df$p.adj.signif <- NA_character_
+
+  # create .xvar column to avoid rlang quoting issues with special column names
+  plot_df$.xvar <- if (!is.null(x_col)) as.character(plot_df[[x_col]]) else "ATRXdel"
+  if (!is.null(x_col) && is.factor(plot_df[[x_col]])) {
+    plot_df$.xvar <- factor(plot_df$.xvar, levels = levels(plot_df[[x_col]]))
+  }
+
+  message("fc_dotplot: fc_df rows = ", nrow(fc_df), ", plot_df rows = ", nrow(plot_df))
+
+  ggplot2::ggplot(
+    plot_df,
+    ggplot2::aes(x = .xvar, y = gene, size = pct, color = log2FC)
+  ) +
+    ggplot2::geom_point() +
+    ggplot2::geom_text(ggplot2::aes(label = ifelse(is.na(p.adj.signif), "", p.adj.signif)),
+                       size = 2.5, vjust = -1.5, color = "black") +
+    ggplot2::scale_size_continuous(name = "% expressing",
+                                   range = c(1, 8), limits = c(0, 100)) +
+    ggplot2::scale_color_gradient2(
+      low = GRADIENT_COLORS["low"], mid = GRADIENT_COLORS["mid"],
+      high = GRADIENT_COLORS["high"], midpoint = 0,
+      limits = fc_limits, oob = scales::squish,
+      name = "log2FC (ATRXdel vs. ctrl)"
+    ) +
+    ggplot2::theme_classic(base_size = base_size) +
+    ggplot2::theme(
+      axis.title    = ggplot2::element_blank(),
+      axis.text.x   = ggplot2::element_text(angle = 45, hjust = 1,
+                                             size = base_size - 1),
+      axis.text.y   = ggplot2::element_text(face = "italic",
+                                             size = base_size - 1),
+      axis.line     = ggplot2::element_line(linewidth = 0.4),
+      axis.ticks    = ggplot2::element_line(linewidth = 0.4),
+      legend.key.size   = ggplot2::unit(3, "mm"),
+      legend.text       = ggplot2::element_text(size = base_size - 2),
+      legend.background = ggplot2::element_blank(),
+      strip.background  = ggplot2::element_blank(),
+      strip.text        = ggplot2::element_text(size = base_size)
+    )
+}
+```
+
+# Load data
+
+```{r load-data}
+fetahu2023 <- readRDS("~/mnt_out/NK_project/Rds/fetahu2023_withNewMetadata.Rds")
+fetahu2023 <- NormalizeData(fetahu2023, 
+                            normalization.method = "LogNormalize",
+                            scale.factor = 10000) %>% 
+  ScaleData()
+fetahu2023$celltype <- fetahu2023$orig.ident
+
+ALL_NK <- readRDS("~/mnt_out/NK_project/Rds/ALL_NK_cluster_withNewMetadata.Rds")
+ALL_NK <- NormalizeData(ALL_NK, 
+                        normalization.method = "LogNormalize",
+                        scale.factor = 10000) %>% 
+  ScaleData()
+
+ALL_NB <- readRDS("~/mnt_out/NK_project/Rds/ALL_NB_cluster_withNewMetadata.Rds")
+ALL_NB <- NormalizeData(ALL_NB, 
+                        normalization.method = "LogNormalize",
+                        scale.factor = 10000) %>% 
+  ScaleData()
+
+# NK:  all groups, only the 4 annotated subsets (for multi-group violin)
+ALL_NK_all <- subset(ALL_NK,
+                     subset = predicted_NK_type_de.n350 %in% NK_SUBSET_ORDER)
+ALL_NK_all$group <- factor(ALL_NK_all$group,
+                            levels = names(COLOR_CODE_GROUP))
+ALL_NK_all$predicted_NK_type_de.n350 <- factor(
+  ALL_NK_all$predicted_NK_type_de.n350, levels = NK_SUBSET_ORDER)
+
+# NK:  control + ATRXdel, only the 4 annotated subsets
+ALL_NK_2 <- subset(ALL_NK,
+                   subset = group %in% c("control", "ATRXdel") &
+                            predicted_NK_type_de.n350 %in% NK_SUBSET_ORDER)
+ALL_NK_2$group <- factor(ALL_NK_2$group, levels = c("control", "ATRXdel"))
+ALL_NK_2$predicted_NK_type_de.n350 <- factor(ALL_NK_2$predicted_NK_type_de.n350,
+                                              levels = NK_SUBSET_ORDER)
+
+# combined group × NK subset label for dotplots showing both groups (4A, 4D)
+ALL_NK_2$group_nksubset <- paste0(as.character(ALL_NK_2$group), "_",
+                                   as.character(ALL_NK_2$predicted_NK_type_de.n350))
+nk_gc_levels <- as.vector(rbind(paste0("ATRXdel_", NK_SUBSET_ORDER),
+                                 paste0("control_",  NK_SUBSET_ORDER)))
+ALL_NK_2$group_nksubset <- factor(ALL_NK_2$group_nksubset, levels = nk_gc_levels)
+
+# NB:  tumor-only object → no control; use ATRXdel only
+# droplevels() removes the unused MYCNamp / ATRXwtMYCNwt factor levels that
+# Seurat::subset() retains — SCpubr checks all levels, not just present ones.
+ALL_NB_A <- subset(ALL_NB, subset = group == "ATRXdel")
+ALL_NB_A$group <- droplevels(ALL_NB_A$group)
+
+# Full atlas: all groups
+fetahu_all <- fetahu2023
+fetahu_all$group    <- factor(fetahu_all$group,    levels = names(COLOR_CODE_GROUP))
+fetahu_all$celltype <- factor(fetahu_all$celltype, levels = names(COLOR_CODE_FETAHU2023_v2))
+
+# Full atlas: control + ATRXdel
+fetahu_2 <- subset(fetahu2023, subset = group %in% c("control", "ATRXdel"))
+fetahu_2$group    <- factor(fetahu_2$group,    levels = c("control", "ATRXdel"))
+fetahu_2$celltype <- factor(fetahu_2$celltype, levels = names(COLOR_CODE_FETAHU2023_v2))
+
+# Atlas + NB tumor cells merged, with group_celltype combined annotation for 4E
+ALL_NB_fetahu <- subset(ALL_NB, subset = group %in% c("control", "ATRXdel"))
+ALL_NB_fetahu$group    <- factor(ALL_NB_fetahu$group, levels = c("control", "ATRXdel"))
+ALL_NB_fetahu$celltype <- "NB"
+fetahu_2_nb <- merge(fetahu_2, ALL_NB_fetahu)
+fetahu_2_nb <- NormalizeData(fetahu_2_nb, normalization.method = "LogNormalize",
+                              scale.factor = 10000)
+fetahu_2_nb$group    <- factor(fetahu_2_nb$group, levels = c("control", "ATRXdel"))
+ct_levels_nb         <- c(levels(fetahu_2$celltype), "NB")
+fetahu_2_nb$celltype <- factor(as.character(fetahu_2_nb$celltype), levels = ct_levels_nb)
+
+# combined label: control_X then ATRXdel_X within each cell type
+fetahu_2_nb$group_celltype <- paste0(as.character(fetahu_2_nb$group), "_",
+                                      as.character(fetahu_2_nb$celltype))
+gc_levels <- as.vector(rbind(paste0("control_",  ct_levels_nb),
+                              paste0("ATRXdel_", ct_levels_nb)))
+fetahu_2_nb$group_celltype <- factor(fetahu_2_nb$group_celltype, levels = gc_levels)
+
+cat("NK_2 cells:", ncol(ALL_NK_2), "\n")
+cat("NB_A cells:", ncol(ALL_NB_A), "\n")
+cat("fetahu_2 cells:", ncol(fetahu_2), "\n")
+cat("fetahu_2_nb cells:", ncol(fetahu_2_nb), "\n")
+```
+
+# Figure 4A — CD6 expression per NK cell state
+
+**Layout: one panel per NK subset (hNK_Bm1–4); x = group (ctrl vs ATRXdel)**
+
+```{r cd6-nk-violin, fig.height=3, fig.width=3}
+p_cd6_vio <- do_ViolinPlot(
+  ALL_NK_2,
+  features   = "CD6",
+  group.by   = "group",
+  colors.use = COLOR_CODE_GROUP[c("control", "ATRXdel")],
+  legend.title = "",
+  font.size  = 12,
+  plot_boxplot = FALSE,
+  plot.grid = FALSE,
+  grid.type = "blank") +
+  ggpubr::stat_compare_means(
+    comparisons = CTRL_ATRX, method = "wilcox.test",
+    label = "p.signif", size = 3, tip.length = 0.01
+  )
+p_cd6_vio
+
+ggsave(paste0(fig_out, "CD6_NKsubset_violin.pdf"),
+       p_cd6_vio, width = 3, height = 3, device = cairo_pdf)
+```
+
+```{r cd6-nk-dot, fig.height=5, fig.width=3}
+# BH-adjusted Wilcoxon + log2FC per NK subset
+.cd6_stats <- Seurat::FetchData(ALL_NK_2,
+                                 vars = c("CD6", "group", "predicted_NK_type_de.n350"),
+                                 layer = "data") %>%
+  dplyr::group_by(predicted_NK_type_de.n350) %>%
+  dplyr::group_modify(~ {
+    w  <- rstatix::wilcox_test(.x, CD6 ~ group, exact = FALSE) %>%
+      rstatix::adjust_pvalue(method = "BH") %>%
+      rstatix::add_significance("p.adj",
+        cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1),
+        symbols   = c("****", "***", "**", "*", "ns"))
+    fc <- log2((mean(.x$CD6[.x$group == "ATRXdel"]) + 0.01) /
+                (mean(.x$CD6[.x$group == "control"])  + 0.01))
+    data.frame(signif = w$p.adj.signif, log2FC = round(fc, 2))
+  }) %>%
+  dplyr::ungroup()
+
+.lvls <- levels(ALL_NK_2$NK_subtype_per_group)
+.cd6_stats <- .cd6_stats %>%
+  dplyr::mutate(
+    y1    = sapply(predicted_NK_type_de.n350, function(s)
+                     which(grepl("ATRXdel", .lvls) & grepl(s, .lvls, fixed = TRUE))),
+    y2    = sapply(predicted_NK_type_de.n350, function(s)
+                     which(grepl("control",  .lvls) & grepl(s, .lvls, fixed = TRUE))),
+    y_mid = (y1 + y2) / 2,
+    label = paste0(signif, "  log2FC=", log2FC)
+  )
+
+p_cd6_dot <- do_DotPlot(
+  ALL_NK_2,
+  features   = "CD6",
+  group.by   = "NK_subtype_per_group",
+  dot_border = FALSE,
+  font.size  = 10,
+  dot.scale  = 12,
+  use_viridis  = TRUE,
+  viridis.palette = "A",
+  viridis.direction = -1,
+  colors.use   = GRADIENT_COLORS_v2
+)
+
+.x_range <- ggplot_build(p_cd6_dot)$layout$panel_params[[1]]$x.range
+.x_brk   <- .x_range[2] + 0.15 * diff(.x_range)
+
+p_cd6_dot <- p_cd6_dot +
+  ggplot2::geom_segment(
+    data = .cd6_stats,
+    ggplot2::aes(y = y1, yend = y2),
+    x = .x_brk, xend = .x_brk,
+    inherit.aes = FALSE, color = "black", linewidth = 0.4
+  ) +
+  ggplot2::geom_text(
+    data = .cd6_stats,
+    ggplot2::aes(y = y_mid, label = label),
+    x = .x_brk + 0.05 * diff(.x_range),
+    inherit.aes = FALSE, hjust = 0, size = 2.5
+  ) +
+  ggplot2::coord_cartesian(clip = "off") +
+  ggplot2::theme(plot.margin = ggplot2::margin(t = 5, r = 45, b = 5, l = 5))
+
+p_cd6_dot
+
+ggsave(paste0(fig_out, "CD6_NKsubset_dotplot.pdf"),
+       p_cd6_dot, width = 3, height = 5, device = cairo_pdf)
+```
+
+# Figure 4B — CD6 binding partners on NB tumor cells (ATRXdel)
+
+**Genes: ALCAM, CDCP1, CD44 | NB = tumor-only, no control**
+
+```{r cd6lig-nb-violin, fig.height=3, fig.width=5}
+p_cd6lig_vio <- do_ViolinPlot(
+  ALL_NB_A,
+  features     = CD6_NB_GENES,
+  colors.use   = COLOR_CODE_GROUP["ATRXdel"],
+  legend.title = "",
+  font.size    = 9,
+  plot_boxplot = FALSE,
+  y_cut = c(3,3,3),
+)
+p_cd6lig_vio
+
+ggsave(paste0(fig_out, "CD6ligands_NB_violin.pdf"),
+       p_cd6lig_vio, width = 5, height = 3, device = cairo_pdf)
+```
+
+```{r cd6lig-nb-dot, fig.height=4, fig.width=6}
+# BH-adjusted Wilcoxon + log2FC per gene, for two comparisons vs ATRXdel
+.nb_stats <- Seurat::FetchData(ALL_NB,
+                                vars = c(CD6_NB_GENES, "group"),
+                                layer = "data") %>%
+  tidyr::pivot_longer(cols = dplyr::all_of(CD6_NB_GENES),
+                      names_to = "gene", values_to = "expr") %>%
+  dplyr::group_by(gene) %>%
+  dplyr::group_modify(~ {
+    dd <- .x
+    purrr::map_dfr(list(c("ATRXdel","ATRXwtMYCNwt"), c("ATRXdel","MYCNamp")), function(grps) {
+      sub <- dplyr::filter(dd, group %in% grps)
+      sub$group <- factor(sub$group, levels = grps)
+      w <- tryCatch(
+        rstatix::wilcox_test(sub, expr ~ group, exact = FALSE) %>%
+          rstatix::adjust_pvalue(method = "BH") %>%
+          rstatix::add_significance("p.adj",
+            cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1),
+            symbols   = c("****", "***", "**", "*", "ns")),
+        error = function(e) data.frame(p.adj.signif = "ns")
+      )
+      fc <- log2((mean(sub$expr[sub$group == "ATRXdel"]) + 0.01) /
+                  (mean(sub$expr[sub$group == grps[2]])   + 0.01))
+      data.frame(comparison = paste(grps, collapse = " vs "),
+                 grp2 = grps[2],
+                 signif = w$p.adj.signif[1],
+                 log2FC = round(fc, 2))
+    })
+  }) %>%
+  dplyr::ungroup()
+
+p_cd6lig_dot <- do_DotPlot(
+  ALL_NB,
+  features     = CD6_NB_GENES,
+  group.by     = "group",
+  scale        = TRUE,
+  dot.scale    = 15,
+  font.size    = 12,
+  dot_border   = FALSE,
+  use_viridis  = TRUE,
+  viridis.palette = "A",
+  viridis.direction = -1,
+  colors.use   = GRADIENT_COLORS_v2
+)
+
+# detect y-axis group order from the built plot
+.pb       <- ggplot_build(p_cd6lig_dot)
+.y_groups <- .pb$layout$panel_params[[1]]$y$limits   # groups bottom → top
+.x_range  <- .pb$layout$panel_params[[1]]$x.range
+
+.y_pos <- function(grp) which(.y_groups == grp)
+.x_brk1 <- .x_range[2] + 0.20 * diff(.x_range)   # ATRXdel vs ATRXwtMYCNwt
+.x_brk2 <- .x_range[2] + 0.55 * diff(.x_range)   # ATRXdel vs MYCNamp
+.x_tick  <- 0.06 * diff(.x_range)
+
+.make_cmp <- function(grp2, x_brk) {
+  sub <- dplyr::filter(.nb_stats, grp2 == !!grp2) %>%
+    dplyr::arrange(factor(gene, levels = CD6_NB_GENES))
+  lbl <- paste(paste0(sub$gene, ": ", sub$signif, " (FC=", sub$log2FC, ")"),
+               collapse = "\n")
+  y1  <- .y_pos("ATRXdel")
+  y2  <- .y_pos(grp2)
+  list(
+    ggplot2::geom_segment(data = data.frame(x_brk = x_brk, y1 = y1, y2 = y2),
+      ggplot2::aes(y = y1, yend = y2), x = x_brk, xend = x_brk,
+      inherit.aes = FALSE, color = "black", linewidth = 0.4),
+    ggplot2::geom_text(data = data.frame(x_brk = x_brk + .x_tick,
+                                          y_mid = (y1 + y2) / 2, label = lbl),
+      ggplot2::aes(y = y_mid, label = label), x = x_brk + .x_tick,
+      inherit.aes = FALSE, hjust = 0, size = 2.2, lineheight = 0.9)
+  )
+}
+
+p_cd6lig_dot <- p_cd6lig_dot +
+  .make_cmp("ATRXwtMYCNwt", .x_brk1) +
+  .make_cmp("MYCNamp",       .x_brk2) +
+  ggplot2::coord_cartesian(clip = "off") +
+  ggplot2::theme(plot.margin = ggplot2::margin(t = 5, r = 120, b = 5, l = 5))
+
+p_cd6lig_dot
+
+ggsave(paste0(fig_out, "CD6ligands_NB_dotplot.pdf"),
+       p_cd6lig_dot, width = 6, height = 4, device = cairo_pdf)
+```
+
+# Figure 4C — ALCAM expression in NB tumor cells (ATRXdel)
+
+```{r alcam-nb-violin, fig.height=3, fig.width=2.5}
+p_alcam_vio <- do_ViolinPlot(
+  ALL_NB,
+  features     = "ALCAM",
+  group.by     = "group",
+  colors.use   = COLOR_CODE_GROUP,
+  legend.title = "",
+  font.size    = 9,
+  plot_boxplot = FALSE
+)
+p_alcam_vio
+
+ggsave(paste0(fig_out, "ALCAM_NB_violin.pdf"),
+       p_alcam_vio, width = 2.5, height = 3, device = cairo_pdf)
+```
+
+# Figure 4D — ALCAM-binding partners on NK subsets (ctrl vs ATRXdel)
+
+**Genes: CD6, LGALS1, LGALS8, LILRB4, L1CAM, S100B**
+**Layout: one panel per gene; x = group (ctrl vs ATRXdel), facet by NK subset within each panel**
+
+```{r alcamlig-nk-violin, fig.height=10, fig.width=8}
+p_alcamlig_vio <- VlnPlot(
+  ALL_NK_2,
+  features = ALCAM_NK_GENES,
+  split.by = "group",
+  group.by = "predicted_NK_type_de.n350",
+  cols     = COLOR_CODE_GROUP,
+  log      = TRUE,
+  pt.size  = 0
+) & ggplot2::coord_cartesian(ylim = c(NA, 5))
+p_alcamlig_vio
+
+ggsave(paste0(fig_out, "ALCAMligands_NK_violin.pdf"),
+       p_alcamlig_vio, width = 8, height = 10, device = cairo_pdf)
+```
+
+```{r alcamlig-nk-allgroups-violin, fig.height=8, fig.width=8}
+# Same layout as alcamlig-nk-violin but including all groups (not only ctrl + ATRXdel)
+p_alcamlig_vio_all <- VlnPlot(
+  ALL_NK_all,
+  features = ALCAM_NK_GENES,
+  split.by = "group",
+  group.by = "predicted_NK_type_de.n350",
+  cols     = COLOR_CODE_GROUP,
+  log      = TRUE,
+  pt.size  = 0
+) & ggplot2::coord_cartesian(ylim = c(NA, 5))
+p_alcamlig_vio_all
+
+ggsave(paste0(fig_out, "ALCAMligands_NK_allgroups_violin.pdf"),
+       p_alcamlig_vio_all, width = 8, height = 8, device = cairo_pdf)
+```
+
+```{r alcamlig-nk-allgroups-violin-2, fig.height=8, fig.width=8}
+# Same layout as alcamlig-nk-violin but including all groups (not only ctrl + ATRXdel)
+p_alcamlig_vio_all <- VlnPlot(
+  ALL_NK_all,
+  features     = ALCAM_NK_GENES,
+  group.by     = "group",
+  cols         = COLOR_CODE_GROUP,
+  log          = TRUE,
+  pt.size      = 0
+) & ggplot2::coord_cartesian(ylim = c(NA, 5))
+p_alcamlig_vio_all
+
+ggsave(paste0(fig_out, "ALCAMligands_NK_allgroups_violin_perGroup.pdf"),
+       p_alcamlig_vio_all, width = 8, height = 8, device = cairo_pdf)
+```
+
+```{r alcamlig-nk-group-stats}
+# BH-adjusted Wilcoxon (control vs ATRXdel) per gene, across all NK cells (group level)
+# p-values BH-adjusted globally across all genes
+.alcamlig_nk_group_stats <- Seurat::FetchData(
+  ALL_NK_2,
+  vars  = c(ALCAM_NK_GENES, "group"),
+  layer = "data"
+) %>%
+  tidyr::pivot_longer(cols = dplyr::all_of(ALCAM_NK_GENES),
+                      names_to = "gene", values_to = "expr") %>%
+  dplyr::group_by(gene) %>%
+  dplyr::group_modify(~ {
+    dd <- .x
+    if (length(unique(dd$group)) < 2)
+      return(data.frame(log2FC = NA_real_, p = NA_real_))
+    w <- tryCatch(
+      rstatix::wilcox_test(dd, expr ~ group, exact = FALSE),
+      error = function(e) NULL
+    )
+    fc <- log2((mean(dd$expr[dd$group == "ATRXdel"]) + 0.01) /
+                (mean(dd$expr[dd$group == "control"])  + 0.01))
+    if (is.null(w)) return(data.frame(log2FC = round(fc, 3), p = NA_real_))
+    data.frame(log2FC = round(fc, 3), p = w$p[1])
+  }) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    p.adj        = p.adjust(p, method = "BH"),
+    p.adj.signif = dplyr::case_when(
+      is.na(p.adj)   ~ NA_character_,
+      p.adj < 0.0001 ~ "****",
+      p.adj < 0.001  ~ "***",
+      p.adj < 0.01   ~ "**",
+      p.adj < 0.05   ~ "*",
+      TRUE           ~ "ns"
+    )
+  ) %>%
+  dplyr::arrange(gene)
+
+knitr::kable(.alcamlig_nk_group_stats, digits = 4,
+             caption = "BH-adjusted Wilcoxon: control vs ATRXdel — ALCAM-binding NK genes (all NK cells pooled)")
+```
+
+```{r alcamlig-nk-stats}
+# BH-adjusted Wilcoxon (control vs ATRXdel) per gene × NK subset
+# p-values BH-adjusted globally across all gene×subset combinations
+.alcamlig_nk_stats <- Seurat::FetchData(
+  ALL_NK_2,
+  vars  = c(ALCAM_NK_GENES, "group", "predicted_NK_type_de.n350"),
+  layer = "data"
+) %>%
+  tidyr::pivot_longer(cols = dplyr::all_of(ALCAM_NK_GENES),
+                      names_to = "gene", values_to = "expr") %>%
+  dplyr::group_by(gene, predicted_NK_type_de.n350) %>%
+  dplyr::group_modify(~ {
+    dd <- .x
+    if (length(unique(dd$group)) < 2)
+      return(data.frame(log2FC = NA_real_, p = NA_real_))
+    w <- tryCatch(
+      rstatix::wilcox_test(dd, expr ~ group, exact = FALSE),
+      error = function(e) NULL
+    )
+    fc <- log2((mean(dd$expr[dd$group == "ATRXdel"]) + 0.01) /
+                (mean(dd$expr[dd$group == "control"])  + 0.01))
+    if (is.null(w)) return(data.frame(log2FC = round(fc, 3), p = NA_real_))
+    data.frame(log2FC = round(fc, 3), p = w$p[1])
+  }) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    p.adj        = p.adjust(p, method = "BH"),
+    p.adj.signif = dplyr::case_when(
+      is.na(p.adj)   ~ NA_character_,
+      p.adj < 0.0001 ~ "****",
+      p.adj < 0.001  ~ "***",
+      p.adj < 0.01   ~ "**",
+      p.adj < 0.05   ~ "*",
+      TRUE           ~ "ns"
+    )
+  ) %>%
+  dplyr::rename(NK_subset = predicted_NK_type_de.n350) %>%
+  dplyr::arrange(gene, NK_subset)
+
+knitr::kable(.alcamlig_nk_stats, digits = 4,
+             caption = "BH-adjusted Wilcoxon: control vs ATRXdel — ALCAM-binding NK genes per NK subset")
+```
+
+```{r alcamlig-nk-dot, fig.height=3, fig.width=3}
+# x = group (control vs ATRXdel), y = gene, color = avg expression, size = % expressing
+p_alcamlig_dot <- do_DotPlot(
+  ALL_NK_2,
+  features     = ALCAM_NK_GENES,
+  group.by     = "group",
+  dot_border   = FALSE,
+  font.size    = 9,
+  dot.scale    = 10,
+  use_viridis  = TRUE,
+  viridis.palette = "A",
+  viridis.direction = -1,
+  colors.use   = GRADIENT_COLORS_v2
+)
+p_alcamlig_dot
+
+ggsave(paste0(fig_out, "ALCAMligands_NK_dotplot.pdf"),
+       p_alcamlig_dot, width = 3, height = 3, device = cairo_pdf)
+```
+
+
+# Figure 4E — ALCAM + CD6 on all cell types (ctrl vs ATRXdel)
+
+**Stacked: ALCAM on top, CD6 on bottom**
+
+```{r alcam-cd6-allt-violin, fig.height=7, fig.width=18}
+.vio_gene <- function(gene) {
+  Seurat::VlnPlot(
+    fetahu_2,
+    features = gene,
+    group.by = "celltype",
+    split.by = "group",
+    cols     = unname(COLOR_CODE_GROUP[c("control", "ATRXdel")]),
+    pt.size  = 0,
+    log = TRUE
+  ) + ggplot2::ggtitle(gene) +
+    ggplot2::theme(plot.title = ggplot2::element_text(face = "italic"))
+}
+
+p_stacked_vio <- patchwork::wrap_plots(
+  .vio_gene("ALCAM"),
+  .vio_gene("CD6"),
+  ncol = 1
+)
+p_stacked_vio
+
+ggsave(paste0(fig_out, "ALCAM_CD6_allCelltypes_violin.pdf"),
+       p_stacked_vio, width = 18, height = 7, device = cairo_pdf)
+```
+
+```{r alcam-cd6-allt-allgroups-violin, fig.height=7, fig.width=18}
+.vio_gene_all <- function(gene) {
+  Seurat::VlnPlot(
+    fetahu_all,
+    features = gene,
+    group.by = "celltype",
+    split.by = "group",
+    cols     = unname(COLOR_CODE_GROUP),
+    pt.size  = 0,
+    log      = TRUE
+  ) + ggplot2::ggtitle(gene) +
+    ggplot2::theme(plot.title = ggplot2::element_text(face = "italic")
+}
+
+p_stacked_vio_all <- patchwork::wrap_plots(
+  .vio_gene_all("ALCAM"),
+  .vio_gene_all("CD6"),
+  ncol = 1
+)
+p_stacked_vio_all
+
+ggsave(paste0(fig_out, "ALCAM_CD6_allCelltypes_allgroups_violin.pdf"),
+       p_stacked_vio_all, width = 18, height = 7, device = cairo_pdf)
+```
+
+```{r alcam-cd6-allt-stats}
+# BH-adjusted Wilcoxon (control vs ATRXdel) per gene × cell type
+# p-values BH-adjusted globally across all gene×celltype combinations
+.allt_stats <- Seurat::FetchData(
+  fetahu_2,
+  vars  = c("ALCAM", "CD6", "group", "celltype"),
+  layer = "data"
+) %>%
+  tidyr::pivot_longer(cols = c("ALCAM", "CD6"),
+                      names_to = "gene", values_to = "expr") %>%
+  dplyr::group_by(gene, celltype) %>%
+  dplyr::group_modify(~ {
+    dd <- .x
+    if (length(unique(dd$group)) < 2)
+      return(data.frame(log2FC = NA_real_, p = NA_real_))
+    w <- tryCatch(
+      rstatix::wilcox_test(dd, expr ~ group, exact = FALSE),
+      error = function(e) NULL
+    )
+    fc <- log2((mean(dd$expr[dd$group == "ATRXdel"]) + 0.01) /
+                (mean(dd$expr[dd$group == "control"])  + 0.01))
+    if (is.null(w)) return(data.frame(log2FC = round(fc, 3), p = NA_real_))
+    data.frame(log2FC = round(fc, 3), p = w$p[1])
+  }) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    p.adj        = p.adjust(p, method = "BH"),
+    p.adj.signif = dplyr::case_when(
+      is.na(p.adj)   ~ NA_character_,
+      p.adj < 0.0001 ~ "****",
+      p.adj < 0.001  ~ "***",
+      p.adj < 0.01   ~ "**",
+      p.adj < 0.05   ~ "*",
+      TRUE           ~ "ns"
+    )
+  ) %>%
+  dplyr::arrange(gene, celltype)
+
+knitr::kable(.allt_stats, digits = 4,
+             caption = "BH-adjusted Wilcoxon: control vs ATRXdel — ALCAM & CD6 per cell type (atlas)")
+```
+
+```{r alcam-cd6-allt-dot, fig.height=5, fig.width=10}
+p_alcam_dot <- do_DotPlot(
+  fetahu_2_nb,
+  features   = "ALCAM",
+  group.by   = "group_celltype",
+  dot_border = FALSE,
+  font.size  = 8,
+  flip       = TRUE,
+  dot.scale  = 6,
+  use_viridis = TRUE,
+  viridis.palette = "A",
+  viridis.direction = -1
+)
+
+p_cd6_dot <- do_DotPlot(
+  fetahu_2_nb,
+  features   = "CD6",
+  group.by   = "group_celltype",
+  dot_border = FALSE,
+  font.size  = 8,
+  flip       = TRUE,
+  dot.scale  = 6,
+  use_viridis = TRUE,
+  viridis.palette = "A",
+  viridis.direction = -1
+)
+
+p_stacked_dot <- patchwork::wrap_plots(p_alcam_dot, p_cd6_dot, nrow = 2)
+p_stacked_dot
+
+ggsave(paste0(fig_out, "ALCAM_CD6_allCelltypes_dotplot.pdf"),
+       p_stacked_dot, width = 10, height = 5, device = cairo_pdf)
+```
+
+# SessionInfo
+
+```{r}
+sessionInfo()
+```

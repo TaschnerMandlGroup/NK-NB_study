@@ -72,20 +72,6 @@ suppressPackageStartupMessages({
 ```
 
 ```{r}
-pub_theme <- theme_classic(base_size = 9) +
-  theme(
-    axis.line        = element_line(linewidth = 0.4, color = "black"),
-    axis.ticks       = element_line(linewidth = 0.4, color = "black"),
-    axis.text        = element_text(size = 8, color = "black"),
-    axis.title       = element_text(size = 9, color = "black"),
-    plot.title       = element_text(size = 10, face = "bold"),
-    plot.subtitle    = element_text(size = 8),
-    legend.key.size  = unit(3, "mm"),
-    legend.text      = element_text(size = 8),
-    legend.title     = element_text(size = 9),
-    strip.background = element_blank(),
-    strip.text       = element_text(size = 9)
-  )
 theme_set(pub_theme)
 
 # Cell-line colors (map onto project palette where logical)
@@ -695,392 +681,298 @@ if (!is.null(gsea_go_bp) && nrow(gsea_go_bp@result) > 0) {
 }
 ```
 
-# ___TF footprinting: TOBIAS (ATRXdel vs ATRXwt — DMSO)___
+# ___TF footprinting: DeepTools (ATRXdel vs ATRXwt — DMSO)___
 
-TOBIAS (Transcription Factor Occupancy prediction By Investigation of ATAC-seq Signal)
-predicts differential TF binding between conditions from ATAC-seq data.
-Pipeline: ScoreBigwig (footprint scores from bigWig) → BINDetect (ATRXdel vs ATRXwt comparison).
-Only bigWig files are available (no BAMs), so ATACorrect is skipped.
-Conditions compared: E6 | ATRXdel vs. p53 | ATRXwt (DMSO only).
-TFs analysed: the `TFs` vector defined in `00_NK_paper_setup.R`.
+Aggregate footprint profiles are computed with:
 
-```{r tobias-setup}
-suppressPackageStartupMessages(library(TFBSTools))
-suppressPackageStartupMessages(library(JASPAR2020))
+1. **motifmatchr** (R): scan consensus peaks for JASPAR2020 motifs → per-TF site BED files
+2. **DeepTools `computeMatrix reference-point`**: extract bigWig signal ±250 bp around each motif centre
+3. **DeepTools `plotProfile --outFileNameData`**: export per-sample average signal profiles
+4. **ggplot2** (R): overlay ATRXdel vs ATRXwt mean ± SEM with pub_theme
 
-tobias_dir <- paste0(params$out, "tobias/")
-motif_dir  <- file.path(tobias_dir, "motifs")
-score_dir  <- file.path(tobias_dir, "ScoreBigwig")
-detect_dir <- file.path(tobias_dir, "BINDetect")
-dir.create(motif_dir,  showWarnings = FALSE, recursive = TRUE)
-dir.create(score_dir,  showWarnings = FALSE, recursive = TRUE)
-dir.create(detect_dir, showWarnings = FALSE, recursive = TRUE)
+Conditions: E6 (ATRXdel) vs p53 (ATRXwt) — DMSO replicates only.
+TFs: `TFs` vector from `00_NK_paper_setup.R`.
 
-# Resolve genome FASTA (required by BINDetect)
-genome_candidates <- c(
-  "/home/rstudio/mnt_resources/genome/hg38/hg38.fa",
-  "/home/rstudio/mnt_resources/genome/hg38/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna",
-  "/home/rstudio/mnt_resources/hg38/hg38.fa"
-)
-genome_fa <- genome_candidates[file.exists(genome_candidates)][1]
-if (is.na(genome_fa)) stop("hg38 FASTA not found — set genome_fa manually.")
-cat("Genome FASTA:", genome_fa, "\n")
+## ___Setup___
 
-# Consensus peaks as BED (built earlier in this script)
-peaks_bed <- file.path(tobias_dir, "consensus_peaks.bed")
-peaks_df  <- data.frame(
-  chr   = as.character(seqnames(consensus_peaks)),
-  start = start(consensus_peaks) - 1L,   # BED is 0-based
-  end   = end(consensus_peaks),
-  name  = consensus_peaks$peak_id
-)
-write.table(peaks_df, peaks_bed, sep = "\t", row.names = FALSE,
-            col.names = FALSE, quote = FALSE)
-cat("Peaks BED written:", nrow(peaks_df), "peaks →", peaks_bed, "\n")
+```{r fp-setup}
+suppressPackageStartupMessages({
+  library(motifmatchr)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  library(TFBSTools)
+  library(JASPAR2020)
+  library(jsonlite)
+})
 
-# TFs of interest (from 00_NK_paper_setup.R), deduplicated
-TFs_tobias <- unique(TFs)
-cat("TFs to analyse:", paste(TFs_tobias, collapse = ", "), "\n")
+ft_dir      <- file.path(params$out, "footprinting")
+ft_bed_dir  <- file.path(ft_dir, "motif_beds")
+ft_mat_dir  <- file.path(ft_dir, "matrices")
+ft_prof_dir <- file.path(ft_dir, "profiles")
+ft_fig_dir  <- file.path(params$out, "figures")
+for (d in c(ft_bed_dir, ft_mat_dir, ft_prof_dir)) {
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+}
+
+dt_ok <- Sys.which("computeMatrix") != ""
+if (!dt_ok) message("computeMatrix (deepTools) not found — install via: pip install deeptools")
+
+TFs_fp <- unique(TFs)
+cat("TFs of interest:", paste(TFs_fp, collapse = ", "), "\n")
+
+# DMSO bigWig files: ATRXdel (E6) first, then ATRXwt (p53)
+dmso_meta   <- meta_bw[meta_bw$cell_line %in% c("E6", "p53") &
+                        meta_bw$treatment == "DMSO", ]
+dmso_meta   <- dmso_meta[order(dmso_meta$ATRX), ]   # ATRXdel < ATRXwt alphabetically
+bws_del     <- dmso_meta$file[dmso_meta$cell_line == "E6"]
+bws_wt      <- dmso_meta$file[dmso_meta$cell_line == "p53"]
+bws_all     <- c(bws_del, bws_wt)
+labels_all  <- c(dmso_meta$sample_id[dmso_meta$cell_line == "E6"],
+                 dmso_meta$sample_id[dmso_meta$cell_line == "p53"])
+n_del <- length(bws_del)
+n_wt  <- length(bws_wt)
+cat(sprintf("BigWig files: ATRXdel n=%d, ATRXwt n=%d\n", n_del, n_wt))
+
+FP_WINDOW <- 250L   # bp upstream/downstream of motif centre
+FP_BINSIZE <- 10L   # bp per bin in computeMatrix
 ```
 
-## ___Fetch JASPAR motifs for TFs of interest___
+## ___Motif scanning (motifmatchr)___
 
-```{r tobias-motifs}
-# Query JASPAR2020 CORE vertebrates for the TFs of interest
-opts <- list(collection = "CORE", tax_group = "vertebrates", all_versions = FALSE)
+```{r fp-motifs}
+# Fetch JASPAR2020 CORE vertebrate PWMs for TFs of interest
+opts    <- list(collection = "CORE", tax_group = "vertebrates", all_versions = FALSE)
 pfm_all <- TFBSTools::getMatrixSet(JASPAR2020, opts = opts)
 
-# Filter to TFs of interest (case-insensitive match on TF name)
-tf_names_upper <- toupper(TFs_tobias)
-keep_idx <- sapply(pfm_all, function(m) toupper(TFBSTools::name(m)) %in% tf_names_upper)
+tf_upper <- toupper(TFs_fp)
+keep_idx <- sapply(pfm_all, function(m) toupper(TFBSTools::name(m)) %in% tf_upper)
 pfm_tfs  <- pfm_all[keep_idx]
 
-cat("Motifs retrieved for", length(pfm_tfs), "of", length(TFs_tobias),
-    "requested TFs\n")
+cat("Motifs retrieved for", length(pfm_tfs), "of", length(TFs_fp), "TFs\n")
 if (length(pfm_tfs) > 0)
   cat("Matched:", paste(unique(sapply(pfm_tfs, TFBSTools::name)), collapse = ", "), "\n")
 
-# Write filtered motifs as JASPAR format for TOBIAS
-# (TFBSTools::writeJASPARMatrix is not exported; write manually)
-motif_file <- file.path(motif_dir, "NK_TFs_JASPAR2020.jaspar")
-write_jaspar <- function(pfm_list, path) {
-  lines <- unlist(lapply(pfm_list, function(m) {
-    mat <- TFBSTools::Matrix(m)
-    fmt_row <- function(nuc) {
-      vals <- formatC(mat[nuc, ], width = 6, format = "f", digits = 2)
-      paste0(nuc, " [", paste(vals, collapse = ""), "]")
-    }
-    c(paste0(">", TFBSTools::ID(m), "\t", TFBSTools::name(m)),
-      fmt_row("A"), fmt_row("C"), fmt_row("G"), fmt_row("T"), "")
-  }))
-  writeLines(lines, path)
-}
-write_jaspar(pfm_tfs, motif_file)
-cat("Motif file:", motif_file, "\n")
-```
+# Scan consensus peaks for motif occurrences
+motif_hits <- motifmatchr::matchMotifs(
+  pwms    = pfm_tfs,
+  subject = consensus_peaks,
+  genome  = BSgenome.Hsapiens.UCSC.hg38,
+  out     = "positions",
+  p.cutoff = 5e-5
+)
 
-## ___ScoreBigwig: footprint scores___
-
-```{bash}
-pip install tobias
-```
-
-```{r tobias-scorebigwig}
-tobias_ok <- Sys.which("TOBIAS") != ""
-if (!tobias_ok) message("TOBIAS not found in PATH — install via: pip install tobias")
-
-# Use raw bigWig files directly (DMSO E6 + p53 only)
-input_bws <- meta_bw$file[meta_bw$cell_line %in% c("E6", "p53") &
-                           meta_bw$treatment == "DMSO"]
-cat("BigWig files for scoring:", length(input_bws), "\n")
-print(basename(input_bws))
-
-if (tobias_ok) {
-
-  score_cmds <- vapply(input_bws, function(bw) {
-    sid   <- gsub("(_corrected)?\\.bw$|.*[/]", "", bw)
-    out   <- file.path(score_dir, paste0(sid, "_footprints.bw"))
-    sprintf(
-      "TOBIAS ScoreBigwig --signal %s --regions %s --output %s --cores 4",
-      bw, peaks_bed, out
-    )
-  }, character(1))
-
-  for (cmd in score_cmds) {
-    cat("Running:", cmd, "\n")
-    ret <- system(cmd)
-    if (ret != 0) message("ScoreBigwig failed: ", cmd)
+# Write per-TF BED files of motif match centres (0-based, required by DeepTools)
+tf_beds <- list()
+for (i in seq_along(motif_hits)) {
+  tf_name <- TFBSTools::name(pfm_tfs[[i]])
+  hits_gr <- motif_hits[[i]]
+  if (length(hits_gr) == 0) {
+    message("No motif sites found for: ", tf_name); next
   }
-}
-```
-
-## ___BINDetect: ATRXdel vs ATRXwt differential TF binding___
-
-BINDetect compares per-condition footprint score distributions at each motif site
-and returns a differential binding score and p-value for every TF.
-Signals must be ordered condition-by-condition; `--n-signals` tells TOBIAS how many
-replicates belong to each condition.
-
-```{r tobias-bindetect}
-if (tobias_ok) {
-  # Re-scan scored footprint bigWigs
-  all_score_bws <- list.files(score_dir, pattern = "_footprints\\.bw$", full.names = TRUE)
-
-  bw_to_atrx <- function(path) {
-    fname <- basename(path)
-    if (grepl("^E6",  fname)) return("ATRXdel")
-    if (grepl("^p53", fname)) return("ATRXwt")
-    NA_character_
-  }
-  atrx_labels <- sapply(all_score_bws, bw_to_atrx)
-  all_score_bws <- all_score_bws[!is.na(atrx_labels)]
-  atrx_labels   <- atrx_labels[!is.na(atrx_labels)]
-
-  # Order: ATRXdel replicates first, then ATRXwt — required by BINDetect
-  ord        <- order(atrx_labels)          # "ATRXdel" < "ATRXwt" alphabetically
-  all_score_bws <- all_score_bws[ord]
-  atrx_labels   <- atrx_labels[ord]
-
-  n_del <- sum(atrx_labels == "ATRXdel")
-  n_wt  <- sum(atrx_labels == "ATRXwt")
-  cat(sprintf("BINDetect conditions: ATRXdel (n=%d) vs ATRXwt (n=%d)\n", n_del, n_wt))
-
-  bindetect_cmd <- sprintf(
-    paste("TOBIAS BINDetect",
-          "--motifs %s",
-          "--signals %s",
-          "--genome %s",
-          "--peaks %s",
-          "--outdir %s",
-          "--cond-names ATRXdel ATRXwt",
-          "--n-signals %d %d",
-          "--cores 4"),
-    motif_file,
-    paste(all_score_bws, collapse = " "),
-    genome_fa, peaks_bed, detect_dir,
-    n_del, n_wt
+  centres <- data.frame(
+    chr    = as.character(seqnames(hits_gr)),
+    start  = as.integer(start(hits_gr) + floor(width(hits_gr) / 2)) - 1L,   # 0-based
+    end    = as.integer(start(hits_gr) + floor(width(hits_gr) / 2)),
+    name   = paste0(tf_name, "_", seq_along(hits_gr)),
+    score  = 0,
+    strand = as.character(strand(hits_gr))
   )
-
-  cat("Running BINDetect:\n", bindetect_cmd, "\n")
-  ret <- system(bindetect_cmd)
-  if (ret != 0) message("BINDetect failed — check TOBIAS log in ", detect_dir)
-
-  # Make score bigwig paths available to downstream chunks
-  score_bws_del <- all_score_bws[atrx_labels == "ATRXdel"]
-  score_bws_wt  <- all_score_bws[atrx_labels == "ATRXwt"]
+  bed_path <- file.path(ft_bed_dir, paste0(tf_name, "_centres.bed"))
+  write.table(centres, bed_path, sep = "\t", row.names = FALSE,
+              col.names = FALSE, quote = FALSE)
+  tf_beds[[tf_name]] <- bed_path
+  cat(tf_name, ":", nrow(centres), "motif sites →", bed_path, "\n")
 }
 ```
 
-## ___Parse and visualise BINDetect results___
+## ___computeMatrix: signal around motif centres___
 
-```{r tobias-results, fig.height=5, fig.width=5}
-bindetect_result_file <- file.path(detect_dir, "bindetect_results.txt")
-
-if (!file.exists(bindetect_result_file)) {
-  message("BINDetect results not found at: ", bindetect_result_file,
-          "\n  — run the TOBIAS chunks above first.")
-} else {
-  bd <- read.table(bindetect_result_file, header = TRUE, sep = "\t",
-                   stringsAsFactors = FALSE)
-  cat("BINDetect output:", nrow(bd), "TF motifs ×", ncol(bd), "columns\n")
-
-  # Identify the change-score column: typically "<condA>_<condB>_change"
-  change_col <- grep("ATRXdel.*ATRXwt.*change|change", colnames(bd),
-                     value = TRUE, ignore.case = TRUE)[1]
-  pval_col   <- grep("pvalue",   colnames(bd), value = TRUE, ignore.case = TRUE)[1]
-  cat("Using change column:", change_col, "| p-value column:", pval_col, "\n")
-
-  bd <- bd %>%
-    dplyr::rename(tf_name = output_prefix) %>%
-    dplyr::mutate(
-      change    = .data[[change_col]],
-      pval      = .data[[pval_col]],
-      log10p    = -log10(pval + 1e-300),
-      sig       = pval < 0.05 & abs(change) > 0.1,
-      direction = case_when(
-        sig & change > 0 ~ "more bound ATRXdel",
-        sig & change < 0 ~ "more bound ATRXwt",
-        TRUE             ~ "NS"
-      ),
-      label     = ifelse(toupper(tf_name) %in% toupper(TFs_tobias), tf_name, NA)
+```{r fp-computematrix}
+if (dt_ok) {
+  for (tf in names(tf_beds)) {
+    mat_out <- file.path(ft_mat_dir, paste0(tf, "_matrix.gz"))
+    if (file.exists(mat_out)) {
+      cat(tf, ": matrix exists — skipping\n"); next
+    }
+    cmd <- paste(
+      "computeMatrix reference-point",
+      "--referencePoint center",
+      sprintf("-b %d -a %d --binSize %d", FP_WINDOW, FP_WINDOW, FP_BINSIZE),
+      "--missingDataAsZero --skipZeros",
+      "-S", paste(bws_all, collapse = " "),
+      "-R", tf_beds[[tf]],
+      "-o", mat_out,
+      "--samplesLabel", paste(labels_all, collapse = " "),
+      "-p 4"
     )
-
-  p_bindetect <- ggplot(bd, aes(x = change, y = log10p, color = direction)) +
-    geom_point(size = 1.2, alpha = 0.7) +
-    ggrepel::geom_text_repel(
-      aes(label = label), size = 2.5, max.overlaps = 30,
-      na.rm = TRUE, segment.size = 0.3
-    ) +
-    geom_vline(xintercept = c(-0.1, 0.1), linetype = "dashed",
-               color = "gray60", linewidth = 0.35) +
-    geom_hline(yintercept = -log10(0.05), linetype = "dashed",
-               color = "gray60", linewidth = 0.35) +
-    scale_color_manual(values = c(
-      "more bound ATRXdel" = COL_ATRX["ATRXdel"],
-      "more bound ATRXwt"  = COL_ATRX["ATRXwt"],
-      "NS"                 = "gray80"
-    )) +
-    labs(
-      title    = "TF footprinting: ATRXdel vs ATRXwt (TOBIAS BINDetect)",
-      subtitle = "Positive change = more bound in ATRXdel",
-      x        = "Differential binding score (ATRXdel − ATRXwt)",
-      y        = "-log10 (p-value)",
-      color    = NULL
-    ) +
-    pub_theme + theme(legend.position = "top")
-
-  p_bindetect
-  pdf(paste0(params$out, "figures/bulkATAC_TOBIAS_BINDetect_volcano.pdf"),
-      height = 5, width = 5, useDingbats = FALSE)
-  print(p_bindetect); dev.off()
-
-  # Summary table: TFs of interest only
-  bd_tfs <- bd %>%
-    dplyr::filter(toupper(tf_name) %in% toupper(TFs_tobias)) %>%
-    dplyr::select(tf_name, change, pval, direction) %>%
-    dplyr::arrange(pval)
-
-  cat("\nBINDetect results for TFs of interest:\n")
-  print(bd_tfs)
-
-  write.table(bd_tfs, sep = "\t", row.names = FALSE, quote = FALSE,
-              file = paste0(params$out,
-                            "tables/bulkATAC_TOBIAS_BINDetect_TFs_2026-06-25.csv"))
+    cat("Running computeMatrix:", tf, "\n")
+    ret <- system(cmd)
+    if (ret != 0) message("computeMatrix failed for: ", tf)
+  }
 }
 ```
 
-## ___ATRXdel vs ATRXwt: TF binding comparison for TFs of interest___
+## ___plotProfile: aggregate footprint PDFs___
 
-```{r tobias-compare-lollipop, fig.height=4, fig.width=5}
-if (exists("bd") && nrow(bd) > 0) {
-  bd_tfs <- bd %>%
-    dplyr::filter(toupper(tf_name) %in% toupper(TFs_tobias)) %>%
-    dplyr::mutate(
-      tf_label  = tf_name,
-      tf_label  = factor(tf_label, levels = tf_label[order(change)]),
-      fill_col  = case_when(
-        sig & change > 0 ~ "ATRXdel",
-        sig & change < 0 ~ "ATRXwt",
-        TRUE             ~ "NS"
-      ),
-      sig_label = ifelse(pval < 0.001, "***",
-                  ifelse(pval < 0.01,  "**",
-                  ifelse(pval < 0.05,  "*", "")))
+```{r fp-plotprofile}
+# Colour string: n_del replicates ATRXdel colour + n_wt replicates ATRXwt colour
+col_del <- unname(COL_ATRX["ATRXdel"])
+col_wt  <- unname(COL_ATRX["ATRXwt"])
+colors_str <- paste(c(rep(col_del, n_del), rep(col_wt, n_wt)), collapse = " ")
+
+if (dt_ok) {
+  for (tf in names(tf_beds)) {
+    mat_out  <- file.path(ft_mat_dir,  paste0(tf, "_matrix.gz"))
+    prof_pdf <- file.path(ft_prof_dir, paste0(tf, "_profile.pdf"))
+    prof_tab <- file.path(ft_prof_dir, paste0(tf, "_profile_data.tab"))
+    if (!file.exists(mat_out)) next
+
+    cmd <- paste(
+      "plotProfile",
+      "-m", mat_out,
+      "--perGroup",
+      "--colors", colors_str,
+      sprintf("--plotTitle '%s footprint: ATRXdel vs ATRXwt'", tf),
+      "--yAxisLabel 'Mean ATAC signal'",
+      sprintf("--xAxisLabel 'Distance from motif centre (bp)'"),
+      "--outFileName", prof_pdf,
+      "--outFileNameData", prof_tab,
+      "--dpi 150"
     )
+    ret <- system(cmd)
+    if (ret != 0) message("plotProfile failed for: ", tf)
+  }
+  cat("Footprint profile PDFs:", ft_prof_dir, "\n")
+}
+```
 
-  p_lollipop <- ggplot(bd_tfs, aes(x = change, y = tf_label, color = fill_col)) +
-    geom_vline(xintercept = 0, linetype = "solid", color = "gray40", linewidth = 0.4) +
-    geom_vline(xintercept = c(-0.1, 0.1), linetype = "dashed",
-               color = "gray70", linewidth = 0.3) +
-    geom_segment(aes(x = 0, xend = change, y = tf_label, yend = tf_label),
-                 linewidth = 0.6) +
-    geom_point(size = 3) +
-    geom_text(aes(label = sig_label),
-              hjust = ifelse(bd_tfs$change >= 0, -0.4, 1.4),
-              size = 3, color = "black") +
-    scale_color_manual(values = c(
-      "ATRXdel" = COL_ATRX["ATRXdel"],
-      "ATRXwt"  = COL_ATRX["ATRXwt"],
-      "NS"      = "gray70"
-    ), name = "More bound in") +
+## ___ggplot2: footprint profiles per TF___
+
+Parse the computeMatrix output (gzipped; JSON header + tab-delimited data) and plot
+mean ± SEM per condition in ggplot2.
+
+```{r fp-parse-matrix}
+parse_fp_matrix <- function(matrix_gz) {
+  con   <- gzfile(matrix_gz, "r")
+  lines <- readLines(con)
+  close(con)
+
+  hdr <- jsonlite::fromJSON(sub("^@", "", lines[1]))
+  n_samples  <- length(hdr$sample_labels)
+  upstream   <- hdr[["upstream"]]
+  downstream <- hdr[["downstream"]]
+  bin_sz     <- hdr[["bin size"]]
+  n_bins     <- (upstream + downstream) / bin_sz
+  # Bin centres relative to motif (negative = upstream)
+  bin_pos    <- seq(-upstream + bin_sz / 2, downstream - bin_sz / 2, by = bin_sz)
+
+  data_lines <- lines[-1]
+  data_lines <- data_lines[nzchar(data_lines)]
+  mat <- do.call(rbind, lapply(data_lines, function(l) {
+    parts <- strsplit(l, "\t")[[1]]
+    suppressWarnings(as.numeric(parts[7:length(parts)]))  # cols 1-6: chr/start/end/name/score/strand
+  }))
+
+  if (ncol(mat) != n_bins * n_samples) {
+    message("Unexpected matrix dimensions: ", nrow(mat), " x ", ncol(mat)); return(NULL)
+  }
+
+  # Per-sample mean signal per bin → named list
+  sample_means <- lapply(seq_len(n_samples), function(i) {
+    cols <- ((i - 1L) * n_bins + 1L):(i * n_bins)
+    colMeans(mat[, cols, drop = FALSE], na.rm = TRUE)
+  })
+  names(sample_means) <- hdr$sample_labels
+
+  list(bin_pos = bin_pos, sample_means = sample_means,
+       sample_labels = hdr$sample_labels, n_bins = n_bins)
+}
+```
+
+```{r fp-ggplot, fig.height=3, fig.width=4}
+fp_plots <- list()
+
+for (tf in names(tf_beds)) {
+  mat_gz <- file.path(ft_mat_dir, paste0(tf, "_matrix.gz"))
+  if (!file.exists(mat_gz)) next
+
+  pf <- parse_fp_matrix(mat_gz)
+  if (is.null(pf)) next
+
+  del_samps <- pf$sample_labels[seq_len(n_del)]
+  wt_samps  <- pf$sample_labels[seq(n_del + 1L, length(pf$sample_labels))]
+
+  del_mat <- do.call(rbind, pf$sample_means[del_samps])
+  wt_mat  <- do.call(rbind, pf$sample_means[wt_samps])
+
+  long_df <- dplyr::bind_rows(
+    data.frame(
+      position  = pf$bin_pos,
+      mean_sig  = colMeans(del_mat, na.rm = TRUE),
+      sem       = apply(del_mat, 2, sd, na.rm = TRUE) / sqrt(nrow(del_mat)),
+      condition = "ATRXdel"
+    ),
+    data.frame(
+      position  = pf$bin_pos,
+      mean_sig  = colMeans(wt_mat, na.rm = TRUE),
+      sem       = apply(wt_mat, 2, sd, na.rm = TRUE) / sqrt(nrow(wt_mat)),
+      condition = "ATRXwt"
+    )
+  ) %>%
+    dplyr::mutate(condition = factor(condition, levels = c("ATRXdel", "ATRXwt")))
+
+  p <- ggplot(long_df, aes(x = position, y = mean_sig,
+                            color = condition, fill = condition)) +
+    geom_ribbon(aes(ymin = mean_sig - sem, ymax = mean_sig + sem),
+                alpha = 0.15, color = NA) +
+    geom_line(linewidth = 0.7) +
+    geom_vline(xintercept = 0, linetype = "dashed",
+               color = "gray50", linewidth = 0.35) +
+    scale_color_manual(values = COL_ATRX, name = NULL) +
+    scale_fill_manual( values = COL_ATRX, name = NULL) +
+    scale_x_continuous(
+      breaks = c(-FP_WINDOW, -FP_WINDOW %/% 2L, 0L,
+                  FP_WINDOW %/% 2L, FP_WINDOW),
+      labels = c(paste0("-", FP_WINDOW), paste0("-", FP_WINDOW %/% 2L),
+                 "0", as.character(FP_WINDOW %/% 2L), as.character(FP_WINDOW))
+    ) +
     labs(
-      title    = "TF footprint: ATRXdel vs ATRXwt",
-      subtitle = "Differential binding score (BINDetect); * p<0.05, ** p<0.01, *** p<0.001",
-      x        = "Binding score change (ATRXdel − ATRXwt)",
-      y        = NULL
+      title    = paste(tf, "— ATAC footprint"),
+      subtitle = "ATRXdel (E6) vs ATRXwt (p53), DMSO; ribbon = ±SEM",
+      x        = "Distance from motif centre (bp)",
+      y        = "Mean ATAC-seq signal"
     ) +
     pub_theme +
-    theme(legend.position = "top", panel.grid.major.y = element_line(linewidth = 0.2,
-                                                                      color = "gray90"))
+    theme(legend.position = "top")
 
-  p_lollipop
-  pdf(paste0(params$out, "figures/bulkATAC_TOBIAS_TFs_lollipop_ATRXdel-vs-ATRXwt.pdf"),
-      height = 4, width = 5, useDingbats = FALSE)
-  print(p_lollipop); dev.off()
+  fp_plots[[tf]] <- p
+  print(p)
+
+  ggsave(file.path(ft_fig_dir,
+                   paste0("bulkATAC_footprint_", tf, "_ATRXdel-vs-ATRXwt.pdf")),
+         p, width = 4, height = 3, device = cairo_pdf)
 }
 ```
 
-Per-condition mean binding scores for TFs of interest (heatmap).
-Columns = BINDetect per-condition average score; rows = TFs, ordered by differential score.
+## ___Combined footprint panel (all TFs)___
 
-```{r tobias-compare-heatmap, fig.height=4, fig.width=3}
-if (exists("bd") && nrow(bd) > 0) {
-  # BINDetect result columns include <cond>_mean_score for each condition
-  del_score_col <- grep("ATRXdel.*mean_score|mean_score.*ATRXdel",
-                        colnames(bd), value = TRUE, ignore.case = TRUE)[1]
-  wt_score_col  <- grep("ATRXwt.*mean_score|mean_score.*ATRXwt",
-                        colnames(bd), value = TRUE, ignore.case = TRUE)[1]
+```{r fp-combined, fig.height=6, fig.width=9}
+if (length(fp_plots) > 0) {
+  n_col      <- min(3L, length(fp_plots))
+  n_row      <- ceiling(length(fp_plots) / n_col)
+  p_combined <- patchwork::wrap_plots(fp_plots, ncol = n_col) +
+    patchwork::plot_layout(guides = "collect") &
+    theme(legend.position = "bottom")
 
-  if (!is.na(del_score_col) && !is.na(wt_score_col)) {
-    hm_df <- bd %>%
-      dplyr::filter(toupper(tf_name) %in% toupper(TFs_tobias)) %>%
-      dplyr::mutate(
-        ATRXdel = .data[[del_score_col]],
-        ATRXwt  = .data[[wt_score_col]]
-      ) %>%
-      dplyr::arrange(change) %>%
-      dplyr::select(tf_name, ATRXdel, ATRXwt)
-
-    hm_mat <- as.matrix(hm_df[, c("ATRXdel", "ATRXwt")])
-    rownames(hm_mat) <- hm_df$tf_name
-
-    # Scale row-wise so color reflects relative binding per TF
-    hm_mat_z <- t(scale(t(hm_mat)))
-
-    pheatmap::pheatmap(
-      hm_mat_z,
-      cluster_rows   = FALSE,
-      cluster_cols   = FALSE,
-      color          = colorRampPalette(c(COL_ATRX["ATRXwt"], "white",
-                                          COL_ATRX["ATRXdel"]))(101),
-      breaks         = seq(-2, 2, length.out = 102),
-      border_color   = NA,
-      fontsize        = 8,
-      fontsize_row    = 7,
-      main            = "Mean footprint score\n(row z-score)",
-      filename        = paste0(params$out,
-                               "figures/bulkATAC_TOBIAS_TFs_heatmap_ATRXdel-vs-ATRXwt.pdf")
-    )
-  } else {
-    message("Mean score columns not found in BINDetect output — column names: ",
-            paste(grep("score|mean", colnames(bd), value = TRUE, ignore.case = TRUE),
-                  collapse = ", "))
-  }
-}
-```
-
-## ___Aggregate footprint plots for significant TFs___
-
-```{r tobias-aggregate, fig.height=3, fig.width=5}
-if (tobias_ok && exists("bd") && any(bd$sig, na.rm = TRUE)) {
-  sig_tfs <- bd$tf_name[bd$sig & !is.na(bd$label)]
-
-  if (length(sig_tfs) > 0) {
-    agg_out <- file.path(tobias_dir, "aggregate_plots")
-    dir.create(agg_out, showWarnings = FALSE)
-
-    for (tf in sig_tfs) {
-      # TOBIAS stores per-TF bound/unbound site BED files under detect_dir/tf_name/
-      sites_bed <- file.path(detect_dir, tf, paste0(tf, "_all_bound.bed"))
-      if (!file.exists(sites_bed)) next
-
-      agg_cmd <- sprintf(
-        paste("TOBIAS PlotAggregate",
-              "--TFBS %s",
-              "--signals %s %s",
-              "--labels ATRXdel ATRXwt",
-              "--output %s",
-              "--share-y both --smooth 3"),
-        sites_bed,
-        paste(score_bws_atrxdel, collapse = " "),
-        paste(score_bws_atrxwt,  collapse = " "),
-        file.path(agg_out, paste0(tf, "_aggregate.pdf"))
-      )
-      ret <- system(agg_cmd)
-      if (ret != 0) message("PlotAggregate failed for TF: ", tf)
-    }
-    cat("Aggregate footprint PDFs written to:", agg_out, "\n")
-  }
+  print(p_combined)
+  ggsave(
+    file.path(ft_fig_dir, "bulkATAC_footprints_allTFs_ATRXdel-vs-ATRXwt.pdf"),
+    p_combined,
+    width  = n_col * 4,
+    height = n_row * 3,
+    device = cairo_pdf
+  )
+} else {
+  message("No footprint matrices found — run computeMatrix chunks first.")
 }
 ```
 

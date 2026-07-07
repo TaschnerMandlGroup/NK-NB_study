@@ -1,0 +1,516 @@
+---
+title: "NK project"
+subtitle: "RUNX3 - TBX21 - CD6 regulation axis on NK cells part II"
+author: "Dr. Sara Wernig-Zorc"
+date: "2026-07-06"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  out: "/home/rstudio/mnt_out/NK_project/"
+  anno: "/home/rstudio/mnt_resources/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Signac)
+  library(motifmatchr)
+  library(TFBSTools)
+  library(JASPAR2020)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  library(ArchR)
+  library(SummarizedExperiment)
+  library(GenomicRanges)
+  library(Matrix)
+  library(dplyr) 
+  library(tibble)
+  library(arrow)
+})
+```
+
+```{r}
+atac <- loadArchRProject(path = "/home/rstudio/mnt_out/NK_project/ArchR_v20260203")
+motif_name   <- "TBX21"          # name used in addMotifAnnotations
+out_parquet  <- "base_GRN_NK_cells_from_snATAC_fetahu2023.parquet"
+promoter_win <- 2000             # bp; peaks within +/- of a TSS count as promoter-linked
+use_p2g      <- FALSE            # TRUE if you ran addGeneIntegrationMatrix + addPeak2GeneLinks
+p2g_cor      <- 0.45             # correlation cutoff for Peak2Gene distal links
+ 
+# Restore Arrow file paths to current mount point
+atac@projectMetadata$outputDirectory <- paste0(params$out, "ArchR_v20260203")
+atac@sampleColData$ArrowFiles <- paste0(
+  params$out, "ArchR_v20260203/ArrowFiles/",
+  basename(as.character(atac@sampleColData$ArrowFiles))
+)
+
+# Create clust_group column (cluster × group, e.g. "C1_control")
+atac$clust_group <- paste0(
+  as.character(atac$Clusters_res1), "_",
+  as.character(atac$group)
+)
+atac$clust_group <- factor(atac$clust_group)
+
+pkid <- function(gr) paste0(seqnames(gr), ":", start(gr), "-", end(gr))
+ 
+## Ensure motif annotations exist
+if (!(motif_name %in% names(atac@peakAnnotation))) {
+  message("Adding JASPAR2020 motif annotations (one-time, can be slow)...")
+  atac <- addMotifAnnotations(ArchRatac = atac, motifSet = "JASPAR2020",
+                              name = motif_name, force = FALSE)
+}
+ 
+## Peak2gene links
+ps <- getPeakSet(atac)
+ps_id <- pkid(ps)
+ 
+##  distal links via Peak2Gene (integrated scRNA-seq data)
+p2g  <- getPeak2GeneLinks(atac, corCutOff = p2g_cor, returnLoops = FALSE)
+pks  <- metadata(p2g)$peakSet
+gns  <- metadata(p2g)$geneSet
+
+links_p2g <- data.frame(peak_id          = pkid(pks)[p2g$idxATAC],
+                        gene_short_name  = gns$name[p2g$idxRNA],
+                        stringsAsFactors = FALSE)
+ 
+links_p2g <- links_p2g %>% filter(gene_short_name != "" & !is.na(gene_short_name)) %>% distinct()
+message(sprintf("%d peak-gene links_p2g across %d genes",
+                nrow(links_p2g), length(unique(links_p2g$gene_short_name))))
+ 
+## 3. Motif matches: peaks x TF (0/1)
+matches <- getMatches(atac, name = motif_name)      # SummarizedExperiment
+mm <- assay(matches)                                 # peaks x motifs (sparse logical)
+rownames(mm) <- pkid(rowRanges(matches))
+colnames(mm) <- colnames(matches)                    # motif names like "TBX21_750"
+ 
+## restrict to peaks we actually linked, to keep memory down
+mm <- mm[intersect(rownames(mm), unique(links_p2g$peak_id)), , drop = FALSE]
+ 
+## collapse motif columns to TF symbols (OR across a TF's multiple motifs)
+tf_sym <- sub("_[0-9]+$", "", colnames(mm))
+uniq_tf <- unique(tf_sym)
+tf_mat <- vapply(uniq_tf, function(tf) {
+  cols <- which(tf_sym == tf)
+  as.integer(Matrix::rowSums(mm[, cols, drop = FALSE]) > 0)
+}, integer(nrow(mm)))
+rownames(tf_mat) <- rownames(mm)
+tf_df <- as.data.frame(tf_mat) %>% rownames_to_column("peak_id")
+ 
+## optional: keep only TFs that are measured genes in the RNA (cleaner for CellOracle)
+# rna_genes <- rownames(GetAssayData(readRDS("nk_seurat.rds"), assay="RNA", layer="counts"))
+# tf_df <- tf_df[, c("peak_id", intersect(colnames(tf_df)[-1], rna_genes))]
+ 
+## 4. Assemble CellOracle base-GRN table ---------------------------
+base_grn <- links_p2g %>%
+  left_join(tf_df, by = "peak_id") %>%
+  filter(if_any(-c(peak_id, gene_short_name), ~ !is.na(.)))   # drop peaks w/ no motif row
+tf_cols  <- setdiff(colnames(base_grn), c("peak_id", "gene_short_name"))
+base_grn[tf_cols][is.na(base_grn[tf_cols])] <- 0L
+base_grn <- base_grn[, c("peak_id", "gene_short_name", tf_cols)]
+ 
+message(sprintf("base GRN: %d rows, %d TF columns", nrow(base_grn), length(tf_cols)))
+stopifnot("TBX21" %in% tf_cols)                       # sanity: T-bet motif present
+ 
+## 5. Write for CellOracle-----------
+write_parquet(base_grn, out_parquet)
+message(sprintf("wrote %s -> set BASE_GRN_PARQUET in the Python sim script.", out_parquet))
+ 
+## Next (single Python step): in in_silico_TBX21_perturbation.py set
+##   BASE_GRN_PARQUET = "base_GRN_from_ATAC.parquet"  and run it.
+ 
+```
+
+# ___TBX21 - RUNX3 - CD6 axis___
+
+```{r}
+## ___Define TBX21 locus (incl. CNS-3 enhancer, 3kb upstream of TSS)___
+
+# Get TBX21 coordinates from the project's gene annotation
+gene_anno   <- getGeneAnnotation(atac)
+tbx21_gene  <- gene_anno$genes[which(gene_anno$genes$symbol == "TBX21")]
+
+if (length(tbx21_gene) == 0) {
+  # Fallback: hg38 coordinates (chr17, plus strand)
+  # Source: NCBI/UCSC via GeneCards, https://www.genecards.org/cgi-bin/carddisp.pl?gene=TBX21
+  tbx21_gene <- GRanges("chr17", IRanges(47733236, 47746126), strand = "+",
+                         symbol = "TBX21")
+  cat("TBX21 gene annotation not found in project; using hg38 hardcoded coordinates.\n")
+} else {
+  cat("TBX21 gene:", as.character(seqnames(tbx21_gene)),
+      start(tbx21_gene), "-", end(tbx21_gene),
+      "strand:", as.character(strand(tbx21_gene)), "\n")
+}
+
+# TSS (respecting strand)
+if (as.character(strand(tbx21_gene)) == "-") {
+  tbx21_tss <- end(tbx21_gene)
+} else {
+  tbx21_tss <- start(tbx21_gene)
+}
+
+# Promoter: TSS +/- 2 kb (same convention as GSK3B)
+tss_w <- 2000L
+tbx21_promoter <- GRanges(
+  seqnames = seqnames(tbx21_gene),
+  ranges   = IRanges(tbx21_tss - tss_w, tbx21_tss + tss_w),
+  strand   = strand(tbx21_gene)
+)
+
+# CNS-3 enhancer: ~3kb UPSTREAM of TSS (Fang et al., Immunity 2022,
+# PII S1074-7613(22)00128-5 / DOI: 10.1016/j.immuni.2022.03.002).
+# NOTE: CNS-3 was defined/validated in MOUSE Tbx21; this window projects the
+# "-3kb from TSS" logic onto the human locus and is NOT a lifted-over,
+# experimentally validated human coordinate. Treat as a candidate region.
+# "Upstream" here = lower genomic coordinate because TBX21 is + strand in hg38.
+enh_offset <- 3000L   # distance from TSS to enhancer center
+enh_halfw  <- 1000L   # half-width of the window around that point (adjust if needed)
+
+if (as.character(strand(tbx21_gene)) == "-") {
+  tbx21_enh_center <- tbx21_tss + enh_offset
+} else {
+  tbx21_enh_center <- tbx21_tss - enh_offset
+}
+
+tbx21_enhancer <- GRanges(
+  seqnames = seqnames(tbx21_gene),
+  ranges   = IRanges(
+    pmax(1L, tbx21_enh_center - enh_halfw),
+    tbx21_enh_center + enh_halfw
+  ),
+  strand   = strand(tbx21_gene)
+)
+
+# Extended locus for browser track: gene body + generous flanks so the
+# CNS-3 enhancer (upstream) is comfortably inside the view
+tbx21_locus <- GRanges(
+  seqnames = seqnames(tbx21_gene),
+  ranges   = IRanges(
+    pmax(1L, min(start(tbx21_gene), start(tbx21_enhancer)) - 3000L),
+    max(end(tbx21_gene), end(tbx21_enhancer)) + 3000L
+  )
+)
+
+cat("TBX21 promoter (TSS +/-2kb):",
+    as.character(seqnames(tbx21_promoter)),
+    start(tbx21_promoter), "-", end(tbx21_promoter), "\n")
+cat("TBX21 CNS-3 enhancer (~TSS -3kb, +/-1kb):",
+    as.character(seqnames(tbx21_enhancer)),
+    start(tbx21_enhancer), "-", end(tbx21_enhancer), "\n")
+cat("TBX21 locus (view window):",
+    as.character(seqnames(tbx21_locus)),
+    start(tbx21_locus), "-", end(tbx21_locus), "\n")
+```
+
+## ___Browser track at TBX21 locus (incl. CNS-3 enhancer from 10.1016/j.immuni.2022.03.005)___
+
+```{r fig.height=6, fig.width=8}
+atac <- addGroupCoverages(atac,groupBy = "clust_group")
+
+file.exists("/home/rstudio/mnt_out/NK_project/ArchR_v20260203/ArrowFiles/NK_ATAC.arrow")
+
+for (cl in CLUSTER_ORDER) {
+  cl_groups <- paste0(cl, "_", GROUP_ORDER)
+
+  tryCatch({
+    p_track <- plotBrowserTrack(
+      ArchRProj   = atac,
+      groupBy     = "clust_group",
+      useGroups   = cl_groups,
+      geneSymbol  = "TBX21",
+      region      = tbx21_locus,
+      pal         = setNames(COLOR_CODE_perGROUP[sub(paste0("^", cl, "_"), "", cl_groups)], cl_groups),
+      plotSummary = c("bulkTrack", "featureTrack", "geneTrack"),
+      sizes       = c(10, 1.5, 2),
+      tileSize    = 100,
+      upstream    = 8000,
+      downstream  = 5000
+    )
+    grid::grid.newpage()
+    grid::grid.draw(p_track)
+    pdf(paste0(params$out, "figures/snATAC_NK_TBX21_browserTrack_", cl, ".pdf"),
+        height = 6, width = 8, useDingbats = FALSE)
+    grid::grid.draw(p_track); dev.off()
+    message("Browser track saved for cluster ", cl)
+  }, error = function(e) {
+    message("Browser track error for ", cl, ": ", conditionMessage(e))
+  })
+}
+```
+
+## ___Peak accessibility at TBX21 promoter, CNS-3 enhancer, and gene body___
+
+```{r}
+peak_se <- getMatrixFromProject(atac, useMatrix = "PeakMatrix")
+
+# Peaks overlapping TBX21 gene body OR promoter OR CNS-3 enhancer
+tbx21_query <- c(tbx21_gene, tbx21_promoter, tbx21_enhancer)
+peak_gr     <- getPeakSet(atac)
+ov_hits     <- findOverlaps(peak_gr, tbx21_query, ignore.strand = TRUE)
+tbx21_peak_idx <- unique(queryHits(ov_hits))
+
+cat("Peaks overlapping TBX21 locus (gene + promoter + CNS-3 enhancer):",
+    length(tbx21_peak_idx), "\n")
+if (length(tbx21_peak_idx) == 0) {
+  cat("WARNING: No peaks found at TBX21 locus. Check chromosome naming.\n")
+}
+```
+
+```{r}
+if (length(tbx21_peak_idx) > 0) {
+  acc_mat <- assay(peak_se, "PeakMatrix")[tbx21_peak_idx, , drop = FALSE]
+
+  is_promoter <- tbx21_peak_idx %in% queryHits(findOverlaps(
+    peak_gr, tbx21_promoter, ignore.strand = TRUE
+  ))
+  is_enhancer <- tbx21_peak_idx %in% queryHits(findOverlaps(
+    peak_gr, tbx21_enhancer, ignore.strand = TRUE
+  ))
+  is_genebody <- tbx21_peak_idx %in% queryHits(findOverlaps(
+    peak_gr, tbx21_gene, ignore.strand = TRUE
+  ))
+
+  cat("Promoter peaks:", sum(is_promoter), "\n")
+  cat("CNS-3 enhancer peaks:", sum(is_enhancer), "\n")
+  cat("Gene body peaks:", sum(is_genebody), "\n")
+
+  cell_acc <- data.frame(
+    cell       = colnames(acc_mat),
+    acc_all    = colSums(acc_mat),
+    acc_promo  = if (any(is_promoter)) colSums(acc_mat[is_promoter, , drop = FALSE]) else 0,
+    acc_enh    = if (any(is_enhancer)) colSums(acc_mat[is_enhancer, , drop = FALSE]) else 0,
+    acc_body   = if (any(is_genebody)) colSums(acc_mat[is_genebody, , drop = FALSE]) else 0
+  )
+
+  cell_df_tbx <- data.frame(
+    Clusters_res1 = as.character(atac$Clusters_res1),
+    group         = as.character(atac$group),
+    cell          = getCellNames(atac),
+    stringsAsFactors = FALSE
+  )
+  cell_df_tbx <- left_join(cell_df_tbx, cell_acc, by = "cell") %>%
+    mutate(
+      Clusters_res1 = factor(Clusters_res1, levels = CLUSTER_ORDER),
+      group         = factor(group, levels = GROUP_ORDER)
+    )
+
+  head(cell_df_tbx)
+}
+```
+
+## ___Pseudobulk accessibility at TBX21 per cluster x group___
+
+```{r fig.height=8, fig.width=10}
+if (exists("cell_df_tbx") && nrow(cell_df_tbx) > 0 && !all(cell_df_tbx$acc_all == 0)) {
+
+  pb_tbx <- cell_df_tbx %>%
+    group_by(Clusters_res1, group) %>%
+    summarise(
+      n_cells    = n(),
+      mean_all   = mean(acc_all,   na.rm = TRUE),
+      mean_promo = mean(acc_promo, na.rm = TRUE),
+      mean_enh   = mean(acc_enh,   na.rm = TRUE),
+      mean_body  = mean(acc_body,  na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    filter(n_cells >= 5)
+
+  pb_long <- pb_tbx %>%
+    pivot_longer(cols = c(mean_promo, mean_enh, mean_body),
+                 names_to = "region", values_to = "accessibility") %>%
+    mutate(region = recode(region,
+                           mean_promo = "TBX21 promoter (TSS +/-2kb)",
+                           mean_enh   = "TBX21 CNS-3 enhancer (~TSS -3kb)",
+                           mean_body  = "TBX21 gene body"))
+
+  p_pb <- ggplot(pb_long, aes(x = Clusters_res1, y = accessibility, fill = group)) +
+    geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+    facet_wrap(~ region, scales = "free_y", ncol = 1) +
+    scale_fill_manual(values = COLOR_CODE_perGROUP) +
+    labs(
+      title    = "TBX21 chromatin accessibility per ATAC cluster",
+      subtitle = "Pseudobulk mean (cells >=5 per clust_group)",
+      x        = "ATAC cluster", y = "mean accessibility", fill = "genetic group"
+    ) +
+    theme(axis.text.x = element_text(angle = 35, hjust = 1),
+          legend.position = "top")
+
+  p_pb
+  pdf(paste0(params$out, "figures/snATAC_NK_TBX21_pseudobulk_accessibility.pdf"),
+      height = 8, width = 10, useDingbats = FALSE)
+  p_pb; dev.off()
+}
+```
+
+## ___Per-cell violin plots at TBX21 per cluster___
+
+```{r fig.height=5, fig.width=12}
+if (exists("cell_df_tbx")) {
+  regions_to_plot <- list(
+    "TBX21 promoter (TSS +/-2kb)"       = "acc_promo",
+    "TBX21 CNS-3 enhancer (~TSS -3kb)"  = "acc_enh",
+    "TBX21 gene body"                   = "acc_body"
+  )
+
+  for (region_label in names(regions_to_plot)) {
+    col_nm <- regions_to_plot[[region_label]]
+    p_vln <- ggplot(cell_df_tbx,
+                    aes(x = group, y = .data[[col_nm]], fill = group)) +
+      geom_violin(scale = "width", linewidth = 0.3, alpha = 0.8) +
+      geom_boxplot(width = 0.12, fill = "white", outlier.size = 0.3,
+                   linewidth = 0.3) +
+      facet_wrap(~ Clusters_res1, nrow = 2, labeller = as_labeller(CLUSTER_NAMES)) +
+      scale_fill_manual(values = COLOR_CODE_perGROUP) +
+      labs(
+        title    = region_label,
+        subtitle = "Per-cell chromatin accessibility — genetic groups within each ATAC cluster",
+        x = NULL, y = "peak accessibility", fill = "genetic group"
+      ) +
+      theme(
+        axis.text.x    = element_text(angle = 40, hjust = 1, size = 7),
+        legend.position = "none"
+      )
+    print(p_vln)
+    pdf(paste0(params$out, "figures/snATAC_NK_TBX21_",
+               gsub("[^A-Za-z0-9]+", "_", region_label), "_violin.pdf"),
+        height = 5, width = 12, useDingbats = FALSE)
+    print(p_vln); dev.off()
+  }
+}
+```
+
+## ___Wilcoxon tests: ATRXdel vs control per cluster___
+
+```{r}
+if (exists("cell_df_tbx")) {
+  regions_stat <- c(
+    "TBX21 promoter"      = "acc_promo",
+    "TBX21 CNS-3 enhancer" = "acc_enh",
+    "TBX21 gene body"     = "acc_body"
+  )
+
+  stat_results <- bind_rows(lapply(names(regions_stat), function(rl) {
+    col_nm <- regions_stat[[rl]]
+    bind_rows(lapply(CLUSTER_ORDER, function(cl) {
+      sub_df <- cell_df_tbx %>% filter(Clusters_res1 == cl)
+      bind_rows(lapply(
+        list(c("ATRXdel", "control"),
+             c("ATRXdel", "MYCNamp"),
+             c("ATRXdel", "ATRXwtMYCNwt"),
+             c("MYCNamp", "control")),
+        function(grp_pair) {
+          g1 <- sub_df %>% filter(group == grp_pair[1]) %>% pull(col_nm)
+          g2 <- sub_df %>% filter(group == grp_pair[2]) %>% pull(col_nm)
+          if (length(g1) < 5 || length(g2) < 5) return(NULL)
+          wt <- wilcox.test(g1, g2)
+          data.frame(
+            region    = rl,
+            cluster   = cl,
+            group1    = grp_pair[1],
+            group2    = grp_pair[2],
+            n1        = length(g1),
+            n2        = length(g2),
+            median1   = median(g1),
+            median2   = median(g2),
+            p_value   = wt$p.value,
+            stringsAsFactors = FALSE
+          )
+        }
+      ))
+    }))
+  }))
+
+  stat_results$p_adj <- p.adjust(stat_results$p_value, method = "BH")
+  stat_results$sig   <- stat_results$p_adj < 0.05
+  stat_results <- stat_results %>%
+    arrange(region, cluster, p_adj) %>%
+    mutate(across(c(p_value, p_adj), ~signif(.x, 3)))
+
+  cat("TBX21 accessibility — Wilcoxon tests (BH-adjusted):\n")
+  print(stat_results)
+
+  write.csv(stat_results,
+            paste0(params$out, "tables/snATAC_NK_TBX21_accessibility_wilcoxon.csv"),
+            row.names = FALSE)
+}
+```
+
+## ___Peak-level accessibility heatmap at TBX21___
+
+```{r fig.height=5, fig.width=8}
+if (exists("cell_df_tbx") && length(tbx21_peak_idx) > 0) {
+  cg_levels <- levels(atac$clust_group)
+  cell_cg        <- as.character(atac$clust_group)
+  names(cell_cg) <- getCellNames(atac)
+
+  pb_peak_mat <- vapply(cg_levels, function(cg) {
+    cells <- names(cell_cg)[cell_cg == cg]
+    cells <- cells[cells %in% colnames(acc_mat)]
+    if (length(cells) < 5) return(rep(NA_real_, nrow(acc_mat)))
+    rowMeans(acc_mat[, cells, drop = FALSE], na.rm = TRUE)
+  }, numeric(nrow(acc_mat)))
+
+  # Row annotation: promoter vs CNS-3 enhancer vs gene body
+  peak_region <- ifelse(is_promoter, "promoter",
+                  ifelse(is_enhancer, "CNS-3 enhancer",
+                  ifelse(is_genebody, "gene body", "other")))
+  row_ha <- rowAnnotation(
+    region = peak_region,
+    col    = list(region = c("promoter" = "#D62728", "CNS-3 enhancer" = "#2CA02C",
+                             "gene body" = "#1F77B4", "other" = "gray80")),
+    annotation_name_gp = gpar(fontsize = 8)
+  )
+
+  col_ann_pk <- data.frame(
+    cluster   = sub("_.*", "", colnames(pb_peak_mat)),
+    group     = sub("^[^_]+_", "", colnames(pb_peak_mat)),
+    row.names = colnames(pb_peak_mat)
+  )
+  ha_pk <- HeatmapAnnotation(
+    cluster = col_ann_pk$cluster,
+    group   = col_ann_pk$group,
+    col     = list(
+      cluster = COL_ATAC_CLUSTER[unique(col_ann_pk$cluster)],
+      group   = COLOR_CODE_perGROUP[unique(col_ann_pk$group)]
+    ),
+    annotation_name_gp = gpar(fontsize = 8)
+  )
+
+  pb_peak_z <- t(scale(t(pb_peak_mat)))
+  pb_peak_z[is.nan(pb_peak_z)] <- 0
+  pb_peak_z[pb_peak_z >  2]   <-  2
+  pb_peak_z[pb_peak_z < -2]   <- -2
+
+  ht_peak <- Heatmap(
+    pb_peak_z,
+    name              = "accessibility\n(z-score)",
+    top_annotation    = ha_pk,
+    left_annotation   = row_ha,
+    row_names_gp      = gpar(fontsize = 7),
+    column_names_gp   = gpar(fontsize = 7),
+    col               = colorRamp2(c(-2, 0, 2), c("#2166AC", "white", "#B2182B")),
+    cluster_rows      = TRUE,
+    cluster_columns   = FALSE,
+    column_split      = col_ann_pk$cluster,
+    border            = TRUE,
+    column_title      = "TBX21 peak accessibility: 7 clusters x genetic groups",
+    column_title_gp   = gpar(fontsize = 10, fontface = "bold"),
+    show_row_names    = nrow(pb_peak_z) <= 50
+  )
+  draw(ht_peak)
+  pdf(paste0(params$out, "figures/snATAC_NK_TBX21_peak_accessibility_heatmap.pdf"),
+      height = 5, width = 8, useDingbats = FALSE)
+  draw(ht_peak); dev.off()
+}
+```
+

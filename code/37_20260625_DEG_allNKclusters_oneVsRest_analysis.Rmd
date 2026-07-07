@@ -81,23 +81,7 @@ cat("Clusters present:\n")
 print(table(ALL_NK$predicted_NK_type_de.n350))
 ```
 
-Publication theme and shared color helpers.
-
 ```{r}
-pub_theme <- theme_classic(base_size = 9) +
-  theme(
-    axis.line        = element_line(linewidth = 0.4, color = "black"),
-    axis.ticks       = element_line(linewidth = 0.4, color = "black"),
-    axis.text        = element_text(size = 8,  color = "black"),
-    axis.title       = element_text(size = 9,  color = "black"),
-    plot.title       = element_text(size = 10, face = "bold"),
-    plot.subtitle    = element_text(size = 8),
-    legend.key.size  = unit(3,  "mm"),
-    legend.text      = element_text(size = 8),
-    legend.title     = element_text(size = 9),
-    strip.background = element_blank(),
-    strip.text       = element_text(size = 9)
-  )
 theme_set(pub_theme)
 
 # All 4 cluster colors from COLOR_CODE_v2
@@ -110,93 +94,6 @@ volcano_colors_ovr <- function(df, clust_col, padj_cut = 0.05, fc_cut = 0.5) {
   col_vec[!is.na(df$padj) & df$padj < padj_cut & df$log_fc < -fc_cut] <- "gray40"
   names(col_vec) <- rownames(df)
   col_vec
-}
-
-# Enrichment helpers
-run_enrichment <- function(gene_symbols,
-                           type = c("BP", "MF", "CC", "KEGG", "HALLMARK"),
-                           term2gene = NULL,
-                           label = "") {
-  type <- match.arg(type)
-  if (length(gene_symbols) == 0) {
-    message(label, ": no input genes - skipping"); return(invisible(NULL))
-  }
-  entrez_ids <- na.omit(map_gene_to_entrez(gene_symbols))
-  if (length(entrez_ids) == 0) {
-    message(label, ": no valid Entrez IDs - skipping"); return(invisible(NULL))
-  }
-  tryCatch(
-    {
-      if (type %in% c("BP", "MF", "CC")) {
-        enrichGO(gene = entrez_ids, ont = type, OrgDb = "org.Hs.eg.db",
-                 readable = TRUE, pAdjustMethod = "bonferroni",
-                 pvalueCutoff = 0.05)
-      } else if (type == "KEGG") {
-        enrichKEGG(gene = entrez_ids, organism = "hsa", keyType = "kegg",
-                   pAdjustMethod = "bonferroni", pvalueCutoff = 0.05)
-      } else if (type == "HALLMARK") {
-        enricher(gene = entrez_ids, TERM2GENE = term2gene,
-                 pAdjustMethod = "bonferroni", pvalueCutoff = 0.05)
-      }
-    },
-    error = function(e) {
-      message(label, " (", type, ") error: ", conditionMessage(e)); NULL
-    }
-  )
-}
-
-show_enrichment <- function(result, label = "", out_path = NULL,
-                            out_w = 5, out_h = 4.5) {
-  if (is.null(result) || nrow(result@result) == 0) {
-    print(paste0("0 enriched terms - ", label)); return(invisible(NULL))
-  }
-  signif_rows <- result@result[result@result$p.adjust < 0.05, ]
-  if (nrow(signif_rows) == 0) {
-    print(paste0("0 terms with bonferroni p.adjust < 0.05 - ", label))
-    return(invisible(NULL))
-  }
-  p <- dotplot(result, showCategory = 20) +
-    ggtitle(label) + pub_theme +
-    theme(axis.text.y = element_text(size = 7))
-  print(p)
-  if (!is.null(out_path)) {
-    pdf(out_path, height = out_h, width = out_w, useDingbats = FALSE)
-    print(p); dev.off()
-  }
-}
-
-run_treeplot <- function(result, label = "", n_cluster = 5, n_words = 1,
-                         show_cat = 15, out_path = NULL, out_w = 9, out_h = 4) {
-  if (is.null(result) || nrow(result@result) == 0) {
-    message("treeplot skipped (no enriched terms): ", label); return(invisible(NULL))
-  }
-  signif_rows <- result@result[result@result$p.adjust < 0.05, ]
-  if (nrow(signif_rows) < 2) {
-    message("treeplot skipped (< 2 significant terms): ", label); return(invisible(NULL))
-  }
-  p <- tryCatch(
-    {
-      enrichres2 <- pairwise_termsim(result)
-      treeplot(enrichres2, showCategory = show_cat, color = "p.adjust",
-               offset = 10, offset_tiplab = 0.5,
-               nCluster = min(n_cluster, nrow(signif_rows)),
-               nWords = n_words, split = "subcategory")
-    },
-    error = function(e) { message("treeplot error: ", conditionMessage(e)); NULL }
-  )
-  if (!is.null(p)) {
-    tryCatch(print(p),
-             error = function(e) message("treeplot render error: ", conditionMessage(e)))
-    if (!is.null(out_path)) {
-      tryCatch({
-        pdf(out_path, height = out_h, width = out_w, useDingbats = FALSE)
-        print(p); dev.off()
-      }, error = function(e) {
-        try(dev.off(), silent = TRUE)
-        message("treeplot PDF error: ", conditionMessage(e))
-      })
-    }
-  }
 }
 
 # Violin + boxplot + jitter for top marker genes of a given cluster

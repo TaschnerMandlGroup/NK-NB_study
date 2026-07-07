@@ -1,0 +1,557 @@
+---
+title: "NK project"
+subtitle: "RUNX3 - TBX21 - CD6 regulation axis on NK cells"
+author: "Dr. Sara Wernig-Zorc"
+date: "2026-07-06"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  out: "/home/rstudio/mnt_out/NK_project/"
+  anno: "/home/rstudio/mnt_resources/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+source("/home/rstudio/00_NK_paper_setup.R")
+source("/home/rstudio/00_NK_paper_utils.R")
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+library(dplyr)
+set.seed(2805)
+
+fig_out <- paste0(params$out, "figures/revision/")
+dir.create(fig_out, showWarnings = FALSE, recursive = TRUE)
+
+comparisons <- list(c("control", "ATRXdel"),
+                    c("MYCNamp","ATRXdel"), 
+                    c("ATRXwtMYCNwt","ATRXdel"))
+```
+
+```{r}
+fetahu2023 <- readRDS("~/mnt_out/NK_project/Rds/fetahu2023_withNewMetadata.Rds")
+fetahu2023 <- NormalizeData(fetahu2023, 
+                            normalization.method = "LogNormalize",
+                            scale.factor = 10000) %>% 
+  ScaleData()
+fetahu2023$celltype <- factor(fetahu2023$orig.ident)
+
+ALL_NK <- readRDS("~/mnt_out/NK_project/Rds/ALL_NK_cluster_withNewMetadata.Rds")
+ALL_NK <- NormalizeData(ALL_NK, 
+                        normalization.method = "LogNormalize",
+                        scale.factor = 10000) %>% 
+  ScaleData()
+ALL_NK$predicted_NK_type_de.n350 <- factor(ALL_NK$predicted_NK_type_de.n350)
+```
+
+```{r}
+gene_of_interest <- "RUNX3"
+
+NK_subset_order <- c("hNK_Bm2","hNK_Bm3","hNK_Bm4","hNK_Bm1")
+ALL_NK$predicted_NK_type_de.n350 <- factor(ALL_NK$predicted_NK_type_de.n350, 
+                                           levels  = NK_subset_order)
+
+
+p_RUNX3_vio <- do_ViolinPlot(
+  ALL_NK,
+  features   = gene_of_interest,
+  group.by   = "group",
+  colors.use = COLOR_CODE_GROUP,
+  legend.title = "",
+  font.size  = 12,
+  plot_boxplot = FALSE,
+  plot.grid = FALSE,
+  grid.type = "blank") +
+  ggpubr::stat_compare_means(
+    comparisons = comparisons, method = "wilcox.test",
+    label = "p.signif", size = 3, tip.length = 0.01
+  )
+p_RUNX3_vio
+
+ggsave(paste0(fig_out, "RUNX3_NKsubset_violin_perGroup.pdf"),
+       p_RUNX3_vio, width = 3, height = 3, device = cairo_pdf)
+
+p_RUNX3_vio_sub <- do_ViolinPlot(
+  ALL_NK,
+  features   = gene_of_interest,
+  group.by   = "predicted_NK_type_de.n350",
+  colors.use = COLOR_CODE_v2,
+  legend.title = "",
+  font.size  = 12,
+  plot_boxplot = FALSE,
+  plot.grid = FALSE,
+  grid.type = "blank") +
+  ggpubr::stat_compare_means(
+    comparisons = comparisons, method = "wilcox.test",
+    label = "p.signif", size = 3, tip.length = 0.01
+  )
+p_RUNX3_vio_sub
+
+ggsave(paste0(fig_out, "RUNX3_NKsubset_violin_perNKsubset.pdf"),
+       p_RUNX3_vio_sub, width = 3, height = 3, device = cairo_pdf)
+
+p_RUNX3_vio_sub2 <- do_ViolinPlot(
+  ALL_NK,
+  features   = gene_of_interest,
+  group.by   = "predicted_NK_type_de.n350",
+  #colors.use = COLOR_CODE_v2,
+  legend.title = "",
+  font.size  = 12,
+  plot_boxplot = FALSE,
+  plot.grid = FALSE,
+  grid.type = "blank") +
+  ggpubr::stat_compare_means(
+    comparisons = comparisons, method = "wilcox.test",
+    label = "p.signif", size = 3, tip.length = 0.01
+  )
+p_RUNX3_vio_sub2
+
+ggsave(paste0(fig_out, "RUNX3_NKsubset_violin_perNKsubset_perGroup.pdf"),
+       p_RUNX3_vio_sub2, width = 3, height = 3, device = cairo_pdf)
+```
+
+```{r stats}
+# BH-adjusted Wilcoxon + log2FC per gene, for two comparisons vs ATRXdel
+.nk_stats <- Seurat::FetchData(ALL_NK,
+                                vars = c(gene_of_interest, "group"),
+                                layer = "data") %>%
+  tidyr::pivot_longer(cols = dplyr::all_of(gene_of_interest),
+                      names_to = "gene", values_to = "expr") %>%
+  dplyr::group_by(gene) %>%
+  dplyr::group_modify(~ {
+    dd <- .x
+    purrr::map_dfr(list(c("ATRXdel","control"),
+                        c("ATRXdel","ATRXwtMYCNwt"), 
+                        c("ATRXdel","MYCNamp")), 
+                   function(grps) {
+      sub <- dplyr::filter(dd, group %in% grps)
+      sub$group <- factor(sub$group, levels = grps)
+      w <- tryCatch(
+        rstatix::wilcox_test(sub, expr ~ group, exact = FALSE) %>%
+          rstatix::adjust_pvalue(method = "BH") %>%
+          rstatix::add_significance("p.adj",
+            cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1),
+            symbols   = c("****", "***", "**", "*", "ns")),
+        error = function(e) data.frame(p.adj.signif = "ns")
+      )
+      fc <- log2((mean(sub$expr[sub$group == "ATRXdel"]) + 0.01) /
+                  (mean(sub$expr[sub$group == grps[2]])   + 0.01))
+      data.frame(comparison = paste(grps, collapse = " vs "),
+                 grp2 = grps[2],
+                 signif = w$p.adj.signif[1],
+                 log2FC = round(fc, 2))
+    })
+  }) %>%
+  dplyr::ungroup()
+
+.nk_stats
+
+# per NK subset - per group
+Idents(ALL_NK) <- ALL_NK$predicted_NK_type_de.n350
+NK2_NK3 <- subset(ALL_NK, idents = c("hNK_Bm2", "hNK_Bm3"))
+Idents(NK2_NK3) <- NK2_NK3$group
+
+.nk_stats_2 <- Seurat::FetchData(NK2_NK3,
+                                vars = c(gene_of_interest, "group"),
+                                layer = "data") %>%
+  tidyr::pivot_longer(cols = dplyr::all_of(gene_of_interest),
+                      names_to = "gene", values_to = "expr") %>%
+  dplyr::group_by(gene) %>%
+  dplyr::group_modify(~ {
+    dd <- .x
+    purrr::map_dfr(list(c("ATRXdel","control"),
+                        c("ATRXdel","ATRXwtMYCNwt"), 
+                        c("ATRXdel","MYCNamp")), 
+                   function(grps) {
+      sub <- dplyr::filter(dd, group %in% grps)
+      sub$group <- factor(sub$group, levels = grps)
+      w <- tryCatch(
+        rstatix::wilcox_test(sub, expr ~ group, exact = FALSE) %>%
+          rstatix::adjust_pvalue(method = "BH") %>%
+          rstatix::add_significance("p.adj",
+            cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1),
+            symbols   = c("****", "***", "**", "*", "ns")),
+        error = function(e) data.frame(p.adj.signif = "ns")
+      )
+      fc <- log2((mean(sub$expr[sub$group == "ATRXdel"]) + 0.01) /
+                  (mean(sub$expr[sub$group == grps[2]])   + 0.01))
+      data.frame(comparison = paste(grps, collapse = " vs "),
+                 grp2 = grps[2],
+                 signif = w$p.adj.signif[1],
+                 log2FC = round(fc, 2))
+    })
+  }) %>%
+  dplyr::ungroup()
+
+.nk_stats_2
+```
+
+```{r}
+p_RUNX3_NK2NK3 <- do_DotPlot(
+  NK2_NK3,
+  features     = gene_of_interest,
+  group.by     = "group",
+  scale        = TRUE,
+  dot.scale    = 12,
+  font.size    = 12,
+  dot_border   = FALSE,
+  use_viridis  = TRUE,
+  viridis.palette = "A",
+  viridis.direction = -1,
+  colors.use   = GRADIENT_COLORS_v2
+)
+
+p_RUNX3_NK2NK3
+```
+
+```{r RUNX3-nk-dot, fig.height=4, fig.width=6}
+p_RUNX3_dot <- do_DotPlot(
+  ALL_NK,
+  features     = gene_of_interest,
+  group.by     = "group",
+  scale        = TRUE,
+  dot.scale    = 12,
+  font.size    = 12,
+  dot_border   = FALSE,
+  use_viridis  = TRUE,
+  viridis.palette = "A",
+  viridis.direction = -1,
+  colors.use   = GRADIENT_COLORS_v2
+)
+
+# detect y-axis group order from the built plot
+.pb       <- ggplot_build(p_RUNX3_dot)
+.y_groups <- .pb$layout$panel_params[[1]]$y$limits 
+.x_range  <- .pb$layout$panel_params[[1]]$x.range
+
+.y_pos <- function(grp) which(.y_groups == grp)
+.x_brk1 <- .x_range[2] + 0.20 * diff(.x_range)   # ATRXdel vs ATRXwtMYCNwt
+.x_brk2 <- .x_range[2] + 0.55 * diff(.x_range)   # ATRXdel vs control
+.x_brk3 <- .x_range[2] + 0.75 * diff(.x_range)   # ATRXdel vs MYCNamp
+.x_tick  <- 0.06 * diff(.x_range)
+
+.make_cmp <- function(grp2, x_brk) {
+  sub <- dplyr::filter(.nk_stats, grp2 == !!grp2) %>%
+    dplyr::arrange(factor(gene, levels = CD6_NB_GENES))
+  lbl <- paste(paste0(sub$gene, ": ", sub$signif, " (FC=", sub$log2FC, ")"),
+               collapse = "\n")
+  y1  <- .y_pos("ATRXdel")
+  y2  <- .y_pos(grp2)
+  list(
+    ggplot2::geom_segment(data = data.frame(x_brk = x_brk, y1 = y1, y2 = y2),
+      ggplot2::aes(y = y1, yend = y2), x = x_brk, xend = x_brk,
+      inherit.aes = FALSE, color = "black", linewidth = 0.4),
+    ggplot2::geom_text(data = data.frame(x_brk = x_brk + .x_tick,
+                                          y_mid = (y1 + y2) / 2, label = lbl),
+      ggplot2::aes(y = y_mid, label = label), x = x_brk + .x_tick,
+      inherit.aes = FALSE, hjust = 0, size = 2.2, lineheight = 0.9)
+  )
+}
+
+p_RUNX3_dot <- p_RUNX3_dot +
+  .make_cmp("ATRXwtMYCNwt", .x_brk1) +
+  .make_cmp("control",    .x_brk2) +
+  .make_cmp("MYCNamp",      .x_brk3) +
+  ggplot2::coord_cartesian(clip = "off") +
+  ggplot2::theme(plot.margin = ggplot2::margin(t = 5, r = 120, b = 5, l = 5))
+
+p_RUNX3_dot
+
+ggsave(paste0(fig_out, "RUNX3_NK_dotplot_perGroup.pdf"),
+       p_RUNX3_dot, width = 6, height = 4, device = cairo_pdf)
+```
+
+
+# ___Define CD6 locus___
+
+```{r}
+gene_anno <- getGeneAnnotation(atac)
+cd6_gene  <- gene_anno$genes[which(gene_anno$genes$symbol == "CD6")]
+
+if (length(cd6_gene) == 0) {
+  # Fallback: hg38 coordinates (chr11, plus strand)
+  # Source: GeneCards / UCSC, https://www.genecards.org/cgi-bin/carddisp.pl?gene=CD6
+  cd6_gene <- GRanges("chr11", IRanges(60971675, 61020377), strand = "+",
+                       symbol = "CD6")
+  cat("CD6 gene annotation not found in project; using hg38 hardcoded coordinates.\n")
+} else {
+  cat("CD6 gene:", as.character(seqnames(cd6_gene)),
+      start(cd6_gene), "-", end(cd6_gene),
+      "strand:", as.character(strand(cd6_gene)), "\n")
+}
+
+# Extend locus to capture distal regulatory elements (promoter + flanking
+# enhancers). The RUNX+T-box composite enhancer at the analogous SELL locus
+# (Cichocki et al., Cell 2018, https://pmc.ncbi.nlm.nih.gov/articles/PMC6329660/)
+# was intronic/proximal rather than far distal, so +/-10kb is a reasonable
+# starting window; widen if nothing turns up.
+flank <- 10000L
+cd6_locus <- GRanges(
+  seqnames = seqnames(cd6_gene),
+  ranges   = IRanges(pmax(1L, start(cd6_gene) - flank), end(cd6_gene) + flank)
+)
+
+cat("CD6 locus (gene +/-10kb):",
+    as.character(seqnames(cd6_locus)),
+    start(cd6_locus), "-", end(cd6_locus), "\n")
+```
+
+## ___Peaks overlapping the CD6 locus___
+
+```{r}
+atac <- addMotifAnnotations(
+  ArchRProj = atac,
+  motifSet  = "cisbp",
+  name      = "Motif",
+  force     = TRUE   
+)
+
+stopifnot(nrow(getMatches(atac, name = "Motif")) == length(getPeakSet(atac)))
+motifMatches <- getMatches(atac, name = "Motif")
+
+peak_gr <- getPeakSet(atac)
+ov_hits <- findOverlaps(peak_gr, cd6_locus, ignore.strand = TRUE)
+cd6_peak_idx <- unique(queryHits(ov_hits))
+
+cat("Peaks overlapping CD6 locus (+/-10kb):", length(cd6_peak_idx), "\n")
+if (length(cd6_peak_idx) == 0) {
+  stop("No peaks found at the CD6 locus with this window - widen `flank` and re-run.")
+}
+
+cd6_peaks <- peak_gr[cd6_peak_idx]
+print(cd6_peaks)
+```
+
+## ___Pull existing motif matches (CIS-BP) at those peaks___
+
+```{r}
+#fixing archR file paths (different dockers have different folder bindings)
+old_prefix <- "/home/rstudio/mnt_out/ArchR_v20260203"
+new_prefix <- "/home/rstudio/mnt_out/NK_project/ArchR_v20260203"
+
+for (i in seq_along(atac@peakAnnotation)) {
+  if (!is.null(atac@peakAnnotation[[i]]$Positions)) {
+    atac@peakAnnotation[[i]]$Positions <- gsub(old_prefix, new_prefix,
+                                                atac@peakAnnotation[[i]]$Positions,
+                                                fixed = TRUE)
+  }
+  if (!is.null(atac@peakAnnotation[[i]]$Matches)) {
+    atac@peakAnnotation[[i]]$Matches <- gsub(old_prefix, new_prefix,
+                                              atac@peakAnnotation[[i]]$Matches,
+                                              fixed = TRUE)
+  }
+}
+
+# Verify before moving on
+sapply(atac@peakAnnotation, function(x) {
+  c(Positions = if (!is.null(x$Positions)) file.exists(x$Positions) else NA,
+    Matches   = if (!is.null(x$Matches))   file.exists(x$Matches)   else NA)
+})
+```
+
+
+```{r}
+stopifnot(nrow(getMatches(atac, name = "Motif")) == length(getPeakSet(atac)))
+motifSetName <- "Motif"
+
+motifMatches <- getMatches(atac, name = motifSetName)
+cat("Motif match matrix: ", nrow(motifMatches), "peaks x", ncol(motifMatches), "motifs\n")
+
+# Peaks in the motif match SE are indexed identically to getPeakSet(atac),
+# assuming peaks haven't been re-called/re-ordered since addMotifAnnotations()
+# was run. Sanity check that dimensions line up before subsetting.
+stopifnot(nrow(motifMatches) == length(peak_gr))
+
+cd6_motif_mat <- assay(motifMatches)[cd6_peak_idx, , drop = FALSE]
+rownames(cd6_motif_mat) <- paste0(
+  as.character(seqnames(cd6_peaks)), ":", start(cd6_peaks), "-", end(cd6_peaks)
+)
+```
+
+## ___Subset to RUNX family and T-box family motifs___
+
+```{r}
+all_motif_names <- colnames(cd6_motif_mat)
+
+# RUNX family: RUNX1, RUNX2, RUNX3 (motif names typically look like
+# "RUNX1_123" or "RUNX3(var.2)" depending on the motif DB naming convention)
+runx_motifs <- grep("RUNX", all_motif_names, ignore.case = TRUE, value = TRUE)
+
+# T-box family relevant to NK/T cytotoxic biology: TBX21 (T-bet), EOMES,
+# plus other T-box family members that share the same core T-box consensus
+# (Fang et al., Immunity 2022; Cichocki et al., Cell 2018 both describe
+# T-box motifs broadly, not just the TBX21 PWM specifically)
+tbox_motifs <- grep("TBX21|^EOMES|TBR1|TBX[0-9]", all_motif_names,
+                     ignore.case = TRUE, value = TRUE)
+
+cat("RUNX-family motifs found in DB:", paste(runx_motifs, collapse = ", "), "\n")
+cat("T-box-family motifs found in DB:", paste(tbox_motifs, collapse = ", "), "\n")
+
+if (length(runx_motifs) == 0 || length(tbox_motifs) == 0) {
+  warning(
+    "Could not find RUNX and/or T-box motifs under these name patterns.\n",
+    "Run `colnames(getMatches(atac, name = \"", motifSetName, "\"))` ",
+    "and inspect naming convention, then adjust the grep patterns above."
+  )
+}
+
+cd6_runx_tbox <- cd6_motif_mat[, c(runx_motifs, tbox_motifs), drop = FALSE]
+print(cd6_runx_tbox)
+```
+
+## ___Summary: which CD6 peaks carry RUNX and/or T-box motifs___
+
+```{r}
+peak_summary <- data.frame(
+  peak            = rownames(cd6_motif_mat),
+  has_RUNX        = rowSums(cd6_motif_mat[, runx_motifs, drop = FALSE]) > 0,
+  has_Tbox        = rowSums(cd6_motif_mat[, tbox_motifs, drop = FALSE]) > 0,
+  stringsAsFactors = FALSE
+)
+peak_summary$has_RUNX_and_Tbox <- peak_summary$has_RUNX & peak_summary$has_Tbox
+
+cat("CD6 peaks with RUNX motif:", sum(peak_summary$has_RUNX), "of", nrow(peak_summary), "\n")
+cat("CD6 peaks with T-box motif:", sum(peak_summary$has_Tbox), "of", nrow(peak_summary), "\n")
+cat("CD6 peaks with BOTH (candidate composite RUNX+T-box element,",
+    "analogous to the SELL enhancer in Cichocki et al. 2018):",
+    sum(peak_summary$has_RUNX_and_Tbox), "\n")
+
+print(peak_summary)
+
+write.csv(peak_summary,
+          paste0(params$out, "tables/snATAC_NK_CD6_RUNX_Tbox_motif_scan.csv"),
+          row.names = FALSE)
+```
+
+## ___(Optional) Highlight composite-motif peaks on the CD6 browser track___
+
+
+```{r}
+atac <- addGroupCoverages(
+  ArchRProj    = atac,
+  groupBy      = "clust_group",
+  minCells     = 5,
+  maxCells     = 500,
+  maxFragments = 25 * 10^6,
+  force        = TRUE,
+  verbose      = TRUE
+)
+
+"clust_group" %in% names(atac@projectMetadata$GroupCoverages)  # should be TRUE now
+
+saveArchRProject(ArchRProj = atac, outputDirectory = "/home/rstudio/mnt_out/NK_project/ArchR_v20260203", load = FALSE)
+```
+
+
+```{r fig.height=6, fig.width=8}
+CLUSTER_ORDER <- c("C1", "C2", "C3", "C4", "C5", "C6", "C7")
+GROUP_ORDER   <- c("control", "ATRXmut", "MYCNamp", "ATRXwtMYCNwt")
+
+composite_peaks <- cd6_peaks[peak_summary$has_RUNX] #has_RUNX_and_Tbox
+
+if (length(composite_peaks) > 0) {
+  for (cl in CLUSTER_ORDER) {
+    cl_groups <- paste0(cl, "_", GROUP_ORDER)
+    tryCatch({
+      p_track <- plotBrowserTrack(
+        ArchRProj   = atac,
+        groupBy     = "group",
+        useGroups   = GROUP_ORDER,
+        geneSymbol  = "CD6",
+        region      = cd6_locus,
+        pal         = COLOR_CODE_perGROUP,
+        plotSummary = c("bulkTrack", "featureTrack", "geneTrack"),
+        sizes       = c(10, 1.5, 2),
+        tileSize    = 100,
+        upstream    = flank,
+        downstream  = flank,
+        highlight   = composite_peaks,
+        highlightFill = "forestgreen"
+      )
+      grid::grid.newpage()
+      grid::grid.draw(p_track)
+      pdf(paste0(params$out, "figures/snATAC_NK_CD6_browserTrack_motifHighlight_", cl, ".pdf"),
+          height = 6, width = 8, useDingbats = FALSE)
+      grid::grid.draw(p_track); dev.off()
+    }, error = function(e) {
+      message("Browser track error for ", cl, ": ", conditionMessage(e))
+    })
+  }
+} else {
+  message("No composite RUNX3 peaks found at CD6 - nothing to highlight.")
+}
+
+
+p_track_all <- plotBrowserTrack(
+        ArchRProj   = atac,
+        groupBy     = "group",
+        useGroups   = GROUP_ORDER,
+        geneSymbol  = "CD6",
+        region      = cd6_locus,
+        pal         = COLOR_CODE_perGROUP,
+        plotSummary = c("bulkTrack", "featureTrack", "geneTrack"),
+        sizes       = c(10, 1.5, 2),
+        tileSize    = 100,
+        upstream    = flank,
+        downstream  = flank,
+        highlight   = composite_peaks,
+        highlightFill = "forestgreen"
+      )
+
+grid::grid.newpage()
+grid::grid.draw(p_track_all)
+
+pdf(paste0(params$out, "figures/snATAC_NK_CD6_browserTrack_motifHighlight_all.pdf"),
+          height = 6, width = 8, useDingbats = FALSE)
+grid::grid.draw(p_track_all) 
+dev.off()
+```
+
+```{r}
+saveRDS(atac, file = paste0(params$out, "ArchR_v20260203/ATAC_analysis_v20260706.Rds"))
+```
+
+
+```{r}
+markerPeaks <- getMarkerFeatures(
+    ArchRProj = atac, 
+    useMatrix = "PeakMatrix", 
+    groupBy = "group",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  testMethod = "wilcoxon"
+)
+
+markerList <- getMarkers(markerPeaks, cutOff = "FDR <= 0.01 & Log2FC >= 1")
+markerList
+
+heatmapPeaks <- markerHeatmap(
+  seMarker = markerPeaks, 
+  cutOff = "FDR <= 0.1 & Log2FC >= 0.5",
+  transpose = TRUE
+)
+```
+
+
+
+```{r}
+# motif enirhcemnt
+motifsUp <- peakAnnoEnrichment(
+    seMarker = markerTest,
+    ArchRProj = atac,
+    peakAnnotation = "Motif",
+    cutOff = "FDR <= 0.1 & Log2FC >= 0.5"
+  )
+
+```
+

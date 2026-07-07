@@ -1,0 +1,1015 @@
+---
+title: "NK project: snATAC-seq — GSK3B accessibility and functional NK footprinting"
+author: "Dr. Sara Wernig-Zorc"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  out:  "/home/rstudio/mnt_out/NK_project/"
+  anno: "/home/rstudio/mnt_resources/"
+---
+
+Requires: `39_` to have been run first (saves `snATAC_NK_v20260625_modules.Rds`).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = FALSE,
+                      error = FALSE,
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = "future::multicore", workers = 20)
+options(future.globals.maxSize = 40 * 10^9)
+print(params)
+```
+
+```{r include=FALSE}
+source("/home/rstudio/00_NK_paper_setup.R")
+source("/home/rstudio/00_NK_paper_utils.R")
+```
+
+```{r include=FALSE}
+suppressPackageStartupMessages({
+  library(ArchR)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  library(JASPAR2024)
+  library(TFBSTools)
+  library(motifmatchr)
+  library(RSQLite)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(ggrepel)
+  library(patchwork)
+  library(tidyverse)
+})
+
+addArchRThreads(threads = 20)
+addArchRGenome("hg38")
+
+filter    <- dplyr::filter
+select    <- dplyr::select
+mutate    <- dplyr::mutate
+summarise <- dplyr::summarise
+rename    <- dplyr::rename
+count     <- dplyr::count
+group_by  <- dplyr::group_by
+ungroup   <- dplyr::ungroup
+arrange   <- dplyr::arrange
+slice_min <- dplyr::slice_min
+sub       <- base::sub
+gsub      <- base::gsub
+
+# Remap group label strings to canonical names used throughout the script.
+# Logic: anything with "atrx" but no "wt" → ATRXdel (catches ATRXdel/ATRXmut/ATRXm/ATRX_del etc.)
+#        anything with "atrx" and "wt"    → ATRXwtMYCNwt
+remap_group <- function(x) {
+  x <- as.character(x)
+  x[grepl("atrx", x, ignore.case = TRUE) & !grepl("wt", x, ignore.case = TRUE)] <- "ATRXdel"
+  x[grepl("atrx", x, ignore.case = TRUE) &  grepl("wt", x, ignore.case = TRUE)] <- "ATRXwtMYCNwt"
+  x[grepl("mycn", x, ignore.case = TRUE) &  grepl("amp", x, ignore.case = TRUE)] <- "MYCNamp"
+  x[grepl("^control$",            x, ignore.case = TRUE)] <- "control"
+  x
+}
+
+# Extract canonical group name from an ArchR clust_group column name.
+# ArchR appends "._.Rep1" to coverage column names, e.g. "C2_control._.Rep1".
+clust_col_to_group <- function(col_names) {
+  # strip cluster prefix (everything up to and including the first "_")
+  suffix <- sub("^[^_]+_", "", col_names)
+  # strip ArchR's rep suffix (e.g. "._.Rep1")
+  suffix <- sub("\\._\\.Rep.*$", "", suffix)
+  remap_group(suffix)
+}
+```
+
+```{r}
+theme_set(pub_theme)
+
+COL_ATAC_CLUSTER <- c(
+  "C1" = "#1B4F8A",
+  "C2" = "#2E7BB5",
+  "C3" = "#6AADD5",
+  "C4" = "#4A9B6F",
+  "C5" = "#8FC494",
+  "C6" = "#C0392B",
+  "C7" = "#E8837A"
+)
+
+COL_GROUP <- c(
+  "control"      = unname(COLOR_CODE_GROUP["control"]),
+  "ATRXdel"      = unname(COLOR_CODE_GROUP["ATRXdel"]),
+  "MYCNamp"      = unname(COLOR_CODE_GROUP["MYCNamp"]),
+  "ATRXwtMYCNwt" = unname(COLOR_CODE_GROUP["ATRXwtMYCNwt"])
+)
+
+GROUP_ORDER   <- c( "control","ATRXdel", "MYCNamp", "ATRXwtMYCNwt")
+CLUSTER_ORDER <- paste0("C", 1:7)
+
+CLUSTER_NAMES <- c(
+  "C1" = "CD56bright 1",
+  "C2" = "CD56bright 2",
+  "C3" = "CD56bright 3",
+  "C4" = "Intermediate 1",
+  "C5" = "Intermediate 2",
+  "C6" = "CD56dim 1",
+  "C7" = "CD56dim 2"
+)
+
+METACLUSTER <- c(
+  "C1" = "CD56bright", "C2" = "CD56bright", "C3" = "CD56bright",
+  "C4" = "Intermediate", "C5" = "Intermediate",
+  "C6" = "CD56dim", "C7" = "CD56dim"
+)
+```
+
+
+```{r}
+NK_SUBSET_ORDER <- c("hNK_Bm1", "hNK_Bm2", "hNK_Bm3", "hNK_Bm4")
+COL_NK_SUBSET   <- COLOR_CODE_v2[NK_SUBSET_ORDER]
+
+FUNCTIONAL_MAP <- c(
+  "hNK_Bm1" = "cytotoxic",
+  "hNK_Bm2" = "immunomodulatory",
+  "hNK_Bm3" = "immunomodulatory",
+  "hNK_Bm4" = "cytotoxic"
+)
+COL_FUNCTIONAL   <- c("immunomodulatory" = "#4A9B6F", "cytotoxic" = "#C0392B")
+FUNCTIONAL_ORDER <- c("immunomodulatory", "cytotoxic")
+
+GROUP_ORDER_PUB <- c("control", "ATRXdel", "MYCNamp", "ATRXwtMYCNwt")
+```
+
+
+# ___Load ArchR project (from 39a_) and rebuild lt_meta___
+
+```{r}
+proj_filt <- readRDS(paste0(params$out, "Rds/snATAC_NK_v20260625_modules.Rds"))
+
+# Restore Arrow file paths to current mount point
+proj_filt@projectMetadata$outputDirectory <- paste0(params$out, "ArchR_v20260203")
+proj_filt@sampleColData$ArrowFiles <- paste0(
+  params$out, "ArchR_v20260203/ArrowFiles/",
+  basename(as.character(proj_filt@sampleColData$ArrowFiles))
+)
+
+# Create clust_group column (cluster × group, e.g. "C1_control")
+proj_filt$clust_group <- paste0(
+  as.character(proj_filt$Clusters_res1), "_",
+  as.character(proj_filt$group)
+)
+
+cat("Loaded proj_filt:", nCells(proj_filt), "cells\n")
+cat("clust_group levels:", paste(sort(unique(proj_filt$clust_group)), collapse = ", "), "\n")
+
+lt_meta <- data.frame(
+  cell           = proj_filt$cellNames,
+  cluster        = factor(as.character(proj_filt$Clusters_res1), levels = CLUSTER_ORDER),
+  nk_subset      = factor(as.character(proj_filt$majority_vote_label), levels = NK_SUBSET_ORDER),
+  group          = factor(remap_group(as.character(proj_filt$group)), levels = GROUP_ORDER_PUB),
+  stringsAsFactors = FALSE
+)
+lt_meta$functional <- factor(
+  FUNCTIONAL_MAP[as.character(lt_meta$nk_subset)],
+  levels = FUNCTIONAL_ORDER
+)
+rownames(lt_meta) <- lt_meta$cell
+cat("lt_meta rebuilt:", nrow(lt_meta), "cells\n")
+```
+
+# ___PART II___
+
+# ___GSK3B differential chromatin accessibility___
+
+**Reviewer #2, question #2**
+
+Assess chromatin accessibility at the GSK3B gene body and promoter region (TSS +/- 2 kb)
+across all 7 ATAC clusters comparing genetic groups.
+
+## ___Define GSK3B locus___
+
+```{r}
+# Get GSK3B coordinates from the project's gene annotation
+gene_anno  <- getGeneAnnotation(proj_filt)
+gsk3b_gene <- gene_anno$genes[which(gene_anno$genes$symbol == "GSK3B")]
+
+if (length(gsk3b_gene) == 0) {
+  # Fallback: hg38 coordinates (chr3, minus strand)
+  gsk3b_gene <- GRanges("chr3", IRanges(119508042, 119742202), strand = "-",
+                         symbol = "GSK3B")
+  cat("GSK3B gene annotation not found in project; using hg38 hardcoded coordinates.\n")
+} else {
+  cat("GSK3B gene:", as.character(seqnames(gsk3b_gene)),
+      start(gsk3b_gene), "-", end(gsk3b_gene),
+      "strand:", as.character(strand(gsk3b_gene)), "\n")
+}
+
+# Define promoter: TSS +/- 2 kb
+tss_w <- 2000L
+if (as.character(strand(gsk3b_gene)) == "-") {
+  gsk3b_tss <- end(gsk3b_gene)
+} else {
+  gsk3b_tss <- start(gsk3b_gene)
+}
+
+gsk3b_promoter <- GRanges(
+  seqnames = seqnames(gsk3b_gene),
+  ranges   = IRanges(gsk3b_tss - tss_w, gsk3b_tss + tss_w),
+  strand   = strand(gsk3b_gene)
+)
+
+# Extended locus for browser track: gene body + 5 kb flanks
+gsk3b_locus <- GRanges(
+  seqnames = seqnames(gsk3b_gene),
+  ranges   = IRanges(
+    pmax(1L, start(gsk3b_gene) - 5000L),
+    end(gsk3b_gene) + 5000L
+  )
+)
+
+cat("GSK3B promoter (TSS +/-2kb):",
+    as.character(seqnames(gsk3b_promoter)),
+    start(gsk3b_promoter), "-", end(gsk3b_promoter), "\n")
+cat("GSK3B locus (+/-5kb):",
+    as.character(seqnames(gsk3b_locus)),
+    start(gsk3b_locus), "-", end(gsk3b_locus), "\n")
+```
+
+## ___Compute group coverages for clust_group___
+
+Required before `plotBrowserTrack` and pseudobulk peak accessibility.
+If 39b_ was already run, `force = TRUE` re-registers the existing BigWig files.
+
+```{r}
+proj_filt <- addGroupCoverages(
+  ArchRProj    = proj_filt,
+  groupBy      = "clust_group",
+  minCells     = 5,
+  maxCells     = 500,
+  maxFragments = 25 * 10^6,
+  force        = TRUE,
+  verbose      = TRUE
+)
+```
+
+## ___Browser track at GSK3B locus___
+
+```{r fig.height=6, fig.width=8}
+# Plot for each cluster: one track per genetic group within the cluster
+for (cl in CLUSTER_ORDER) {
+  cl_groups <- paste0(cl, "_", GROUP_ORDER)
+
+  tryCatch({
+    p_track <- plotBrowserTrack(
+      ArchRProj   = proj_filt,
+      groupBy     = "clust_group",
+      useGroups   = cl_groups,
+      geneSymbol  = "GSK3B",
+      region      = gsk3b_locus,
+      pal         = setNames(COL_GROUP[sub(paste0("^", cl, "_"), "", cl_groups)], cl_groups),
+      plotSummary = c("bulkTrack", "featureTrack", "geneTrack"),
+      sizes       = c(10, 1.5, 2),
+      tileSize    = 100,
+      upstream    = 5000,
+      downstream  = 5000
+    )
+    grid::grid.newpage()
+    grid::grid.draw(p_track)
+    pdf(paste0(params$out, "figures/snATAC_NK_GSK3B_browserTrack_", cl, ".pdf"),
+        height = 6, width = 8, useDingbats = FALSE)
+    grid::grid.draw(p_track); dev.off()
+    message("Browser track saved for cluster ", cl)
+  }, error = function(e) {
+    message("Browser track error for ", cl, ": ", conditionMessage(e))
+  })
+}
+```
+
+## ___Peak accessibility at GSK3B gene body + promoter___
+
+Extract peaks overlapping the GSK3B locus, aggregate accessibility per cell,
+and compare genetic groups within each cluster.
+
+```{r}
+peak_se <- getMatrixFromProject(proj_filt, useMatrix = "PeakMatrix")
+
+# Peaks overlapping GSK3B gene body OR promoter
+gsk3b_query <- c(gsk3b_gene, gsk3b_promoter)
+peak_gr     <- getPeakSet(proj_filt)
+ov_hits     <- findOverlaps(peak_gr, gsk3b_query, ignore.strand = TRUE)
+gsk3b_peak_idx <- unique(queryHits(ov_hits))
+
+cat("Peaks overlapping GSK3B locus (gene + promoter):", length(gsk3b_peak_idx), "\n")
+if (length(gsk3b_peak_idx) == 0) {
+  cat("WARNING: No peaks found at GSK3B locus. Check chromosome naming.\n")
+}
+```
+
+```{r}
+if (length(gsk3b_peak_idx) > 0) {
+  acc_mat <- assay(peak_se, "PeakMatrix")[gsk3b_peak_idx, , drop = FALSE]
+
+  # Determine which peaks are in promoter vs gene body
+  is_promoter <- gsk3b_peak_idx %in% queryHits(findOverlaps(
+    peak_gr, gsk3b_promoter, ignore.strand = TRUE
+  ))
+  is_genebody <- gsk3b_peak_idx %in% queryHits(findOverlaps(
+    peak_gr, gsk3b_gene, ignore.strand = TRUE
+  ))
+
+  cat("Promoter peaks:", sum(is_promoter), "\n")
+  cat("Gene body peaks:", sum(is_genebody), "\n")
+
+  # Per-cell sum accessibility over GSK3B region (binarised peak matrix → count)
+  cell_acc <- data.frame(
+    cell       = colnames(acc_mat),
+    acc_all    = colSums(acc_mat),
+    acc_promo  = if (any(is_promoter)) colSums(acc_mat[is_promoter, , drop = FALSE]) else 0,
+    acc_body   = if (any(is_genebody)) colSums(acc_mat[is_genebody, , drop = FALSE]) else 0
+  )
+
+  cell_df_gsk <- data.frame(
+    Clusters_res1 = as.character(proj_filt$Clusters_res1),
+    group         = as.character(proj_filt$group),
+    cell          = getCellNames(proj_filt),
+    stringsAsFactors = FALSE
+  )
+  cell_df_gsk <- left_join(cell_df_gsk, cell_acc, by = "cell") %>%
+    mutate(
+      Clusters_res1 = factor(Clusters_res1, levels = CLUSTER_ORDER),
+      group         = factor(group, levels = GROUP_ORDER)
+    )
+
+  head(cell_df_gsk)
+}
+```
+
+## ___Pseudobulk accessibility at GSK3B per cluster x group___
+
+```{r fig.height=6, fig.width=10}
+if (exists("cell_df_gsk") && nrow(cell_df_gsk) > 0 && !all(cell_df_gsk$acc_all == 0)) {
+
+  pb_gsk <- cell_df_gsk %>%
+    group_by(Clusters_res1, group) %>%
+    summarise(
+      n_cells    = n(),
+      mean_all   = mean(acc_all,   na.rm = TRUE),
+      mean_promo = mean(acc_promo, na.rm = TRUE),
+      mean_body  = mean(acc_body,  na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    filter(n_cells >= 5)
+
+  # Long format for plotting
+  pb_long <- pb_gsk %>%
+    pivot_longer(cols = c(mean_promo, mean_body),
+                 names_to = "region", values_to = "accessibility") %>%
+    mutate(region = recode(region,
+                           mean_promo = "GSK3B promoter (TSS +/-2kb)",
+                           mean_body  = "GSK3B gene body"))
+
+  p_pb <- ggplot(pb_long, aes(x = Clusters_res1, y = accessibility, fill = group)) +
+    geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+    facet_wrap(~ region, scales = "free_y", ncol = 1) +
+    scale_fill_manual(values = COL_GROUP) +
+    labs(
+      title    = "GSK3B chromatin accessibility per ATAC cluster",
+      subtitle = "Pseudobulk mean (cells >=5 per clust_group)",
+      x        = "ATAC cluster", y = "mean accessibility", fill = "genetic group"
+    ) +
+    theme(axis.text.x = element_text(angle = 35, hjust = 1),
+          legend.position = "top")
+
+  p_pb
+  pdf(paste0(params$out, "figures/snATAC_NK_GSK3B_pseudobulk_accessibility.pdf"),
+      height = 6, width = 10, useDingbats = FALSE)
+  p_pb; dev.off()
+}
+```
+
+## ___Per-cell violin plots at GSK3B per cluster___
+
+```{r fig.height=5, fig.width=12}
+if (exists("cell_df_gsk")) {
+  regions_to_plot <- list(
+    "GSK3B promoter (TSS +/-2kb)" = "acc_promo",
+    "GSK3B gene body"             = "acc_body"
+  )
+
+  for (region_label in names(regions_to_plot)) {
+    col_nm <- regions_to_plot[[region_label]]
+    p_vln <- ggplot(cell_df_gsk,
+                    aes(x = group, y = .data[[col_nm]], fill = group)) +
+      geom_violin(scale = "width", linewidth = 0.3, alpha = 0.8) +
+      geom_boxplot(width = 0.12, fill = "white", outlier.size = 0.3,
+                   linewidth = 0.3) +
+      facet_wrap(~ Clusters_res1, nrow = 2, labeller = as_labeller(CLUSTER_NAMES)) +
+      scale_fill_manual(values = COL_GROUP) +
+      labs(
+        title    = region_label,
+        subtitle = "Per-cell chromatin accessibility — genetic groups within each ATAC cluster",
+        x = NULL, y = "peak accessibility", fill = "genetic group"
+      ) +
+      theme(
+        axis.text.x    = element_text(angle = 40, hjust = 1, size = 7),
+        legend.position = "none"
+      )
+    print(p_vln)
+    pdf(paste0(params$out, "figures/snATAC_NK_GSK3B_",
+               gsub("[^A-Za-z0-9]+", "_", region_label), "_violin.pdf"),
+        height = 5, width = 12, useDingbats = FALSE)
+    print(p_vln); dev.off()
+  }
+}
+```
+
+## ___Wilcoxon tests: ATRXdel vs control per cluster___
+
+```{r}
+if (exists("cell_df_gsk")) {
+  regions_stat <- c(
+    "GSK3B promoter" = "acc_promo",
+    "GSK3B gene body" = "acc_body"
+  )
+
+  stat_results <- bind_rows(lapply(names(regions_stat), function(rl) {
+    col_nm <- regions_stat[[rl]]
+    bind_rows(lapply(CLUSTER_ORDER, function(cl) {
+      sub_df <- cell_df_gsk %>% filter(Clusters_res1 == cl)
+      bind_rows(lapply(
+        list(c("ATRXdel", "control"),
+             c("ATRXdel", "MYCNamp"),
+             c("ATRXdel", "ATRXwtMYCNwt"),
+             c("MYCNamp", "control")),
+        function(grp_pair) {
+          g1 <- sub_df %>% filter(group == grp_pair[1]) %>% pull(col_nm)
+          g2 <- sub_df %>% filter(group == grp_pair[2]) %>% pull(col_nm)
+          if (length(g1) < 5 || length(g2) < 5) return(NULL)
+          wt <- wilcox.test(g1, g2)
+          data.frame(
+            region    = rl,
+            cluster   = cl,
+            group1    = grp_pair[1],
+            group2    = grp_pair[2],
+            n1        = length(g1),
+            n2        = length(g2),
+            median1   = median(g1),
+            median2   = median(g2),
+            p_value   = wt$p.value,
+            stringsAsFactors = FALSE
+          )
+        }
+      ))
+    }))
+  }))
+
+  stat_results$p_adj <- p.adjust(stat_results$p_value, method = "BH")
+  stat_results$sig   <- stat_results$p_adj < 0.05
+  stat_results <- stat_results %>%
+    arrange(region, cluster, p_adj) %>%
+    mutate(across(c(p_value, p_adj), ~signif(.x, 3)))
+
+  cat("GSK3B accessibility — Wilcoxon tests (BH-adjusted):\n")
+  print(stat_results)
+
+  write.csv(stat_results,
+            paste0(params$out, "tables/snATAC_NK_GSK3B_accessibility_wilcoxon.csv"),
+            row.names = FALSE)
+}
+```
+
+## ___Peak-level accessibility heatmap at GSK3B___
+
+```{r fig.height=5, fig.width=8}
+if (exists("cell_df_gsk") && length(gsk3b_peak_idx) > 0) {
+  # Pseudobulk mean per peak per clust_group
+  cg_levels <- levels(proj_filt$clust_group)
+  cell_cg        <- as.character(proj_filt$clust_group)
+  names(cell_cg) <- getCellNames(proj_filt)
+
+  pb_peak_mat <- vapply(cg_levels, function(cg) {
+    cells <- names(cell_cg)[cell_cg == cg]
+    cells <- cells[cells %in% colnames(acc_mat)]
+    if (length(cells) < 5) return(rep(NA_real_, nrow(acc_mat)))
+    rowMeans(acc_mat[, cells, drop = FALSE], na.rm = TRUE)
+  }, numeric(nrow(acc_mat)))
+
+  # Row annotation: promoter vs gene body
+  peak_region <- ifelse(is_promoter, "promoter", ifelse(is_genebody, "gene body", "other"))
+  row_ha <- rowAnnotation(
+    region = peak_region,
+    col    = list(region = c("promoter" = "#D62728", "gene body" = "#1F77B4",
+                             "other" = "gray80")),
+    annotation_name_gp = gpar(fontsize = 8)
+  )
+
+  col_ann_pk <- data.frame(
+    cluster   = sub("_.*", "", colnames(pb_peak_mat)),
+    group     = sub("^[^_]+_", "", colnames(pb_peak_mat)),
+    row.names = colnames(pb_peak_mat)
+  )
+  ha_pk <- HeatmapAnnotation(
+    cluster = col_ann_pk$cluster,
+    group   = col_ann_pk$group,
+    col     = list(
+      cluster = COL_ATAC_CLUSTER[unique(col_ann_pk$cluster)],
+      group   = COL_GROUP[unique(col_ann_pk$group)]
+    ),
+    annotation_name_gp = gpar(fontsize = 8)
+  )
+
+  pb_peak_z <- t(scale(t(pb_peak_mat)))
+  pb_peak_z[is.nan(pb_peak_z)] <- 0
+  pb_peak_z[pb_peak_z >  2]   <-  2
+  pb_peak_z[pb_peak_z < -2]   <- -2
+
+  ht_peak <- Heatmap(
+    pb_peak_z,
+    name              = "accessibility\n(z-score)",
+    top_annotation    = ha_pk,
+    left_annotation   = row_ha,
+    row_names_gp      = gpar(fontsize = 7),
+    column_names_gp   = gpar(fontsize = 7),
+    col               = colorRamp2(c(-2, 0, 2), c("#2166AC", "white", "#B2182B")),
+    cluster_rows      = TRUE,
+    cluster_columns   = FALSE,
+    column_split      = col_ann_pk$cluster,
+    border            = TRUE,
+    column_title      = "GSK3B peak accessibility: 7 clusters x genetic groups",
+    column_title_gp   = gpar(fontsize = 10, fontface = "bold"),
+    show_row_names    = nrow(pb_peak_z) <= 50
+  )
+  draw(ht_peak)
+  pdf(paste0(params$out, "figures/snATAC_NK_GSK3B_peak_accessibility_heatmap.pdf"),
+      height = 5, width = 8, useDingbats = FALSE)
+  draw(ht_peak); dev.off()
+}
+```
+
+# ___TF footprinting: cytotoxic vs immunomodulatory NK (label transfer)___
+
+**Reviewer #2, question #2**
+
+Minimal functional label transfer: hNK_Bm1 + hNK_Bm4 → cytotoxic; hNK_Bm2 + hNK_Bm3 → immunomodulatory.
+Compares TF footprints between the two functional categories, and then within each category
+across genetic groups.
+
+## ___Add functional label to ArchR project___
+
+```{r}
+# Add functional category to cell metadata from majority_vote_label
+proj_filt$functional <- factor(
+  FUNCTIONAL_MAP[as.character(proj_filt$majority_vote_label)],
+  levels = FUNCTIONAL_ORDER
+)
+
+# Combined functional × group label for within-category group comparisons
+proj_filt$functional_group <- factor(
+  ifelse(
+    !is.na(proj_filt$functional) & !is.na(proj_filt$group),
+    paste0(as.character(proj_filt$functional), "_", as.character(proj_filt$group)),
+    NA_character_
+  )
+)
+
+cat("Functional label distribution:\n")
+print(table(proj_filt$functional, useNA = "always"))
+cat("\nFunctional × group distribution:\n")
+print(table(proj_filt$functional_group, useNA = "always"))
+```
+
+## ___Footprints: cytotoxic vs immunomodulatory (all groups pooled)___
+
+```{r}
+proj_filt <- addGroupCoverages(
+  ArchRProj    = proj_filt,
+  groupBy      = "functional",
+  minCells     = 10,
+  maxCells     = 1000,
+  maxFragments = 25 * 10^6,
+  force        = TRUE,
+  verbose      = TRUE
+)
+
+footprints_func <- getFootprints(
+  ArchRProj = proj_filt,
+  positions = motif_positions[tf_motif_names],
+  groupBy   = "functional",
+  flank     = 250
+)
+cat("Functional footprint columns:", paste(colnames(footprints_func), collapse = ", "), "\n")
+```
+
+```{r fig.height=5, fig.width=10}
+func_col_canonical <- function(col_names)
+  sub("\\._\\.Rep.*$", "", col_names)
+
+mat_func <- assay(footprints_func, "footprint")
+pos_seq   <- seq(-250, 250, length.out = ncol(mat_func))
+
+df_func <- dplyr::bind_rows(lapply(seq_len(nrow(tf_motif_map_valid)), function(i) {
+  motif <- tf_motif_map_valid$motif_name[i]
+  tf    <- tf_motif_map_valid$TF[i]
+  if (!(motif %in% rownames(mat_func))) return(NULL)
+  row_i <- which(rownames(mat_func) == motif)
+  dplyr::bind_rows(lapply(colnames(mat_func), function(g) {
+    data.frame(
+      TF         = tf,
+      functional = func_col_canonical(g),
+      position   = pos_seq,
+      footprint  = as.numeric(mat_func[row_i, g]),
+      stringsAsFactors = FALSE
+    )
+  }))
+})) %>%
+  dplyr::filter(!is.na(functional)) %>%
+  dplyr::mutate(functional = factor(functional, levels = FUNCTIONAL_ORDER))
+
+p_func <- ggplot(df_func, aes(x = position, y = footprint, color = functional)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60", linewidth = 0.3) +
+  geom_line(linewidth = 0.7, alpha = 0.9) +
+  facet_wrap(~ TF, scales = "free_y", ncol = 4) +
+  scale_color_manual(values = COL_FUNCTIONAL, labels = c("Immunomodulatory", "Cytotoxic")) +
+  labs(
+    title    = "TF footprints — cytotoxic vs immunomodulatory NK cells",
+    subtitle = "bias-subtracted; hNK_Bm1+Bm4 = cytotoxic, hNK_Bm2+Bm3 = immunomodulatory",
+    x        = "Distance from motif center (bp)",
+    y        = "Normalized insertion frequency",
+    color    = NULL
+  ) +
+  theme(legend.position = "top", strip.text = element_text(size = 8, face = "italic"),
+        panel.spacing = unit(2, "mm"))
+
+tryCatch(print(p_func), error = function(e) message(conditionMessage(e)))
+tryCatch({
+  pdf(paste0(params$out, "figures/snATAC_NK_footprints_functional-label.pdf"),
+      height = 5, width = 10, useDingbats = FALSE)
+  print(p_func); dev.off()
+}, error = function(e) { try(dev.off(), silent = TRUE); message(conditionMessage(e)) })
+```
+
+## ___Footprints: functional × genetic group___
+
+```{r}
+proj_filt <- addGroupCoverages(
+  ArchRProj    = proj_filt,
+  groupBy      = "functional_group",
+  minCells     = 5,
+  maxCells     = 500,
+  maxFragments = 25 * 10^6,
+  force        = TRUE,
+  verbose      = TRUE
+)
+
+footprints_func_grp <- getFootprints(
+  ArchRProj = proj_filt,
+  positions = motif_positions[tf_motif_names],
+  groupBy   = "functional_group",
+  flank     = 250
+)
+cat("Functional × group footprint columns:",
+    paste(colnames(footprints_func_grp), collapse = ", "), "\n")
+```
+
+```{r fig.height=5, fig.width=12}
+# Parse column names: "cytotoxic_ATRXdel._.Rep1" → functional + group
+fg_col_canonical <- function(col_names) {
+  x <- sub("\\._\\.Rep.*$", "", col_names)    # strip ._.Rep* suffix
+  data.frame(
+    functional = sub("_([^_]+)$", "", x),      # everything before last _group
+    group      = remap_group(sub(".*_", "", x)), # last segment = group
+    stringsAsFactors = FALSE
+  )
+}
+
+mat_fg  <- assay(footprints_func_grp, "footprint")
+pos_seq <- seq(-250, 250, length.out = ncol(mat_fg))
+fg_meta <- fg_col_canonical(colnames(mat_fg))
+
+FUNC_GROUP_ORDER <- as.vector(outer(FUNCTIONAL_ORDER, GROUP_ORDER,
+                                    paste, sep = "_"))
+
+df_fg <- dplyr::bind_rows(lapply(seq_len(nrow(tf_motif_map_valid)), function(i) {
+  motif <- tf_motif_map_valid$motif_name[i]
+  tf    <- tf_motif_map_valid$TF[i]
+  if (!(motif %in% rownames(mat_fg))) return(NULL)
+  row_i <- which(rownames(mat_fg) == motif)
+  do.call(rbind, lapply(seq_along(colnames(mat_fg)), function(j) {
+    data.frame(
+      TF         = tf,
+      functional = fg_meta$functional[j],
+      group      = fg_meta$group[j],
+      position   = pos_seq,
+      footprint  = as.numeric(mat_fg[row_i, j]),
+      stringsAsFactors = FALSE
+    )
+  }))
+})) %>%
+  dplyr::filter(!is.na(functional), !is.na(group)) %>%
+  dplyr::mutate(
+    functional = factor(functional, levels = FUNCTIONAL_ORDER),
+    group      = factor(group,      levels = GROUP_ORDER)
+  )
+
+# One panel per functional category, lines colored by group
+for (func_cat in FUNCTIONAL_ORDER) {
+  df_sub <- dplyr::filter(df_fg, functional == func_cat)
+  if (nrow(df_sub) == 0) next
+
+  p_fg <- ggplot(df_sub, aes(x = position, y = footprint, color = group)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray60", linewidth = 0.3) +
+    geom_line(linewidth = 0.6, alpha = 0.85) +
+    facet_wrap(~ TF, scales = "free_y", ncol = 4) +
+    scale_color_manual(values = COL_GROUP) +
+    labs(
+      title    = paste0("TF footprints — ", func_cat, " NK cells, by genetic group"),
+      subtitle = "bias-subtracted",
+      x        = "Distance from motif center (bp)",
+      y        = "Normalized insertion frequency",
+      color    = "genetic group"
+    ) +
+    theme(legend.position = "top", strip.text = element_text(size = 8, face = "italic"),
+          panel.spacing = unit(2, "mm"))
+
+  tryCatch(print(p_fg), error = function(e) message(conditionMessage(e)))
+  tryCatch({
+    pdf(paste0(params$out, "figures/snATAC_NK_footprints_", func_cat, "_by-group.pdf"),
+        height = 5, width = 10, useDingbats = FALSE)
+    print(p_fg); dev.off()
+  }, error = function(e) { try(dev.off(), silent = TRUE); message(conditionMessage(e)) })
+}
+```
+
+# ___Motif accessibility enrichment: chromVAR by functional label___
+
+**Reviewer #2, question #2**
+
+ChromVAR deviation scores quantify per-cell TF motif accessibility enrichment relative
+to background peaks. Here we compare the TFs of interest between cytotoxic and
+immunomodulatory NK cells, and across genetic groups within each functional category.
+
+## ___Extract chromVAR deviations for TFs of interest___
+
+```{r}
+chrom_func <- tryCatch({
+  chrom_se_full <- getMatrixFromProject(proj_filt, useMatrix = "MotifMatrix")
+  # Match TFs of interest to MotifMatrix row names
+  row_idx <- which(rowData(chrom_se_full)$name %in% tf_motif_map_valid$motif_name)
+  if (length(row_idx) == 0)
+    row_idx <- which(grepl(paste(TF_LIST, collapse = "|"),
+                           rowData(chrom_se_full)$name, ignore.case = TRUE))
+  if (length(row_idx) == 0) stop("No TF motifs found in MotifMatrix")
+
+  chrom_se_tf <- chrom_se_full[row_idx, ]
+  dev_mat     <- assay(chrom_se_tf, 2)          # assay 2 = z-score deviations
+  rownames(dev_mat) <- rowData(chrom_se_tf)$name
+
+  # Remap motif names to TF gene symbols
+  motif_to_tf <- setNames(tf_motif_map_valid$TF, tf_motif_map_valid$motif_name)
+  rownames(dev_mat) <- ifelse(rownames(dev_mat) %in% names(motif_to_tf),
+                              motif_to_tf[rownames(dev_mat)], rownames(dev_mat))
+
+  cell_meta_cv <- data.frame(
+    functional = as.character(proj_filt$functional),
+    group      = as.character(proj_filt$group),
+    func_grp   = paste0(as.character(proj_filt$functional), "_",
+                        as.character(proj_filt$group)),
+    row.names  = getCellNames(proj_filt),
+    stringsAsFactors = FALSE
+  )
+  list(dev_mat = dev_mat, cell_meta = cell_meta_cv)
+
+}, error = function(e) {
+  message("MotifMatrix not available: ", conditionMessage(e))
+  NULL
+})
+```
+
+## ___Heatmap: TF deviation by functional label (cytotoxic vs immunomodulatory)___
+
+```{r fig.height=5, fig.width=4}
+if (!is.null(chrom_func)) {
+  dev_mat   <- chrom_func$dev_mat
+  cell_meta <- chrom_func$cell_meta
+
+  # Pseudobulk mean per functional category
+  pb_func <- vapply(FUNCTIONAL_ORDER, function(f) {
+    cells <- rownames(cell_meta)[cell_meta$functional == f & !is.na(cell_meta$functional)]
+    cells <- cells[cells %in% colnames(dev_mat)]
+    if (length(cells) < 10) return(rep(NA_real_, nrow(dev_mat)))
+    rowMeans(dev_mat[, cells, drop = FALSE], na.rm = TRUE)
+  }, numeric(nrow(dev_mat)))
+
+  pb_func <- pb_func[, colSums(is.na(pb_func)) == 0, drop = FALSE]
+
+  ha_func <- HeatmapAnnotation(
+    functional = FUNCTIONAL_ORDER[seq_len(ncol(pb_func))],
+    col        = list(functional = COL_FUNCTIONAL),
+    simple_anno_size     = unit(3, "mm"),
+    annotation_name_side = "left",
+    annotation_name_gp   = gpar(fontsize = 8)
+  )
+
+  pb_func_z <- t(scale(t(pb_func)))
+  pb_func_z[is.nan(pb_func_z)] <- 0
+  pb_func_z[pb_func_z >  2] <-  2
+  pb_func_z[pb_func_z < -2] <- -2
+
+  ht_func <- Heatmap(
+    pb_func_z,
+    name              = "deviation\nz-score",
+    top_annotation    = ha_func,
+    row_names_gp      = gpar(fontsize = 8, fontface = "italic"),
+    column_names_gp   = gpar(fontsize = 9),
+    col               = colorRamp2(c(-2, 0, 2),
+                                   c(COL_FUNCTIONAL["cytotoxic"], "white",
+                                     COL_FUNCTIONAL["immunomodulatory"])),
+    cluster_rows      = TRUE,
+    cluster_columns   = FALSE,
+    border            = TRUE,
+    column_title      = "ChromVAR: cytotoxic vs immunomodulatory NK",
+    column_title_gp   = gpar(fontsize = 9, fontface = "bold")
+  )
+  draw(ht_func)
+  pdf(paste0(params$out, "figures/snATAC_NK_chromVAR_TF_functional-label_heatmap.pdf"),
+      height = 5, width = 4, useDingbats = FALSE)
+  draw(ht_func); dev.off()
+}
+```
+
+## ___Heatmap: TF deviation by functional × genetic group___
+
+```{r fig.height=5, fig.width=7}
+if (!is.null(chrom_func)) {
+  dev_mat   <- chrom_func$dev_mat
+  cell_meta <- chrom_func$cell_meta
+
+  fg_levels <- as.vector(outer(FUNCTIONAL_ORDER, GROUP_ORDER, paste, sep = "_"))
+
+  pb_fg <- vapply(fg_levels, function(fg) {
+    cells <- rownames(cell_meta)[cell_meta$func_grp == fg & !is.na(cell_meta$functional)]
+    cells <- cells[cells %in% colnames(dev_mat)]
+    if (length(cells) < 5) return(rep(NA_real_, nrow(dev_mat)))
+    rowMeans(dev_mat[, cells, drop = FALSE], na.rm = TRUE)
+  }, numeric(nrow(dev_mat)))
+
+  # Drop columns with insufficient cells
+  keep_cols <- colSums(is.na(pb_fg)) == 0
+  pb_fg     <- pb_fg[, keep_cols, drop = FALSE]
+  fg_keep   <- fg_levels[keep_cols]
+
+  fg_ann <- data.frame(
+    functional = sub("_.*", "", fg_keep),
+    group      = sub("^[^_]+_", "", fg_keep),
+    row.names  = fg_keep
+  )
+
+  ha_fg <- HeatmapAnnotation(
+    functional = fg_ann$functional,
+    group      = fg_ann$group,
+    col        = list(
+      functional = COL_FUNCTIONAL[unique(fg_ann$functional)],
+      group      = COL_GROUP[unique(fg_ann$group)]
+    ),
+    simple_anno_size     = unit(3, "mm"),
+    annotation_name_side = "left",
+    annotation_name_gp   = gpar(fontsize = 8)
+  )
+
+  pb_fg_z <- t(scale(t(pb_fg)))
+  pb_fg_z[is.nan(pb_fg_z)] <- 0
+  pb_fg_z[pb_fg_z >  2] <-  2
+  pb_fg_z[pb_fg_z < -2] <- -2
+
+  ht_fg <- Heatmap(
+    pb_fg_z,
+    name              = "deviation\nz-score",
+    top_annotation    = ha_fg,
+    row_names_gp      = gpar(fontsize = 8, fontface = "italic"),
+    column_names_gp   = gpar(fontsize = 7),
+    col               = colorRamp2(c(-2, 0, 2), c("#2166AC", "white", "#B2182B")),
+    cluster_rows      = TRUE,
+    cluster_columns   = FALSE,
+    column_split      = fg_ann$functional,
+    column_gap        = unit(3, "mm"),
+    border            = TRUE,
+    column_title_gp   = gpar(fontsize = 9, fontface = "bold"),
+    column_title      = "ChromVAR TF deviation: functional label × genetic group"
+  )
+  draw(ht_fg)
+  pdf(paste0(params$out, "figures/snATAC_NK_chromVAR_TF_functional-x-group_heatmap.pdf"),
+      height = 5, width = 7, useDingbats = FALSE)
+  draw(ht_fg); dev.off()
+}
+```
+
+## ___Violin plots: TF deviation per functional label (per TF)___
+
+```{r fig.height=5, fig.width=10}
+if (!is.null(chrom_func)) {
+  dev_mat   <- chrom_func$dev_mat
+  cell_meta <- chrom_func$cell_meta
+
+  df_dev <- as.data.frame(t(dev_mat)) %>%
+    tibble::rownames_to_column("cell") %>%
+    tidyr::pivot_longer(-cell, names_to = "TF", values_to = "deviation") %>%
+    dplyr::left_join(tibble::rownames_to_column(cell_meta, "cell"), by = "cell") %>%
+    dplyr::filter(!is.na(functional)) %>%
+    dplyr::mutate(
+      functional = factor(functional, levels = FUNCTIONAL_ORDER),
+      group      = factor(group, levels = GROUP_ORDER)
+    )
+
+  p_dev_func <- ggplot(df_dev, aes(x = functional, y = deviation, fill = functional)) +
+    geom_violin(scale = "width", trim = TRUE, linewidth = 0, alpha = 0.9) +
+    ggpubr::stat_compare_means(
+      comparisons = list(c("immunomodulatory", "cytotoxic")),
+      method      = "wilcox.test",
+      label       = "p.signif",
+      size        = 3,
+      symnum.args = list(cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1),
+                         symbols   = c("****", "***", "**", "*", "ns"))
+    ) +
+    facet_wrap(~ TF, scales = "free_y", ncol = 4) +
+    scale_fill_manual(values = COL_FUNCTIONAL) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+    labs(
+      title = "ChromVAR TF deviation: cytotoxic vs immunomodulatory NK",
+      x = NULL, y = "chromVAR deviation z-score", fill = NULL
+    ) +
+    theme(legend.position = "top",
+          strip.text      = element_text(size = 8, face = "italic"),
+          axis.text.x     = element_blank(),
+          axis.ticks.x    = element_blank())
+
+  tryCatch(print(p_dev_func), error = function(e) message(conditionMessage(e)))
+  tryCatch({
+    pdf(paste0(params$out, "figures/snATAC_NK_chromVAR_TF_functional-label_violins.pdf"),
+        height = 5, width = 10, useDingbats = FALSE)
+    print(p_dev_func); dev.off()
+  }, error = function(e) { try(dev.off(), silent = TRUE); message(conditionMessage(e)) })
+}
+```
+
+## ___Violin plots: TF deviation per group, split by functional label___
+
+```{r fig.height=8, fig.width=10}
+if (!is.null(chrom_func)) {
+  # One row per TF, facet column = functional category, fill = group
+  p_dev_grp <- ggplot(df_dev, aes(x = group, y = deviation, fill = group)) +
+    geom_violin(scale = "width", trim = TRUE, linewidth = 0, alpha = 0.9) +
+    facet_grid(TF ~ functional, scales = "free_y") +
+    scale_fill_manual(values = COL_GROUP) +
+    scale_x_discrete(labels = function(x) {
+      lbl <- c(control = "CTRL", ATRXdel = "ATRXdel",
+                MYCNamp = "MYCNamp", ATRXwtMYCNwt = "ATRXwt")
+      ifelse(x %in% names(lbl), lbl[x], x)
+    }) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+    labs(
+      title = "ChromVAR TF deviation by genetic group and functional label",
+      x = NULL, y = "chromVAR deviation z-score", fill = "genetic group"
+    ) +
+    theme(legend.position  = "top",
+          strip.text.x     = element_text(size = 9, face = "bold"),
+          strip.text.y     = element_text(size = 7, face = "italic"),
+          axis.text.x      = element_text(angle = 45, hjust = 1, size = 7),
+          panel.spacing    = unit(1.5, "mm"))
+
+  tryCatch(print(p_dev_grp), error = function(e) message(conditionMessage(e)))
+  tryCatch({
+    n_tfs <- length(unique(df_dev$TF))
+    pdf(paste0(params$out,
+               "figures/snATAC_NK_chromVAR_TF_group-x-functional_violins.pdf"),
+        height = max(6, n_tfs * 1.5), width = 7, useDingbats = FALSE)
+    print(p_dev_grp); dev.off()
+  }, error = function(e) { try(dev.off(), silent = TRUE); message(conditionMessage(e)) })
+}
+```
+
+# ___Save updated ArchR project___
+
+```{r eval=FALSE}
+saveRDS(proj_filt,
+        file = paste0(params$out,
+                      "ArchR_v20260203/ATAC_analysis_v20260625_withClustGroup.Rds"))
+```
+
+
+
+```{r render, eval=FALSE, include=FALSE}
+rmarkdown::render(
+  "/home/rstudio/code/NK-NB_study/code/39c_20260625_snATAC_NK_GSK3B_functional.Rmd",
+  output_file = paste0(params$out, "html/39c_20260625_snATAC_NK_GSK3B_functional.html")
+)
+```
+
+# ___The End___

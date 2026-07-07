@@ -1,0 +1,291 @@
+---
+title: "NK project: snATAC-seq — Data prep (module scoring)"
+author: "Dr. Sara Wernig-Zorc"
+date: "`r format(Sys.time(), '%B %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  out:  "/home/rstudio/mnt_out/NK_project/"
+  anno: "/home/rstudio/mnt_resources/"
+---
+
+Preprocessing script — run **before** 39a_, 39b_, and 39c_.
+
+Loads the ArchR project, adds per-cell module scores for M1–M25, and saves
+`proj_filt` + `score_df` as Rds files that all three downstream scripts consume.
+
+Outputs:
+- `Rds/snATAC_NK_v20260625_modules.Rds`  — ArchR project with module scores
+- `Rds/snATAC_NK_score_df_v20260625.Rds` — score data frame (cells × modules)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = FALSE,
+                      error = FALSE,
+                      messages = FALSE,
+                      warning = FALSE)
+
+library(parallel)
+future::plan(strategy = "future::multicore", workers = 20)
+options(future.globals.maxSize = 40 * 10^9)
+print(params)
+```
+
+```{r include=FALSE}
+source("/home/rstudio/00_NK_paper_setup.R")
+source("/home/rstudio/00_NK_paper_utils.R")
+```
+
+# ___Load packages___
+
+```{r include=FALSE}
+suppressPackageStartupMessages({
+  library(ArchR)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  library(JASPAR2024)
+  library(TFBSTools)
+  library(motifmatchr)
+  library(RSQLite)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(ggrepel)
+  library(patchwork)
+  library(tidyverse)
+})
+
+addArchRThreads(threads = 20)
+addArchRGenome("hg38")
+
+filter    <- dplyr::filter
+select    <- dplyr::select
+mutate    <- dplyr::mutate
+summarise <- dplyr::summarise
+rename    <- dplyr::rename
+count     <- dplyr::count
+group_by  <- dplyr::group_by
+ungroup   <- dplyr::ungroup
+arrange   <- dplyr::arrange
+slice_min <- dplyr::slice_min
+sub       <- base::sub
+gsub      <- base::gsub
+
+# Remap group label strings to canonical names used throughout the script.
+# Logic: anything with "atrx" but no "wt" → ATRXdel (catches ATRXdel/ATRXmut/ATRXm/ATRX_del etc.)
+#        anything with "atrx" and "wt"    → ATRXwtMYCNwt
+remap_group <- function(x) {
+  x <- as.character(x)
+  x[grepl("atrx", x, ignore.case = TRUE) & !grepl("wt", x, ignore.case = TRUE)] <- "ATRXdel"
+  x[grepl("atrx", x, ignore.case = TRUE) &  grepl("wt", x, ignore.case = TRUE)] <- "ATRXwtMYCNwt"
+  x[grepl("mycn", x, ignore.case = TRUE) &  grepl("amp", x, ignore.case = TRUE)] <- "MYCNamp"
+  x[grepl("^control$",            x, ignore.case = TRUE)] <- "control"
+  x
+}
+
+# Extract canonical group name from an ArchR clust_group column name.
+# ArchR appends "._.Rep1" to coverage column names, e.g. "C2_control._.Rep1".
+clust_col_to_group <- function(col_names) {
+  # strip cluster prefix (everything up to and including the first "_")
+  suffix <- sub("^[^_]+_", "", col_names)
+  # strip ArchR's rep suffix (e.g. "._.Rep1")
+  suffix <- sub("\\._\\.Rep.*$", "", suffix)
+  remap_group(suffix)
+}
+```
+
+```{r}
+theme_set(pub_theme)
+
+COL_ATAC_CLUSTER <- c(
+  "C1" = "#1B4F8A",
+  "C2" = "#2E7BB5",
+  "C3" = "#6AADD5",
+  "C4" = "#4A9B6F",
+  "C5" = "#8FC494",
+  "C6" = "#C0392B",
+  "C7" = "#E8837A"
+)
+
+COL_GROUP <- c(
+  "control"      = unname(COLOR_CODE_GROUP["control"]),
+  "ATRXdel"      = unname(COLOR_CODE_GROUP["ATRXdel"]),
+  "MYCNamp"      = unname(COLOR_CODE_GROUP["MYCNamp"]),
+  "ATRXwtMYCNwt" = unname(COLOR_CODE_GROUP["ATRXwtMYCNwt"])
+)
+
+GROUP_ORDER   <- c( "control","ATRXdel", "MYCNamp", "ATRXwtMYCNwt")
+CLUSTER_ORDER <- paste0("C", 1:7)
+
+CLUSTER_NAMES <- c(
+  "C1" = "CD56bright 1",
+  "C2" = "CD56bright 2",
+  "C3" = "CD56bright 3",
+  "C4" = "Intermediate 1",
+  "C5" = "Intermediate 2",
+  "C6" = "CD56dim 1",
+  "C7" = "CD56dim 2"
+)
+
+METACLUSTER <- c(
+  "C1" = "CD56bright", "C2" = "CD56bright", "C3" = "CD56bright",
+  "C4" = "Intermediate", "C5" = "Intermediate",
+  "C6" = "CD56dim", "C7" = "CD56dim"
+)
+```
+
+# ___Load ArchR project___
+
+```{r}
+proj_filt <- readRDS(file = paste0(params$out, "ArchR_v20260203/ATAC_analysis_v20260203.Rds"))
+
+# Update output directory and Arrow file paths to current mount point
+proj_filt@projectMetadata$outputDirectory <- paste0(params$out, "ArchR_v20260203")
+proj_filt@sampleColData$ArrowFiles <- paste0(
+  params$out, "ArchR_v20260203/ArrowFiles/",
+  basename(as.character(proj_filt@sampleColData$ArrowFiles))
+)
+
+cat("Arrow file path set to:\n",
+    as.character(proj_filt@sampleColData$ArrowFiles), "\n")
+cat("Arrow file exists:", file.exists(as.character(proj_filt@sampleColData$ArrowFiles)), "\n")
+
+# Inspect raw values before any conversion — catches spelling mismatches
+raw_groups   <- sort(unique(as.character(proj_filt$group)))
+raw_clusters <- sort(unique(as.character(proj_filt$Clusters_res1)))
+cat("Raw group values in project:  ", paste(raw_groups,   collapse = ", "), "\n")
+cat("Raw cluster values in project:", paste(raw_clusters, collapse = ", "), "\n")
+
+proj_filt$group <- factor(remap_group(proj_filt$group), levels = GROUP_ORDER)
+
+na_count <- sum(is.na(proj_filt$group))
+if (na_count > 0) {
+  warning(na_count, " cells have NA group after remapping — check raw_groups above")
+} else {
+  cat("Group remapping OK. Canonical values:", paste(levels(proj_filt$group), collapse = ", "), "\n")
+  print(table(proj_filt$group, useNA = "always"))
+}
+
+# Add metadata
+proj_filt$Cluster_name  <- CLUSTER_NAMES[as.character(proj_filt$Clusters_res1)]
+proj_filt$Metacluster   <- METACLUSTER[as.character(proj_filt$Clusters_res1)]
+proj_filt$Clusters_res1 <- factor(proj_filt$Clusters_res1, levels = CLUSTER_ORDER)
+
+cat("\nCells:", nrow(getCellColData(proj_filt)), "\n")
+cat("Clusters (Clusters_res1):\n")
+print(table(proj_filt$Clusters_res1))
+cat("\nGenetic groups (after remap):\n")
+print(table(proj_filt$group, useNA = "always"))
+cat("\nCluster x group:\n")
+print(table(proj_filt$Clusters_res1, proj_filt$group))
+```
+
+# ___NK cell gene module scoring (M1–M25)___
+
+Adds per-cell gene-activity module scores to `proj_filt` using
+`addModuleScore()` (GeneScoreMatrix). Results are stored both inside the
+ArchR project (as `proj_filt$M1.score`, ...) and in `score_df`.
+
+```{r}
+library(ArchR)
+library(SummarizedExperiment)
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+
+set.seed(42)
+
+# Resolve Bioconductor/plyr conflicts with dplyr
+filter    <- dplyr::filter
+select    <- dplyr::select
+mutate    <- dplyr::mutate
+summarise <- dplyr::summarise
+rename    <- dplyr::rename
+count     <- dplyr::count
+
+module_dir   <- "/home/rstudio/mnt_out/NK_project/tables/NK_module_genes"
+cluster_col  <- "Clusters_res1"
+group_col    <- "group"
+z_cap        <- 2.0
+
+group_order   <- c("control", "ATRXdel", "MYCNamp", "ATRXwtMYCNwt")
+cluster_order <- paste0("C", 1:7)
+
+# Load gene lists for M1-M25
+module_files <- list.files(module_dir, pattern = "module_\\d+_genes\\.csv",
+                           full.names = TRUE)
+module_nums  <- as.integer(gsub(".*module_(\\d+)_genes\\.csv", "\\1",
+                                basename(module_files)))
+module_files <- module_files[order(module_nums)]
+module_genes <- lapply(module_files, function(f) read.csv(f)$gene)
+names(module_genes) <- paste0("M", sort(module_nums))
+message("Loaded ", length(module_genes), " modules: ",
+        paste(names(module_genes), collapse = ", "))
+
+# ---- ArchR native addModuleScore (GeneScoreMatrix) — one module at a time ----
+# Passing all modules as a named list fails in current ArchR (assigns 25 values
+# to all cells instead of per-cell scores). Add each module individually instead,
+# matching the pattern used for MatureNK / AdaptiveNK below.
+gsm_genes <- getFeatures(proj_filt, useMatrix = "GeneScoreMatrix")
+for (mod_name in names(module_genes)) {
+  genes_valid <- intersect(module_genes[[mod_name]], gsm_genes)
+  if (length(genes_valid) == 0) {
+    message("No valid genes for ", mod_name, " in GeneScoreMatrix — skipping")
+    next
+  }
+  message(mod_name, ": ", length(genes_valid), "/", length(module_genes[[mod_name]]),
+          " genes found in GeneScoreMatrix")
+  proj_filt <- addModuleScore(
+    ArchRProj = proj_filt,
+    useMatrix = "GeneScoreMatrix",
+    name      = mod_name,
+    features  = list(score = genes_valid)
+  )
+}
+
+# Retrieve scores — ArchR names columns "<name>.score", e.g. "M1.score"
+module_cols <- paste0(names(module_genes), ".score")
+score_raw   <- as.data.frame(
+  getCellColData(proj_filt, select = c(cluster_col, group_col, module_cols))
+)
+colnames(score_raw)[1:2] <- c("cluster", "group")
+score_raw$group <- remap_group(as.character(score_raw$group))
+
+# Rename "M1.score" → "M1" etc. for downstream compatibility
+score_df        <- score_raw
+colnames(score_df)[3:(2 + length(module_genes))] <- names(module_genes)
+score_df$cell   <- rownames(score_df)
+
+stopifnot(sum(!is.na(score_df$cluster)) > 0)
+message("score_df: ", nrow(score_df), " cells, ",
+        sum(!is.na(score_df$M1)), " with M1 scores")
+
+# ___Save___
+
+```{r}
+dir.create(paste0(params$out, "Rds"), showWarnings = FALSE, recursive = TRUE)
+
+saveRDS(proj_filt,
+        file = paste0(params$out, "Rds/snATAC_NK_v20260625_modules.Rds"))
+saveRDS(score_df,
+        file = paste0(params$out, "Rds/snATAC_NK_score_df_v20260625.Rds"))
+
+message("Saved proj_filt (",
+        nCells(proj_filt), " cells) → snATAC_NK_v20260625_modules.Rds")
+message("Saved score_df (", nrow(score_df), " rows) → snATAC_NK_score_df_v20260625.Rds")
+```
+
+# ___The End___
+
+```{r render, eval=FALSE, include=FALSE}
+rmarkdown::render(
+  "/home/rstudio/code/NK-NB_study/code/39_00_20260625_snATAC_NK_prep.Rmd",
+  output_file = paste0(params$out, "html/39_00_20260625_snATAC_NK_prep.html")
+)
+```
