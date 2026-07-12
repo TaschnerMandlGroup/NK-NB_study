@@ -1,11 +1,13 @@
 # =============================================================================
 # 04_pseudobulk_stats.R
 # Cross-group test of in silico TF-perturbation effects on the cytotoxicity
-# module, aggregated to ONE value per patient before testing.
+# module, aggregated to ONE value per patient before testing, and stratified
+# by NK subtype cluster (predicted_NK_type_de.n350) now that 03_grn_perturb.py
+# fits one GRN per cluster x genetic_group unit instead of pooling subtypes.
 #
 # Covers four perturbations: TBX21 KO/OE and RUNX3 KO/OE, using one shared
 # helper so all four are processed identically, then combined into a single
-# 4-panel comparison figure.
+# 4-panel comparison figure per cluster.
 #
 # Why patient-level: cells from the same donor are not independent. Testing at
 # the cell level (pseudoreplication) inflates the FDR and can manufacture
@@ -15,7 +17,10 @@
 #   Zimmerman et al., Nat Commun 2021; sc-best-practices (DGE chapter)
 #
 # With 3-5 patients/group (~12-20 donors) a patient-level linear model is
-# appropriate and honest for the rebuttal.
+# appropriate and honest for the rebuttal. Stratifying further by cluster
+# shrinks the per-cell N feeding each patient mean, not the number of patients
+# (the model's inferential unit) -- but clusters with very few contributing
+# cells per patient will still give noisier pseudobulk means; inspect n_cells.
 #
 # patchwork (panel composition): Pedersen, T.L. -- https://patchwork.data-imaging.dev/
 # =============================================================================
@@ -24,51 +29,16 @@ suppressPackageStartupMessages({
   library(data.table); library(emmeans); library(ggplot2); library(patchwork)
 })
 
-id_cols <- c("V1", "cell", "group", "patient")
+source("/home/rstudio/GRN/pseudobulk_helpers.R")  # run_perturb_analysis / run_perturb_analysis_by_cluster / run_single_gene_analysis
+                                 # (also used by 09_additional_TF_cluster_stats.R)
 
-# ---- helper: pseudobulk -> lm -> emmeans -> pairs -> ggplot panel ----------
-run_perturb_analysis <- function(csv_path, label, id_cols) {
-  d <- fread(csv_path)
-  cyto_cols <- setdiff(colnames(d), id_cols)
-  cyto_cols <- cyto_cols[!cyto_cols %in% c("group", "patient")]
-  message(label, " cytotoxicity genes: ", paste(cyto_cols, collapse = ", "))
-  
-  d[, cyto_delta := rowMeans(.SD, na.rm = TRUE), .SDcols = cyto_cols]
-  
-  # ---- pseudobulk: one value per patient -----------------------------------
-  pb <- d[, .(cyto_delta = mean(cyto_delta, na.rm = TRUE),
-              n_cells    = .N),
-          by = .(patient, group)]
-  pb[, group := relevel(factor(group), ref = "control")]
-  print(pb[order(group, patient)])
-  
-  # ---- patient-level model --------------------------------------------------
-  fit <- lm(cyto_delta ~ group, data = pb)
-  
-  cat("\n=== ", label, " ===\n")
-  cat("--- lm(cyto_delta ~ group) ---\n"); print(summary(fit))
-  cat("--- per-group estimated marginal means (vs 0) ---\n"); print(emmeans(fit, ~ group))
-  cat("--- pairwise genotype contrasts (Tukey) ---\n"); print(pairs(emmeans(fit, ~ group)))
-  
-  # ---- panel for the combined figure ---------------------------------------
-  p <- ggplot(pb, aes(group, cyto_delta)) +
-    geom_hline(yintercept = 0, linetype = 2, colour = "grey60") +
-    geom_boxplot(outlier.shape = NA, width = 0.6) +
-    geom_jitter(aes(size = n_cells), width = 0.12, alpha = 0.7) +
-    labs(title = label, x = NULL,
-         y = "\u0394 cytotoxicity module (patient mean)",
-         size = "cells/patient") +
-    theme_bw(base_size = 11) +
-    theme(axis.text.x = element_text(angle = 30, hjust = 1))
-  
-  list(pb = pb, fit = fit, plot = p)
-}
+id_cols <- c("V1", "cell", "group", "cluster", "patient")
 
 # ---- run all four perturbations --------------------------------------------
-res_tbx21_ko <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas.csv",          "TBX21 KO", id_cols)
-res_tbx21_oe <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_OE.csv",       "TBX21 OE", id_cols)
-res_runx3_ko <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_RUNX3_KO.csv", "RUNX3 KO", id_cols)
-res_runx3_oe <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_RUNX3_OE.csv", "RUNX3 OE", id_cols)
+res_tbx21_ko <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas.csv",          "TBX21 KO", id_cols)
+res_tbx21_oe <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas_OE.csv",       "TBX21 OE", id_cols)
+res_runx3_ko <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas_RUNX3_KO.csv", "RUNX3 KO", id_cols)
+res_runx3_oe <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas_RUNX3_OE.csv", "RUNX3 OE", id_cols)
 
 # ---- combined 4-panel figure -------------------------------------------------
 combined <- (res_tbx21_ko$plot | res_tbx21_oe$plot) /
@@ -86,42 +56,13 @@ message("Wrote TBX21_RUNX3_KO_OE_combined.pdf")
 # links_dict check), so any signal here reflects an indirect, multi-step
 # propagated effect (n_propagation=3), not a direct regulatory link.
 # Single-gene readout (TBX21), not a multi-gene module, so no rowMeans step.
+# run_single_gene_analysis() is defined in pseudobulk_helpers.R (sourced above).
 # =============================================================================
 
-run_single_gene_analysis <- function(csv_path, label, gene_col, id_cols) {
-  d <- fread(csv_path)
-  setnames(d, gene_col, "gene_delta")
-  
-  pb <- d[, .(gene_delta = mean(gene_delta, na.rm = TRUE),
-              n_cells    = .N),
-          by = .(patient, group)]
-  pb[, group := relevel(factor(group), ref = "control")]
-  print(pb[order(group, patient)])
-  
-  fit <- lm(gene_delta ~ group, data = pb)
-  
-  cat("\n=== ", label, " ===\n")
-  cat("--- lm(gene_delta ~ group) ---\n"); print(summary(fit))
-  cat("--- per-group estimated marginal means (vs 0) ---\n"); print(emmeans(fit, ~ group))
-  cat("--- pairwise genotype contrasts (Tukey) ---\n"); print(pairs(emmeans(fit, ~ group)))
-  
-  p <- ggplot(pb, aes(group, gene_delta)) +
-    geom_hline(yintercept = 0, linetype = 2, colour = "grey60") +
-    geom_boxplot(outlier.shape = NA, width = 0.6) +
-    geom_jitter(aes(size = n_cells), width = 0.12, alpha = 0.7) +
-    labs(title = label, x = NULL,
-         y = "\u0394 TBX21 expression (patient mean)",
-         size = "cells/patient") +
-    theme_bw(base_size = 11) +
-    theme(axis.text.x = element_text(angle = 30, hjust = 1))
-  
-  list(pb = pb, fit = fit, plot = p)
-}
-
 res_runx3_ko_tbx21 <- run_single_gene_analysis(
-  "/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_RUNX3_KO_TBX21.csv", "RUNX3 KO \u2192 TBX21", "TBX21", id_cols)
+  "/home/rstudio/GRN/perturb_deltas_RUNX3_KO_TBX21.csv", "RUNX3 KO \u2192 TBX21", "TBX21", id_cols)
 res_runx3_oe_tbx21 <- run_single_gene_analysis(
-  "/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_RUNX3_OE_TBX21.csv", "RUNX3 OE \u2192 TBX21", "TBX21", id_cols)
+  "/home/rstudio/GRN/perturb_deltas_RUNX3_OE_TBX21.csv", "RUNX3 OE \u2192 TBX21", "TBX21", id_cols)
 
 combined_tbx21_link <- (res_runx3_ko_tbx21$plot | res_runx3_oe_tbx21$plot) +
   plot_layout(guides = "collect") &
@@ -138,17 +79,17 @@ message("Wrote RUNX3_to_TBX21_link.pdf")
 # MEF2C KO/OE (edges to both TBX21 and RUNX3) and KLF2 KO/OE (edge to RUNX3)
 # =============================================================================
 
-res_mef2c_ko <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_MEF2C_KO.csv", "MEF2C KO", id_cols)
-res_mef2c_oe <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_MEF2C_OE.csv", "MEF2C OE", id_cols)
-res_klf2_ko  <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_KLF2_KO.csv",  "KLF2 KO",  id_cols)
-res_klf2_oe  <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_KLF2_OE.csv",  "KLF2 OE",  id_cols)
+res_mef2c_ko <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas_MEF2C_KO.csv", "MEF2C KO", id_cols)
+res_mef2c_oe <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas_MEF2C_OE.csv", "MEF2C OE", id_cols)
+res_klf2_ko  <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas_KLF2_KO.csv",  "KLF2 KO",  id_cols)
+res_klf2_oe  <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas_KLF2_OE.csv",  "KLF2 OE",  id_cols)
 
-res_mef2c_ko_tbx21 <- run_single_gene_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_MEF2C_KO_TBX21.csv", "MEF2C KO -> TBX21", "TBX21", id_cols)
-res_mef2c_oe_tbx21 <- run_single_gene_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_MEF2C_OE_TBX21.csv", "MEF2C OE -> TBX21", "TBX21", id_cols)
-res_mef2c_ko_runx3 <- run_single_gene_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_MEF2C_KO_RUNX3.csv", "MEF2C KO -> RUNX3", "RUNX3", id_cols)
-res_mef2c_oe_runx3 <- run_single_gene_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_MEF2C_OE_RUNX3.csv", "MEF2C OE -> RUNX3", "RUNX3", id_cols)
-res_klf2_ko_runx3  <- run_single_gene_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_KLF2_KO_RUNX3.csv",  "KLF2 KO -> RUNX3",  "RUNX3", id_cols)
-res_klf2_oe_runx3  <- run_single_gene_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_KLF2_OE_RUNX3.csv",  "KLF2 OE -> RUNX3",  "RUNX3", id_cols)
+res_mef2c_ko_tbx21 <- run_single_gene_analysis("/home/rstudio/GRN/perturb_deltas_MEF2C_KO_TBX21.csv", "MEF2C KO -> TBX21", "TBX21", id_cols)
+res_mef2c_oe_tbx21 <- run_single_gene_analysis("/home/rstudio/GRN/perturb_deltas_MEF2C_OE_TBX21.csv", "MEF2C OE -> TBX21", "TBX21", id_cols)
+res_mef2c_ko_runx3 <- run_single_gene_analysis("/home/rstudio/GRN/perturb_deltas_MEF2C_KO_RUNX3.csv", "MEF2C KO -> RUNX3", "RUNX3", id_cols)
+res_mef2c_oe_runx3 <- run_single_gene_analysis("/home/rstudio/GRN/perturb_deltas_MEF2C_OE_RUNX3.csv", "MEF2C OE -> RUNX3", "RUNX3", id_cols)
+res_klf2_ko_runx3  <- run_single_gene_analysis("/home/rstudio/GRN/perturb_deltas_KLF2_KO_RUNX3.csv",  "KLF2 KO -> RUNX3",  "RUNX3", id_cols)
+res_klf2_oe_runx3  <- run_single_gene_analysis("/home/rstudio/GRN/perturb_deltas_KLF2_OE_RUNX3.csv",  "KLF2 OE -> RUNX3",  "RUNX3", id_cols)
 
 # ---- combined figure: module scores, MEF2C + KLF2, KO vs OE ----------------
 combined_mef2c_klf2 <- (res_mef2c_ko$plot | res_mef2c_oe$plot) /
@@ -176,34 +117,34 @@ message("Wrote MEF2C_KLF2_KO_OE_combined.pdf")
 # =============================================================================
 
 # ---- module-score results for all 6 TFs ------------------------------------
-res_tbx21_ko   <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas.csv",           "TBX21 KO",  id_cols)
-res_tbx21_oe   <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_OE.csv",        "TBX21 OE",  id_cols)
-res_runx3_ko   <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_RUNX3_KO.csv",  "RUNX3 KO",  id_cols)
-res_runx3_oe   <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_RUNX3_OE.csv",  "RUNX3 OE",  id_cols)
-res_mef2c_ko   <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_MEF2C_KO.csv",  "MEF2C KO",  id_cols)
-res_mef2c_oe   <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_MEF2C_OE.csv",  "MEF2C OE",  id_cols)
-res_klf2_ko    <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_KLF2_KO.csv",   "KLF2 KO",   id_cols)
-res_klf2_oe    <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_KLF2_OE.csv",   "KLF2 OE",   id_cols)
-res_pou2f2_ko  <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_POU2F2_KO.csv", "POU2F2 KO", id_cols)
-res_pou2f2_oe  <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_POU2F2_OE.csv", "POU2F2 OE", id_cols)
-res_prdm1_ko   <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_PRDM1_KO.csv",  "PRDM1 KO",  id_cols)
-res_prdm1_oe   <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_PRDM1_OE.csv",  "PRDM1 OE",  id_cols)
-res_fos_ko   <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_FOS_KO.csv",  "FOS KO",  id_cols)
-res_fos_oe   <- run_perturb_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_FOS_OE.csv",  "FOS OE",  id_cols)
+res_tbx21_ko   <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas.csv",           "TBX21 KO",  id_cols)
+res_tbx21_oe   <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas_OE.csv",        "TBX21 OE",  id_cols)
+res_runx3_ko   <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas_RUNX3_KO.csv",  "RUNX3 KO",  id_cols)
+res_runx3_oe   <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas_RUNX3_OE.csv",  "RUNX3 OE",  id_cols)
+res_mef2c_ko   <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas_MEF2C_KO.csv",  "MEF2C KO",  id_cols)
+res_mef2c_oe   <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas_MEF2C_OE.csv",  "MEF2C OE",  id_cols)
+res_klf2_ko    <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas_KLF2_KO.csv",   "KLF2 KO",   id_cols)
+res_klf2_oe    <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas_KLF2_OE.csv",   "KLF2 OE",   id_cols)
+res_pou2f2_ko  <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas_POU2F2_KO.csv", "POU2F2 KO", id_cols)
+res_pou2f2_oe  <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas_POU2F2_OE.csv", "POU2F2 OE", id_cols)
+res_prdm1_ko   <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas_PRDM1_KO.csv",  "PRDM1 KO",  id_cols)
+res_prdm1_oe   <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas_PRDM1_OE.csv",  "PRDM1 OE",  id_cols)
+res_fos_ko   <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas_FOS_KO.csv",  "FOS KO",  id_cols)
+res_fos_oe   <- run_perturb_analysis("/home/rstudio/GRN/perturb_deltas_FOS_OE.csv",  "FOS OE",  id_cols)
 
 # ---- readout-chain results (5 relationships x KO/OE) -----------------------
-res_runx3_ko_tbx21 <- run_single_gene_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_RUNX3_KO_TBX21.csv", "RUNX3 KO\u2192TBX21", "TBX21", id_cols)
-res_runx3_oe_tbx21 <- run_single_gene_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_RUNX3_OE_TBX21.csv", "RUNX3 OE\u2192TBX21", "TBX21", id_cols)
-res_mef2c_ko_tbx21 <- run_single_gene_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_MEF2C_KO_TBX21.csv", "MEF2C KO\u2192TBX21", "TBX21", id_cols)
-res_mef2c_oe_tbx21 <- run_single_gene_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_MEF2C_OE_TBX21.csv", "MEF2C OE\u2192TBX21", "TBX21", id_cols)
-res_mef2c_ko_runx3 <- run_single_gene_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_MEF2C_KO_RUNX3.csv", "MEF2C KO\u2192RUNX3", "RUNX3", id_cols)
-res_mef2c_oe_runx3 <- run_single_gene_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_MEF2C_OE_RUNX3.csv", "MEF2C OE\u2192RUNX3", "RUNX3", id_cols)
-res_klf2_ko_runx3  <- run_single_gene_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_KLF2_KO_RUNX3.csv",  "KLF2 KO\u2192RUNX3",  "RUNX3", id_cols)
-res_klf2_oe_runx3  <- run_single_gene_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_KLF2_OE_RUNX3.csv",  "KLF2 OE\u2192RUNX3",  "RUNX3", id_cols)
-res_prdm1_ko_runx3 <- run_single_gene_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_PRDM1_KO_RUNX3.csv", "PRDM1 KO\u2192RUNX3", "RUNX3", id_cols)
-res_prdm1_oe_runx3 <- run_single_gene_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_PRDM1_OE_RUNX3.csv", "PRDM1 OE\u2192RUNX3", "RUNX3", id_cols)
-res_fos_ko_tbx21 <- run_single_gene_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_FOS_KO_TBX21.csv", "FOS KO\u2192TBX21", "TBX21", id_cols)
-res_fos_oe_tbx21 <- run_single_gene_analysis("/home/rstudio/NK-NB_study/code/GRN/perturb_deltas_FOS_OE_TBX21.csv", "FOS OE\u2192TBX21", "TBX21", id_cols)
+res_runx3_ko_tbx21 <- run_single_gene_analysis("/home/rstudio/GRN/perturb_deltas_RUNX3_KO_TBX21.csv", "RUNX3 KO\u2192TBX21", "TBX21", id_cols)
+res_runx3_oe_tbx21 <- run_single_gene_analysis("/home/rstudio/GRN/perturb_deltas_RUNX3_OE_TBX21.csv", "RUNX3 OE\u2192TBX21", "TBX21", id_cols)
+res_mef2c_ko_tbx21 <- run_single_gene_analysis("/home/rstudio/GRN/perturb_deltas_MEF2C_KO_TBX21.csv", "MEF2C KO\u2192TBX21", "TBX21", id_cols)
+res_mef2c_oe_tbx21 <- run_single_gene_analysis("/home/rstudio/GRN/perturb_deltas_MEF2C_OE_TBX21.csv", "MEF2C OE\u2192TBX21", "TBX21", id_cols)
+res_mef2c_ko_runx3 <- run_single_gene_analysis("/home/rstudio/GRN/perturb_deltas_MEF2C_KO_RUNX3.csv", "MEF2C KO\u2192RUNX3", "RUNX3", id_cols)
+res_mef2c_oe_runx3 <- run_single_gene_analysis("/home/rstudio/GRN/perturb_deltas_MEF2C_OE_RUNX3.csv", "MEF2C OE\u2192RUNX3", "RUNX3", id_cols)
+res_klf2_ko_runx3  <- run_single_gene_analysis("/home/rstudio/GRN/perturb_deltas_KLF2_KO_RUNX3.csv",  "KLF2 KO\u2192RUNX3",  "RUNX3", id_cols)
+res_klf2_oe_runx3  <- run_single_gene_analysis("/home/rstudio/GRN/perturb_deltas_KLF2_OE_RUNX3.csv",  "KLF2 OE\u2192RUNX3",  "RUNX3", id_cols)
+res_prdm1_ko_runx3 <- run_single_gene_analysis("/home/rstudio/GRN/perturb_deltas_PRDM1_KO_RUNX3.csv", "PRDM1 KO\u2192RUNX3", "RUNX3", id_cols)
+res_prdm1_oe_runx3 <- run_single_gene_analysis("/home/rstudio/GRN/perturb_deltas_PRDM1_OE_RUNX3.csv", "PRDM1 OE\u2192RUNX3", "RUNX3", id_cols)
+res_fos_ko_tbx21 <- run_single_gene_analysis("/home/rstudio/GRN/perturb_deltas_FOS_KO_TBX21.csv", "FOS KO\u2192TBX21", "TBX21", id_cols)
+res_fos_oe_tbx21 <- run_single_gene_analysis("/home/rstudio/GRN/perturb_deltas_FOS_OE_TBX21.csv", "FOS OE\u2192TBX21", "TBX21", id_cols)
 
 
 # ---- assemble module-score block (12 panels, 6 TFs x KO/OE, 4 cols x 3 rows)
@@ -249,7 +190,7 @@ suppressPackageStartupMessages({
   library(tidygraph); library(ggraph); library(igraph)
 })
 
-edges <- fread("/home/rstudio/NK-NB_study/code/GRN/tf_tf_edges_all_groups.csv")
+edges <- fread("/home/rstudio/GRN/tf_tf_edges_all_groups.csv")
 found_edges <- edges[found == TRUE]
 
 # ---- network diagram, faceted by group --------------------------------------
@@ -294,3 +235,65 @@ bar_plot <- ggplot(edges[found == TRUE], aes(x = pair, y = coef_mean, fill = gro
 
 ggsave("/home/rstudio/mnt_out/NK_project/figures/TF_TF_edge_strength_barplot.pdf", bar_plot, width = 8, height = 5)
 message("Wrote TF_TF_edge_strength_barplot.pdf")
+
+# =============================================================================
+# Part V: cluster-stratified ATRXdel-vs-other-groups comparison
+# Now that 03_grn_perturb.py fits one GRN per (NK subtype cluster x genetic
+# group) unit, this section re-runs the patient-level module-score tests
+# separately per cluster, and summarizes the GRN-level (edge/network-score)
+# differences 03_grn_perturb.py already computed directly from links_dict.
+# =============================================================================
+
+# ---- (1) patient-level cytotoxicity-module tests, per cluster -------------
+res_tbx21_ko_cl <- run_perturb_analysis_by_cluster("/home/rstudio/GRN/perturb_deltas.csv",          "TBX21 KO", id_cols)
+res_tbx21_oe_cl <- run_perturb_analysis_by_cluster("/home/rstudio/GRN/perturb_deltas_OE.csv",       "TBX21 OE", id_cols)
+res_runx3_ko_cl <- run_perturb_analysis_by_cluster("/home/rstudio/GRN/perturb_deltas_RUNX3_KO.csv", "RUNX3 KO", id_cols)
+res_runx3_oe_cl <- run_perturb_analysis_by_cluster("/home/rstudio/GRN/perturb_deltas_RUNX3_OE.csv", "RUNX3 OE", id_cols)
+
+clusters_seen <- unique(c(names(res_tbx21_ko_cl), names(res_tbx21_oe_cl),
+                          names(res_runx3_ko_cl), names(res_runx3_oe_cl)))
+
+for (cl in clusters_seen) {
+  panels <- Filter(Negate(is.null), list(
+    res_tbx21_ko_cl[[cl]]$plot, res_tbx21_oe_cl[[cl]]$plot,
+    res_runx3_ko_cl[[cl]]$plot, res_runx3_oe_cl[[cl]]$plot
+  ))
+  if (length(panels) == 0) next
+  combined_cl <- wrap_plots(panels, ncol = 2) +
+    plot_layout(guides = "collect") &
+    theme(legend.position = "bottom")
+  out_path <- paste0("/home/rstudio/mnt_out/NK_project/figures/TBX21_RUNX3_KO_OE_",
+                      gsub("[^A-Za-z0-9_]", "-", cl), ".pdf")
+  ggsave(out_path, combined_cl, width = 9, height = 8)
+  message("Wrote ", out_path)
+}
+
+# ---- (2) GRN-level differences (from 03_grn_perturb.py) --------------------
+# Edge-level: which TF->target edges differ most between ATRXdel and each
+# other group, within each matched NK subtype cluster.
+edge_diff <- fread("/home/rstudio/GRN/grn_edge_diff_ATRXdel_vs_other_groups.csv")
+cat("\n--- Top 20 ATRXdel-vs-other-group edge differences (|delta_coef_abs|) ---\n")
+print(head(edge_diff[order(-abs(delta_coef_abs))], 20))
+
+edge_diff_top <- edge_diff[, .SD[order(-abs(delta_coef_abs))][1:min(10, .N)],
+                            by = .(cluster, group_compared)]
+edge_diff_top[, pair := paste0(source, "→", target)]
+
+edge_diff_plot <- ggplot(edge_diff_top,
+                          aes(x = reorder(pair, delta_coef_abs), y = delta_coef_abs)) +
+  geom_col() +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey50") +
+  coord_flip() +
+  facet_grid(cluster ~ group_compared, scales = "free_y") +
+  labs(x = NULL, y = "coef_abs(ATRXdel) - coef_abs(other group)",
+       title = "Top differential TF→target edges: ATRXdel vs other groups, per NK subtype") +
+  theme_bw(base_size = 9)
+
+ggsave("/home/rstudio/mnt_out/NK_project/figures/GRN_edge_diff_ATRXdel_vs_other_groups.pdf",
+       edge_diff_plot, width = 12, height = 8)
+message("Wrote GRN_edge_diff_ATRXdel_vs_other_groups.pdf")
+
+# Network-level: which genes' regulatory centrality shifts most.
+score_diff <- fread("/home/rstudio/GRN/grn_network_score_diff_ATRXdel_vs_other_groups.csv")
+cat("\n--- Top 20 ATRXdel-vs-other-group eigenvector-centrality shifts ---\n")
+print(head(score_diff[order(-abs(delta_eigenvector_centrality))], 20))

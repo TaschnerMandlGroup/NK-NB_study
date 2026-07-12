@@ -1,0 +1,129 @@
+---
+title: "NK project"
+subtitle: "RUNX3 - CD6 - FOS - TBX21 regulation axis on NK cells: part II"
+author: "Dr. Sara Wernig-Zorc"
+date: "2026-07-08"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+    collapsed: false
+    code_folding: hide
+    highlight: pygments
+    theme: spacelab
+    df_print: paged
+params:
+  out: "/home/rstudio/mnt_out/NK_project/"
+  anno: "/home/rstudio/mnt_resources/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r echo=FALSE}
+source("/home/rstudio/00_NK_paper_setup.R")
+source("/home/rstudio/00_NK_paper_utils.R")
+```
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Signac)
+  library(motifmatchr)
+  library(TFBSTools)
+  library(JASPAR2020)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  library(ArchR)
+  library(SummarizedExperiment)
+  library(GenomicRanges)
+  library(Matrix)
+  library(dplyr) 
+  library(tibble)
+  library(SCpubr)
+  library(arrow)
+})
+```
+
+# ___Load RNA data___
+
+```{r echo = FALSE}
+ALL_NK <- readRDS("~/mnt_out/NK_project/Rds/ALL_NK_cluster_withNewMetadata.Rds")
+ALL_NK <- NormalizeData(ALL_NK, normalization.method = "LogNormalize",
+                        scale.factor = 10000) %>% ScaleData()
+table(ALL_NK$group)
+```
+
+# ___All NK cells___
+
+```{r}
+genes_of_interest <- c("RUNX1","RUNX3", "ETS1", "CD6","FOS","TBX21")
+
+comparisons <- list(c("ATRXdel","control"),
+                    c("ATRXdel","MYCNamp"), 
+                    c("ATRXdel","ATRXwtMYCNwt"))
+```
+
+```{r}
+for (gene in genes_of_interest) {
+  TF_plots <- do_ViolinPlot(ALL_NK, 
+                features = gene,
+                group.by = "group",
+                colors.use = COLOR_CODE_GROUP,
+                font.size = 12,
+                plot.grid = FALSE,
+                plot_boxplot = FALSE) + 
+    ggpubr::stat_compare_means(
+    comparisons = comparisons, method = "wilcox.test",
+    label = "p.signif", size = 3, tip.length = 0.01)
+  
+  grid::grid.newpage()
+  grid::grid.draw(TF_plots)
+  
+  pdf(paste0(params$out, "figures/scRNA_violinPlots_", gene, "_AllNK_perGroup.pdf"),
+          height = 4, width = 4, useDingbats = FALSE)
+  grid::grid.draw(TF_plots)
+  dev.off()
+}
+```
+
+# ___Immunomodulatory NK cells___
+
+```{r}
+Idents(ALL_NK) <- ALL_NK$predicted_NK_type_de.n350
+immunoNK <- subset(ALL_NK, idents = c("hNK_Bm2","hNK_Bm3"))
+Idents(immunoNK) <- immunoNK$group
+table(immunoNK$predicted_NK_type_de.n350)
+
+saveRDS(immunoNK, file = paste0(params$out, "/Rds/ALL_NK_NK2+NK2.Rds"))
+```
+
+
+```{r}
+genes_of_interest <- c("RUNX1","RUNX3", "ETS1", "CD6","FOS","TBX21")
+
+for (gene in genes_of_interest) {
+  TF_plots <- do_ViolinPlot(immunoNK, 
+                features = gene,
+                group.by = "group",
+                colors.use = COLOR_CODE_GROUP,
+                font.size = 12,
+                plot.grid = FALSE,
+                plot_boxplot = FALSE,
+                grid.type = "blank") + 
+    ggpubr::stat_compare_means(
+    comparisons = comparisons, method = "wilcox.test",
+    label = "p.signif", size = 3, tip.length = 0.01)
+  
+  grid::grid.newpage()
+  grid::grid.draw(TF_plots)
+  
+  pdf(paste0(params$out, "figures/scRNA_violinPlots_", gene, "_immunoNK_perGroup.pdf"),
+          height = 4, width = 4, useDingbats = FALSE)
+  grid::grid.draw(TF_plots)
+  dev.off()
+}
+```
+

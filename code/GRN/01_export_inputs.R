@@ -68,3 +68,59 @@ write.csv(all_peaks, file.path(out_dir, "all_peaks.csv"), row.names = FALSE)
 write.csv(conns,     file.path(out_dir, "cicero_connections.csv"), row.names = FALSE)
 message("Wrote all_peaks.csv (", nrow(all_peaks), ") and cicero_connections.csv (", nrow(conns), ")")
 
+##################################
+# PART II: NK2+NK3 clusters only #
+##################################
+
+rna_rds     <- "/home/rstudio/mnt_out/NK_project/Rds/ALL_NK_NK2+NK2.Rds"  
+
+idxSample <- BiocGenerics::which(proj$predicted_NK_group %in% "immuno")
+immunoNK_cells <- proj$cellNames[idxSample]
+
+proj <- subsetArchRProject(
+  ArchRProj = proj,
+  cells = immunoNK_cells,
+  outputDirectory = "ArchRSubset_NK2NK3",
+  dropCells = TRUE,
+  logFile = NULL,
+  threads = 20,
+  force = FALSE
+)
+
+proj <- addCoAccessibility(proj, reducedDims = "IterativeLSI")
+ps  <- getPeakSet(proj)
+pstr <- paste(as.character(seqnames(ps)), start(ps), end(ps), sep = "_")
+cA  <- getCoAccessibility(proj, corCutOff = coaccess_cutoff, returnLoops = FALSE)
+conns <- data.frame(Peak1 = pstr[cA$queryHits],
+                    Peak2 = pstr[cA$subjectHits],
+                    coaccess = cA$correlation)
+all_peaks <- data.frame(peak = pstr)
+
+saveArchRProject(ArchRProj = proj, outputDirectory = "ArchRSubset_NK2NK3", load = FALSE)
+
+write.csv(all_peaks, file.path(out_dir, "all_peaks_NK2NK3.csv"), row.names = FALSE)
+write.csv(conns,     file.path(out_dir, "cicero_connections_NK2NK3.csv"), row.names = FALSE)
+message("Wrote all_peaks_NK2NK3.csv (", nrow(all_peaks), ") and cicero_connections_NK2NK3.csv (", nrow(conns), ")")
+
+
+# scRNA -> h5ad
+rna <- readRDS(rna_rds)
+stopifnot(all(c(group_col, patient_col) %in% colnames(rna@meta.data)))
+DefaultAssay(rna) <- "RNA"
+
+# Keep it lean but preserve raw counts + the two grouping columns + embeddings.
+# NOTE: patients within a group MUST be integrated/batch-corrected upstream, so
+# the KNN imputation CellOracle runs later reflects state, not donor batch.
+rna_export <- DietSeurat(rna, assays = "RNA",
+                         dimreducs = intersect(c("UMAP","PCA"), names(rna@reductions)))
+# make sure obs carries clean factor labels
+rna_export$genetic_group <- as.character(rna_export[[group_col]][,1])
+rna_export$patient_id    <- as.character(rna_export[[patient_col]][,1])
+
+sceasy::convertFormat(
+  rna_export, from = "seurat", to = "anndata",
+  outFile = file.path(out_dir, "nk_NK2NK3_rna.h5ad"),
+  main_layer = "counts",           # CellOracle imports RAW counts
+  drop_single_values = FALSE
+)
+message("Wrote ", file.path(out_dir, "nk_NK2NK3_rna.h5ad"))

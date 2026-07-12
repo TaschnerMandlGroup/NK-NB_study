@@ -44,8 +44,8 @@ print(params)
 ```
 
 ```{r load project specific R packages and color code}
-source("/home/rstudio/NK-NB_study/code/00_NK_paper_setup.R")
-source("/home/rstudio/NK-NB_study/code/00_NK_paper_utils.R")
+source("/home/rstudio/00_NK_paper_setup.R")
+source("/home/rstudio/00_NK_paper_utils.R")
 ```
 
 ```{r eval=FALSE, include=FALSE}
@@ -579,11 +579,26 @@ sce <- as.SingleCellExperiment(ALL_NK)
 colLabels(sce) <- sce$predicted_NK_type_de.n350
 
 #same as above but in one command
-pseudo.all <- quickPseudotime(sce, 
+pseudo.all <- quickPseudotime(sce,
                               use.dimred = "UMAP",
                               start = "hNK_Bm2")
 
 all <- averagePseudotime(pseudo.all$ordering)
+```
+
+```{r}
+# Export combined ALL_NK pseudotime for use in the CellOracle developmental
+# comparison (07_development_comparison.py), which otherwise falls back to a
+# cruder scanpy dpt placeholder. Cell IDs must match nk_rna.h5ad's obs_names
+# (01_export_inputs.R exports the same ALL_NK/rna_rds object) for the merge
+# in python to work -- if `all` has NA entries (cells TSCAN couldn't place on
+# the MST), those rows are dropped here rather than exported as NA.
+pseudotime_export <- data.frame(cell_id = colnames(sce), pseudotime = as.numeric(all))
+pseudotime_export <- pseudotime_export[!is.na(pseudotime_export$pseudotime), ]
+write.csv(pseudotime_export,
+          file.path(params$out, "tables/ALL_NK_TSCAN_pseudotime.csv"),
+          row.names = FALSE)
+message("Wrote ", nrow(pseudotime_export), " cells to ALL_NK_TSCAN_pseudotime.csv")
 ```
 
 ```{r}

@@ -1,6 +1,6 @@
 ---
 title: "NK project"
-subtitle: "RUNX3 - TBX21 - CD6 regulation axis on NK cells"
+subtitle: "RUNX3 - CD6 - FOS - TBX21 regulation axis on NK cells: part I"
 author: "Dr. Sara Wernig-Zorc"
 date: "2026-07-06"
 output:

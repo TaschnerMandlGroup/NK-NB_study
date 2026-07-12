@@ -715,7 +715,6 @@ for (gs in gsea_inflam_sknfi@result$ID) {
 
 # ___Bulk ATAC-seq & ChIP-seq: ATRX binding, histone marks and chromatin accessibility at ALCAM gene locus___
 
-
 ```{r gviz-setup}
 library(Gviz)
 library(rtracklayer)
@@ -924,6 +923,8 @@ track_atac_ratio <- DataTrack(
 
 *Isogenic NB cell lines: SK-N-SH*
 
+### ___ALCAM promoter___
+
 ```{r atac-profile-r, fig.height=5, fig.width=7}
 # R-based equivalent of deepTools computeMatrix + plotProfile
 # TSS-centered profile around ALCAM_1 EPD promoter (TSS at 105,366,908)
@@ -1034,6 +1035,125 @@ pdf(paste0(params$out, "NK_project/figures/ALCAM_ATRX_ChIP_TSS_profile.pdf"),
 atrx_profile_plot
 dev.off()
 ```
+
+### ___CD44 promoter___
+
+**Promoter: chr11:35137170–35141170**
+**TSS: chr11:35139171**
+
+```{r atac-profile-r2, fig.height=5, fig.width=7}
+CD44_CHR  <- "chr11"
+CD44_START <- 35137170
+CD44_END   <- 35141170
+
+CD44_TSS  <- 35139171
+PROF_WIN   <- 5000L   # ±5kb
+BIN_SIZE   <- 50L
+
+get_binned_profile <- function(bw_paths, condition, chr = CD44_CHR,
+                                tss = CD44_TSS, window = PROF_WIN,
+                                bin_size = BIN_SIZE) {
+  region     <- GRanges(chr, IRanges(tss - window, tss + window))
+  bin_starts <- seq(tss - window, tss + window - bin_size + 1L, by = bin_size)
+  bins       <- GRanges(chr, IRanges(start = bin_starts, width = bin_size))
+  seqlevels(bins) <- chr  
+
+  rep_mat <- sapply(bw_paths, function(f) {
+    cov     <- import(f, which = region, as = "RleList")
+    cov_chr <- cov[chr]  
+    ba      <- binnedAverage(bins, cov_chr, "avg")
+    ba$avg
+  })
+
+  data.frame(
+    position  = bin_starts - tss,
+    signal    = rowMeans(rep_mat, na.rm = TRUE),
+    condition = condition
+  )
+}
+
+p53_profile <- get_binned_profile(
+  file.path(ATAC_DIR, c("GSM9347420_p53_DMSO_REP1.mLb.clN.bigWig",
+                          "GSM9347424_p53_DMSO_REP2.mLb.clN.bigWig",
+                          "GSM9347428_p53_DMSO_REP3.mLb.clN.bigWig")),
+  condition = "p53 (ATRXwt)"
+)
+e6_profile <- get_binned_profile(
+  file.path(ATAC_DIR, c("GSM9347422_E6_DMSO_REP1.mLb.clN.bigWig",
+                          "GSM9347426_E6_DMSO_REP2.mLb.clN.bigWig",
+                          "GSM9347430_E6_DMSO_REP3.mLb.clN.bigWig")),
+  condition = "E6 (ATRXdel)"
+)
+
+profile_df <- rbind(p53_profile, e6_profile)
+profile_df$condition <- factor(profile_df$condition,
+                                levels = c("p53 (ATRXwt)", "E6 (ATRXdel)"))
+
+ATAC_PROFILE_COLORS <- c("p53 (ATRXwt)" = "#FAA21B", "E6 (ATRXdel)" = "#4f4e92")
+
+atac_profile_plot <- ggplot(profile_df, aes(x = position / 1000, y = signal,
+                                             color = condition)) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.5) +
+  scale_color_manual(values = ATAC_PROFILE_COLORS, name = "") +
+  scale_x_continuous(labels = function(x) paste0(x, " kb")) +
+  labs(
+    title    = "ATAC-seq signal around CD44 TSS",
+    subtitle = "EPD promoter CD44_1 (chr3:105,366,908)",
+    x        = "Distance from TSS",
+    y        = "Mean ATAC-seq signal (bigWig)"
+  ) +
+  theme_pubr(base_size = 12) +
+  theme(legend.position = "top",
+        plot.title      = element_text(face = "bold", size = 13))
+
+atac_profile_plot
+
+pdf(paste0(params$out, "NK_project/figures/CD44_ATAC_TSS_profile.pdf"),
+    height = 5, width = 7)
+atac_profile_plot
+dev.off()
+```
+
+```{r atrx-profile-r2, fig.height=5, fig.width=7}
+# ATRX ChIP-seq profile: CHLA90 vs SKNFI around CD44 TSS
+chla90_atrx_profile <- get_binned_profile(
+  file.path(CHIP_DIR, "GSM3389350_CHLA90_ATRX.bigWig"),
+  condition = "CHLA90"
+)
+sknfi_atrx_profile <- get_binned_profile(
+  file.path(CHIP_DIR, "GSM3389345_SKNFI_ATRX.bigWig"),
+  condition = "SKNFI"
+)
+
+atrx_profile_df <- rbind(chla90_atrx_profile, sknfi_atrx_profile)
+atrx_profile_df$condition <- factor(atrx_profile_df$condition,
+                                     levels = c("CHLA90", "SKNFI"))
+
+atrx_profile_plot <- ggplot(atrx_profile_df,
+                              aes(x = position / 1000, y = signal, color = condition)) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.5) +
+  scale_color_manual(values = c("CHLA90" = "#4f4e92", "SKNFI" = "#FAA21B"), name = "") +
+  scale_x_continuous(labels = function(x) paste0(x, " kb")) +
+  labs(
+    title    = "ATRX ChIP-seq signal around CD44 TSS",
+    subtitle = "Qadeer et al., 2019",
+    x        = "Distance from TSS",
+    y        = "ATRX ChIP-seq signal (bigWig)"
+  ) +
+  theme_pubr(base_size = 12) +
+  theme(legend.position = "top",
+        plot.title      = element_text(face = "bold", size = 13))
+
+atrx_profile_plot
+
+pdf(paste0(params$out, "NK_project/figures/CD44_ATRX_ChIP_TSS_profile.pdf"),
+    height = 5, width = 7)
+atrx_profile_plot
+dev.off()
+```
+
 
 ## ___Qadeer et al., 2019___
 
